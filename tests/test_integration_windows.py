@@ -248,6 +248,29 @@ def test_terminate_via_dll(ctrl):
     assert _wait_until(lambda: not _pid_alive(pid), timeout=20), "目标进程未被终止"
 
 
+def test_pid_alive_false_for_exited_process_with_open_handle():
+    """进程已退出但句柄仍被持有（Popen 未回收）时，pid_alive 必须报 False。
+
+    这正是打包产物自检里唯一那条红：DLL 内的 ExitProcess 已经成功，但存活
+    判定用的是「OpenProcess 能否成功」—— 只要还有人持有句柄，内核里那个进程
+    对象就不销毁，于是把「已退出」误判成「仍存活」。
+    """
+    from superinject import winapi
+
+    proc = subprocess.Popen([TARGET_IMG, "-t", "127.0.0.1"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert winapi.pid_alive(proc.pid), "刚拉起的进程应当被判为存活"
+        proc.kill()
+        proc.wait(timeout=10)         # 进程已退出，但 proc 仍持有句柄
+        assert not winapi.pid_alive(proc.pid), \
+            "进程已退出、句柄未回收时 pid_alive 误报存活"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 # ------------------------------------------------------------------ 冻结
 
 def test_freeze_really_suspends_and_resumes(ctrl):

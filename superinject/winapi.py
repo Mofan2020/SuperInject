@@ -375,15 +375,31 @@ def process_path(pid: int) -> str:
 
 
 def pid_alive(pid: int) -> bool:
-    """进程是否仍然存活（能拿到查询句柄即视为存活）。"""
+    """进程是否仍然存活。
+
+    不能用「能拿到查询句柄就算存活」：目标退出后，只要还有别的进程/本进程
+    持有它的句柄（例如 subprocess.Popen 对象尚未回收），内核里那个进程对象
+    就不会销毁，OpenProcess 依然成功 —— selftest 里就因此把「DLL 成功
+    ExitProcess 自杀」误判成「目标进程仍存活」（19 步里唯一的红）。
+    改用 GetExitCodeProcess：只要不等于 STILL_ACTIVE 就是已退出。
+    """
+    STILL_ACTIVE = 259
     try:
         h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)
     except Exception:  # pragma: no cover
         return False
     if not h:
         return False
-    kernel32().CloseHandle(h)
-    return True
+    try:
+        code = wt.DWORD(0)
+        k = kernel32()
+        k.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+        k.GetExitCodeProcess.restype = wt.BOOL
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32().CloseHandle(h)
 
 
 def process_name(pid: int) -> str:
