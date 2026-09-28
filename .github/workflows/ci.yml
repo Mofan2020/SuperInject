@@ -73,29 +73,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 定位 MSVC 环境
-        shell: cmd
-        run: |
-          for %%E in (Enterprise Professional Community BuildTools); do (
-            if exist "%ProgramFiles%\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" (
-              echo VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat> %GITHUB_ENV%
-              exit /b 0
-            )
-          )
-          exit /b 1
+      - name: 初始化 MSVC 开发环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: 用 MSVC 编译（/W4 /WX 视为错误）
-        shell: cmd
         run: |
-          call "%VCVARS%" || exit /b 1
           cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE ^
              native\agent.c native\superinject_json.c ^
              /Fe:native\build\SuperInjectAgent.dll ^
              /link advapi32.lib shell32.lib user32.lib
-          if errorlevel 1 exit /b 1
-          dir native\build\SuperInjectAgent.dll
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Item native\build\SuperInjectAgent.dll
 
       - name: 校验 MSVC 产物
+        shell: bash
         run: |
           python - <<'PY'
           import pathlib, struct
@@ -174,6 +167,7 @@ jobs:
           path: native/build
 
       - name: 确认当前进程具备提权能力
+        shell: bash
         run: |
           python -c "import ctypes;print('admin=',bool(ctypes.windll.shell32.IsUserAnAdmin()))"
 
@@ -212,6 +206,7 @@ jobs:
         run: python build/make_payload.py
 
       - name: 校验内嵌字节与 DLL 一致
+        shell: bash
         run: |
           python - <<'PY'
           import hashlib, sys
@@ -230,6 +225,7 @@ jobs:
             --hidden-import webview.platforms.edgechromium run_superinject.py
 
       - name: 冒烟检查产物
+        shell: bash
         run: |
           python - <<'PY'
           import pathlib
