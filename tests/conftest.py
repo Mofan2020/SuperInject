@@ -47,12 +47,13 @@ def _force_kill(pid: int) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _cleanup_after_test():
+def _noop_hook():
+    """占位：保持钩子结构，实际清理由各用例的 finally 与会话结束钩子负责。
+
+    注意不要在这里回收被 module 级 fixture 复用的进程，否则会导致
+    后续用例拿到一个已经被杀掉的 PID。
+    """
     yield
-    # 每个用例结束后，把本用例启动但可能仍存活的进程清掉
-    while _TRACKED:
-        pid = _TRACKED.pop()
-        _force_kill(pid)
 
 
 @pytest.fixture(scope="session", autouse=True)

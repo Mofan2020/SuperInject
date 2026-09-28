@@ -51,9 +51,17 @@ def _wait_until(fn, timeout=25.0, interval=0.5):
 
 @pytest.fixture(scope="module")
 def target():
+    """模块级目标进程：整个模块复用，模块结束时强制回收。"""
     if not _dll_path().exists():
         pytest.skip(f"未找到编译好的 DLL：{_dll_path()}")
-    return spawn([TARGET_IMG, "-t", "127.0.0.1"])
+    pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
+    yield pid
+    kill(pid)
+
+
+def kill(pid: int) -> None:
+    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                   capture_output=True, check=False)
 
 
 @pytest.fixture()
@@ -170,5 +178,4 @@ def test_freeze_and_resume(ctrl):
         assert pid not in ctrl._frozen
         assert _pid_alive(pid)
     finally:
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, check=False)
+        kill(pid)
