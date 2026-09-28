@@ -9,10 +9,30 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 _TRACKED: list[int] = []
+
+
+def _setup_debug_logging():
+    """设置 SUPERINJECT_DEBUG=1 时把 IPC 调试日志写到文件，便于 CI 排查。"""
+    import logging
+    import os
+
+    if not os.environ.get("SUPERINJECT_DEBUG"):
+        return
+    path = Path(__file__).resolve().parent.parent / "supinject-debug.log"
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+
+
+_setup_debug_logging()
 
 
 def track(pid: int) -> int:

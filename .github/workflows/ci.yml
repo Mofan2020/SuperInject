@@ -173,8 +173,11 @@ jobs:
       - name: 注入 / 内存读写 / 冻结 / 卸载 / 终止 端到端
         env:
           SUPERINJECT_DLL_PATH: native/build/SuperInjectAgent.dll
+          SUPERINJECT_DEBUG: "1"
         run: |
           python -m pytest tests/test_integration_windows.py -v -x --timeout=180
+          echo "===== IPC 调试日志（末尾 120 行）====="
+          if [ -f superinject-debug.log ]; then tail -n 120 superinject-debug.log; else echo "(无日志文件)"; fi
         timeout-minutes: 15
 
   # ---------------------------------------------------------------

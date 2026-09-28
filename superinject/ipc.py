@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes as wt
 import json
 import logging
 import queue
@@ -67,11 +68,21 @@ def _win_pipes():
     k.ConnectNamedPipe.argtypes = [wt.HANDLE, ctypes.c_void_p]
     k.DisconnectNamedPipe.restype = wt.BOOL
     k.DisconnectNamedPipe.argtypes = [wt.HANDLE]
+    k.FlushFileBuffers.restype = wt.BOOL
+    k.FlushFileBuffers.argtypes = [wt.HANDLE]
+    k.CloseHandle.restype = wt.BOOL
     k.CloseHandle.argtypes = [wt.HANDLE]
     k.CreateFileW.restype = wt.HANDLE
     k.CreateFileW.argtypes = [
         wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE,
     ]
+    # 读写必须显式声明签名：否则 64 位 HANDLE 会被按 32 位 int 传参
+    k.WriteFile.restype = wt.BOOL
+    k.WriteFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+                            ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+    k.ReadFile.restype = wt.BOOL
+    k.ReadFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+                           ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
     return k
 
 
@@ -179,6 +190,7 @@ class PipeServer:
             self._waiters[mid] = q
         payload = dict(cmd)
         payload["id"] = mid
+        log.debug("发送命令 pid=%s type=%s id=%s", pid, cmd.get("type"), mid)
         try:
             conn.send(payload)
         except Exception as exc:  # pragma: no cover - 管道断开
@@ -220,6 +232,7 @@ class PipeServer:
         )
         if handle in (0, INVALID_HANDLE_VALUE):
             raise OSError(ctypes.get_last_error(), f"CreateNamedPipe {name}")
+        log.debug("管道已创建 pid=%s name=%s handle=%s", pid, name, handle)
         return handle
 
     def _serve(self, pid: int) -> None:
@@ -248,6 +261,7 @@ class PipeServer:
 
     def _handle_connection(self, pid: int, handle: int) -> None:
         conn = Connection(handle, pid)
+        log.debug("管道已连接 pid=%s", pid)
         with self._lock:
             self._conns[pid] = conn
         buf = bytearray()
@@ -272,8 +286,6 @@ class PipeServer:
                     pass
 
     def _read_exact_chunk(self, handle: int) -> bytes:
-        import ctypes.wintypes as wt
-
         k = _win_pipes()
         k.ReadFile.restype = wt.BOOL
         k.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
@@ -289,6 +301,7 @@ class PipeServer:
 
     def _dispatch(self, pid: int, conn: Connection, msg: dict) -> None:
         mtype = msg.get("type")
+        log.debug("收到消息 pid=%s type=%s id=%s", pid, mtype, msg.get("id"))
         if mtype == "hello":
             conn.info = msg
             if self.on_attach:
