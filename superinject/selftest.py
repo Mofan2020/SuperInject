@@ -191,19 +191,33 @@ def run(argv: Optional[List[str]] = None) -> int:
         found = ctrl.mem_search([target_pid], "4D 5A ?? ??", 8)
         hits = (found[0].get("resp") or {}).get("results") if found else None
         rec.step("内存搜索（4D 5A ?? ??）", bool(hits), f"{len(hits or [])} 处命中")
-        if hits:
-            address = int(hits[0]["address"])
+
+        # 读写挑目标自己的 PE 头页（模块基址 + 0x100，DOS stub 区永不执行）：
+        # 这一页是只读的，必须靠「临时改页保护」才写得进去 —— 正是调试器给已
+        # 加载模块打补丁的路线。不能用「搜到的第一个 MZ」：那个地址可能落在别的
+        # 只读映射里（只读文件映射之类），写不进去，看着像读写功能坏了。
+        image = Path(winapi.process_path(target_pid)).name.lower()
+        bases = {str(m.get("name", "")).lower(): int(m.get("base", 0))
+                 for m in (info.get("modules") or [])}
+        address = (bases.get(image) or 0) + 0x100
+        if bases.get(image):
             original = ctrl.mem_read(target_pid, address, 1)
             old_byte = str(original.get("hex", ""))[:2]
             new_byte = "90" if old_byte != "90" else "91"
             wrote = ctrl.mem_write(target_pid, address, new_byte)
             back = ctrl.mem_read(target_pid, address, 1)
             restored = ctrl.mem_write(target_pid, address, old_byte)
-            rec.step("内存读 / 改 / 还原",
+            detail = (f"0x{address:X} {old_byte} -> {new_byte} -> "
+                      f"{str(back.get('hex', ''))[:2]}"
+                      f"{' 错误=' + str(wrote['error']) if wrote.get('error') else ''}")
+            rec.step("内存读 / 改 / 还原（只读 PE 头页）",
                      bool(original.get("ok")) and bool(wrote.get("ok"))
                      and str(back.get("hex", ""))[:2] == new_byte
                      and bool(restored.get("ok")),
-                     f"0x{address:X} {old_byte} -> {new_byte} -> {old_byte}")
+                     detail)
+        else:
+            rec.step("内存读 / 改 / 还原（只读 PE 头页）", False,
+                     f"模块表里没有 {image}")
 
         # ---------------------------------------------------------- 资源
         resources = ctrl.resources([target_pid])

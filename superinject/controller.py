@@ -235,8 +235,13 @@ class Controller:
                                      "请重启目标进程后再注入"}
                 base["reinjected"] = True
             elif winapi.module_loaded(pid, DLL_NAME):
-                # 模块已在但没连上：agent 线程可能仍在建连，给它一点时间
-                if not self.server.wait_attach(pid, 3.0):
+                # 模块还在、但没连上。两种情形要分开处理：
+                #   1. 刚卸载完的残留 —— 加载器摘模块是异步的，等它消失后按
+                #      全新进程注入就行（selftest 的「卸载后重新注入」正是这种）；
+                #   2. 上次运行真的残留（线程已死、模块被别处引用着）—— 只能请
+                #      用户重启目标进程。
+                if not self._wait_module_gone(pid, UNLOAD_TIMEOUT) \
+                        and not self.server.wait_attach(pid, 3.0):
                     return {**base, "ok": False,
                             "error": "目标进程内已存在 SuperInjectAgent.dll，"
                                      "但控制通道未建立（上次运行的残留）。"
