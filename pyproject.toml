@@ -1,6 +1,6 @@
 [project]
 name = "superinject"
-version = "1.0.0"
+version = "1.0.1"
 description = "SuperInject —— 仅限 Windows 的基于 DLL 注入的快捷调试工具（仅供开发调试使用）"
 readme = "README.md"
 requires-python = ">=3.10"

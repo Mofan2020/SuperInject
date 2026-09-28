@@ -23,6 +23,7 @@
   <div class="checks">
     <span id="badge-admin" class="badge">权限检查中…</span>
     <span id="badge-dll" class="badge">DLL 校验中…</span>
+    <span id="badge-arch" class="badge">–</span>
     <span id="badge-ver" class="badge">v–</span>
     <button id="btn-refresh" class="ghost">刷新进程</button>
   </div>
@@ -79,6 +80,15 @@
       <button class="act warn" data-act="unload">卸载注入 DLL</button>
       <button class="act danger" data-act="terminate">终止进程</button>
     </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>进程资源</h2>
+      <span id="res-summary" class="muted">尚未提取</span>
+      <span class="grow"></span>
+      <button id="btn-reveal-all" class="ghost">打开导出目录</button>
+    </div>
+    <div id="res-grid" class="res-grid"></div>
   </section>
 
   <section class="panel">

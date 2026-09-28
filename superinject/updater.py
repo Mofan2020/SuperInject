@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 import threading
 import urllib.error
@@ -20,7 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .version import GITHUB_API, GITHUB_RELEASES, __version__, compare_version
+from .version import (GITHUB_API, GITHUB_RELEASES, GITHUB_RELEASES_API,
+                      __version__, compare_version)
 
 log = logging.getLogger("supinject.updater")
 
@@ -33,6 +33,8 @@ class ReleaseInfo:
     url: str
     assets: list[dict]
     notes: str = ""
+    prerelease: bool = False
+    published_at: str = ""
 
     @property
     def has_newer(self) -> bool:
@@ -49,24 +51,63 @@ class ReleaseInfo:
         return None
 
 
-def fetch_latest(timeout: float = 8.0) -> Optional[ReleaseInfo]:
-    """查询 GitHub 最新 Release，失败返回 None（不阻塞启动）。"""
-    req = urllib.request.Request(GITHUB_API, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        log.info("更新检查失败: %s", exc)
-        return None
+def _get_json(url: str, timeout: float):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-    tag = (data.get("tag_name") or data.get("name") or "v0").strip()
-    version = re.sub(r"^v", "", tag)
+
+def _to_release(data: dict) -> Optional[ReleaseInfo]:
+    if not isinstance(data, dict) or data.get("draft"):
+        return None
+    tag = (data.get("tag_name") or data.get("name") or "").strip()
+    if not tag:
+        return None
     return ReleaseInfo(
-        version=version,
+        version=re.sub(r"^v", "", tag),
         url=data.get("html_url") or GITHUB_RELEASES,
         assets=data.get("assets") or [],
         notes=(data.get("body") or "")[:4000],
+        prerelease=bool(data.get("prerelease")),
+        published_at=str(data.get("published_at") or data.get("created_at") or ""),
     )
+
+
+def fetch_latest(timeout: float = 8.0) -> Optional[ReleaseInfo]:
+    """查询 GitHub 最新 Release，失败返回 None（不阻塞启动）。
+
+    优先列 Release 列表：``/releases/latest`` 在没有「正式版」时（例如仓库只发过
+    预发布版本）会直接返回 404，只看它会把「有更新」误判成「没有 Release」。
+    因此这里先拉列表、跳过 draft、按发布时间取最新，列表接口不可用时才退回 latest。
+    """
+    errors: list[str] = []
+    try:
+        data = _get_json(GITHUB_RELEASES_API, timeout)
+        if isinstance(data, list):
+            candidates = [r for r in data if not r.get("draft")]
+            candidates.sort(key=lambda r: str(r.get("published_at")
+                                               or r.get("created_at") or ""),
+                            reverse=True)
+            for raw in candidates:
+                info = _to_release(raw)
+                if info:
+                    return info
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        errors.append(f"list: {exc}")
+
+    try:
+        data = _get_json(GITHUB_API, timeout)
+        info = _to_release(data if isinstance(data, dict) else {})
+        if info:
+            return info
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        errors.append(f"latest: {exc}")
+
+    log.info("更新检查失败: %s", "; ".join(errors) or "无可用 Release")
+    return None
 
 
 def download(url: str, dest: Path,

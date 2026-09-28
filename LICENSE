@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-SuperInject 仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负。
-SuperInject is intended for debugging software you own or are authorized to
-test. Unauthorized use against third-party processes may be illegal.

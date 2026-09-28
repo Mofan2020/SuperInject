@@ -1,4 +1,4 @@
-"""pytest 全局清理：确保测试启动的目标进程不会残留。
+"""pytest 全局夹具与清理。
 
 Windows 11 上像 notepad.exe 这样的应用是「常驻宿主」进程，即使窗口关闭、
 `terminate()` 成功也可能继续存活，导致 CI 步骤迟迟不结束。这里统一在会话
@@ -64,6 +64,40 @@ def _force_kill(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
+
+
+@pytest.fixture
+def stub_winapi(monkeypatch):
+    """把 Win32 层打桩，让控制器逻辑可以在任意平台测试。"""
+    from superinject import controller as ctl_mod
+
+    table = [(100, "notepad.exe"), (200, "chrome.exe"), (300, "thing.exe")]
+    opened: list[int] = []
+
+    monkeypatch.setattr(ctl_mod.winapi, "enum_processes", lambda: list(table))
+    monkeypatch.setattr(ctl_mod.winapi, "process_path", lambda pid: f"C:\\{pid}.exe")
+    monkeypatch.setattr(ctl_mod.winapi, "process_memory_mb", lambda pid: 12.5)
+    monkeypatch.setattr(ctl_mod.winapi, "is_wow64", lambda pid: None)
+    monkeypatch.setattr(ctl_mod.winapi, "module_loaded", lambda pid, name: False)
+    monkeypatch.setattr(ctl_mod.winapi, "close_handle", lambda h: None)
+    monkeypatch.setattr(ctl_mod.winapi, "current_privilege", lambda: "admin")
+    monkeypatch.setattr(ctl_mod.winapi, "process_suspend_state", lambda pid: None)
+
+    def fake_open(pid, access=None):
+        opened.append(pid)
+        return 0x1234
+
+    monkeypatch.setattr(ctl_mod.winapi, "open_process", fake_open)
+    return {"table": table, "opened": opened}
+
+
+@pytest.fixture
+def fast_inject(monkeypatch):
+    """让注入等待/握手不真的睡满超时。"""
+    from superinject import controller as ctl_mod
+
+    monkeypatch.setattr(ctl_mod, "ATTACH_TIMEOUT", 0.0)
+    monkeypatch.setattr(ctl_mod, "DETACH_TIMEOUT", 0.0)
 
 
 @pytest.fixture(autouse=True)

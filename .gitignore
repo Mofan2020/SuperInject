@@ -11,3 +11,5 @@ superinject/embedded/dll_payload.py
 .vscode/
 .idea/
 *.log
+.DS_Store
+build/SuperInject.spec

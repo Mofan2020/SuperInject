@@ -8,10 +8,11 @@ from __future__ import annotations
 APP_NAME = "SuperInject"
 REPO = "Mofan2020/SuperInject"
 PROJECT_URL = f"https://github.com/{REPO}"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{REPO}/releases"
 GITHUB_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 GITHUB_RELEASES = f"https://github.com/{REPO}/releases"
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # 命名管道前缀：注入端 DLL 用 \\.\pipe\SuperInject-<控制器PID>-<目标PID>
 PIPE_PREFIX = r"\\.\pipe\SuperInject-"

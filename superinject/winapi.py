@@ -1,6 +1,7 @@
 """Win32 / NT API 的 ctypes 封装。
 
 所有与系统相关的原语都集中在这里，便于在其他平台安全导入做单元测试。
+本模块只做「薄封装」：参数校验、业务判定一律放在 controller 里。
 """
 
 from __future__ import annotations
@@ -14,10 +15,11 @@ IS_WINDOWS = sys.platform == "win32"
 
 # ---------------------------------------------------------------- 权限常量
 PROCESS_TERMINATE = 0x0001
+PROCESS_CREATE_THREAD = 0x0002
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
-PROCESS_CREATE_THREAD = 0x0002
+PROCESS_DUP_HANDLE = 0x0040
 PROCESS_SUSPEND_RESUME = 0x0800
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -26,11 +28,44 @@ SYNCHRONIZE = 0x00100000
 PROCESS_ALL_ACCESS = 0x1F0FFF
 
 TH32CS_SNAPPROCESS = 0x00000002
+TH32CS_SNAPTHREAD = 0x00000004
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+
+THREAD_QUERY_INFORMATION = 0x0040
+THREAD_SUSPEND_COUNT = 35           # THREADINFOCLASS.ThreadSuspendCount
 
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 MEM_RELEASE = 0x8000
 PAGE_READWRITE = 0x04
+
+TOKEN_QUERY = 0x0008
+TOKEN_USER = 1
+
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+LOCAL_SYSTEM_SID = "S-1-5-18"
+
+# 绝不允许注入的系统关键进程：注入它们会直接蓝屏
+CRITICAL_PROCESSES = {
+    "system",
+    "registry",
+    "idle",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "lsaiso.exe",
+    "svchost.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+    "sihost.exe",
+    "wudfhost.exe",
+    "memory compression",
+}
+CRITICAL_PIDS = {0, 4}
 
 
 class PROCESSENTRY32W(ctypes.Structure):
@@ -45,6 +80,33 @@ class PROCESSENTRY32W(ctypes.Structure):
         ("pcPriClassBase", wt.LONG),
         ("dwFlags", wt.DWORD),
         ("szExeFile", wt.WCHAR * 260),
+    ]
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ThreadID", wt.DWORD),
+        ("th32OwnerProcessID", wt.DWORD),
+        ("tpBasePri", wt.LONG),
+        ("tpDeltaPri", wt.LONG),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("th32ModuleID", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("GlblcntUsage", wt.DWORD),
+        ("ProccntUsage", wt.DWORD),
+        ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+        ("modBaseSize", wt.DWORD),
+        ("hModule", wt.HMODULE),
+        ("szModule", wt.WCHAR * 256),
+        ("szExePath", wt.WCHAR * 260),
     ]
 
 
@@ -65,6 +127,7 @@ class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
 
 _kernel32 = None
 _ntdll = None
+_advapi32 = None
 
 
 def kernel32():
@@ -73,6 +136,18 @@ def kernel32():
         if not IS_WINDOWS:
             raise RuntimeError("SuperInject 仅支持 Windows")
         _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _kernel32.GetCurrentProcess.restype = wt.HANDLE
+        _kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+        _kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+        _kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        _kernel32.OpenProcess.restype = wt.HANDLE
+        _kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        _kernel32.LoadLibraryW.restype = wt.HMODULE
+        _kernel32.LoadLibraryW.argtypes = [wt.LPCWSTR]
+        _kernel32.LocalFree.restype = wt.HLOCAL
+        _kernel32.LocalFree.argtypes = [wt.HLOCAL]
+        _kernel32.IsWow64Process.restype = wt.BOOL
+        _kernel32.IsWow64Process.argtypes = [wt.HANDLE, ctypes.POINTER(wt.BOOL)]
     return _kernel32
 
 
@@ -83,6 +158,25 @@ def ntdll():
             raise RuntimeError("SuperInject 仅支持 Windows")
         _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
     return _ntdll
+
+
+def advapi32():
+    global _advapi32
+    if _advapi32 is None:
+        if not IS_WINDOWS:
+            raise RuntimeError("SuperInject 仅支持 Windows")
+        _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        _advapi32.OpenProcessToken.restype = wt.BOOL
+        _advapi32.OpenProcessToken.argtypes = [
+            wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+        _advapi32.GetTokenInformation.restype = wt.BOOL
+        _advapi32.GetTokenInformation.argtypes = [
+            wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD,
+            ctypes.POINTER(wt.DWORD)]
+        _advapi32.ConvertSidToStringSidW.restype = wt.BOOL
+        _advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
+    return _advapi32
 
 
 def last_error() -> int:
@@ -97,18 +191,85 @@ def format_error(code: Optional[int] = None) -> str:
         return f"Win32 error {code}"
 
 
+# ---------------------------------------------------------------- 权限判定
+
+
+def current_sid() -> str:
+    """当前进程令牌的用户 SID 字符串（失败返回空串）。"""
+    if not IS_WINDOWS:
+        return ""
+    a = advapi32()
+    k = kernel32()
+    token = wt.HANDLE()
+    if not a.OpenProcessToken(k.GetCurrentProcess(), TOKEN_QUERY,
+                              ctypes.byref(token)):
+        return ""
+    try:
+        need = wt.DWORD(0)
+        a.GetTokenInformation(token, TOKEN_USER, None, 0, ctypes.byref(need))
+        if not need.value:
+            return ""
+        buf = ctypes.create_string_buffer(need.value)
+        if not a.GetTokenInformation(token, TOKEN_USER, buf, need.value,
+                                     ctypes.byref(need)):
+            return ""
+        sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+        out = wt.LPWSTR()
+        if not a.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr),
+                                        ctypes.byref(out)):
+            return ""
+        try:
+            return out.value or ""
+        finally:
+            k.LocalFree(out)
+    finally:
+        k.CloseHandle(token)
+
+
+def is_system() -> bool:
+    """当前是否以 SYSTEM（LocalSystem）身份运行。"""
+    return current_sid() == LOCAL_SYSTEM_SID
+
+
+def is_admin() -> bool:
+    """当前令牌是否已提权（管理员或 SYSTEM）。"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        shell.IsUserAnAdmin.restype = wt.BOOL
+        if shell.IsUserAnAdmin():
+            return True
+    except Exception:  # pragma: no cover
+        pass
+    return is_system()
+
+
+def current_privilege() -> str:
+    """返回 'system' / 'admin' / 'user'。"""
+    if not IS_WINDOWS:
+        return "user"
+    if is_system():
+        return "system"
+    return "admin" if is_admin() else "user"
+
+
+def is_elevated() -> bool:
+    """当前进程是否具备管理员/SYSTEM 权限。"""
+    return current_privilege() in ("admin", "system")
+
+
 # ---------------------------------------------------------------- 进程枚举
 
 
 def enum_processes() -> list[tuple[int, str]]:
     """返回 [(pid, exe_name)]，不含当前进程。"""
     k = kernel32()
-    k.CreateToolhelp32Snapshot.restype = wt.HANDLE
     k.Process32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
     k.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
 
     snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == -1 or snap == 0xFFFFFFFFFFFFFFFF:
+    if snap in (0, INVALID_HANDLE_VALUE):
         raise OSError(format_error(), "CreateToolhelp32Snapshot")
 
     out: list[tuple[int, str]] = []
@@ -126,6 +287,66 @@ def enum_processes() -> list[tuple[int, str]]:
     finally:
         k.CloseHandle(snap)
     return out
+
+
+def enum_thread_ids(pid: int) -> list[int]:
+    """枚举某个进程的全部线程 ID。"""
+    k = kernel32()
+    k.Thread32First.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    k.Thread32Next.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if snap in (0, INVALID_HANDLE_VALUE):
+        return []
+    out: list[int] = []
+    try:
+        te = THREADENTRY32()
+        te.dwSize = ctypes.sizeof(THREADENTRY32)
+        if k.Thread32First(snap, ctypes.byref(te)):
+            while True:
+                if int(te.th32OwnerProcessID) == int(pid):
+                    out.append(int(te.th32ThreadID))
+                if not k.Thread32Next(snap, ctypes.byref(te)):
+                    break
+    finally:
+        k.CloseHandle(snap)
+    return out
+
+
+def enum_remote_modules(pid: int) -> list[dict]:
+    """枚举目标进程已加载的模块（跨位数可能失败，返回空列表）。"""
+    k = kernel32()
+    k.Module32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    k.Module32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                      pid)
+    if snap in (0, INVALID_HANDLE_VALUE):
+        return []
+    out: list[dict] = []
+    try:
+        me = MODULEENTRY32W()
+        me.dwSize = ctypes.sizeof(MODULEENTRY32W)
+        if k.Module32FirstW(snap, ctypes.byref(me)):
+            while True:
+                out.append({
+                    "name": me.szModule,
+                    "path": me.szExePath,
+                    "base": int(ctypes.cast(me.modBaseAddr, ctypes.c_void_p).value or 0),
+                    "size": int(me.modBaseSize),
+                })
+                if not k.Module32NextW(snap, ctypes.byref(me)):
+                    break
+    finally:
+        k.CloseHandle(snap)
+    return out
+
+
+def module_loaded(pid: int, module_name: str) -> bool:
+    """目标进程内是否已加载同名模块（用于识别「已注入」）。"""
+    want = str(module_name).lower()
+    try:
+        return any(m["name"].lower() == want for m in enum_remote_modules(pid))
+    except Exception:  # pragma: no cover
+        return False
 
 
 def os_getpid() -> int:
@@ -149,6 +370,43 @@ def process_path(pid: int) -> str:
         if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
             return buf.value
         return ""
+    finally:
+        k.CloseHandle(h)
+
+
+def pid_alive(pid: int) -> bool:
+    """进程是否仍然存活（能拿到查询句柄即视为存活）。"""
+    try:
+        h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+    except Exception:  # pragma: no cover
+        return False
+    if not h:
+        return False
+    kernel32().CloseHandle(h)
+    return True
+
+
+def process_name(pid: int) -> str:
+    """按 PID 查进程名，失败返回空串。"""
+    for p, name in enum_processes():
+        if p == pid:
+            return name
+    return ""
+
+
+def is_wow64(pid: int) -> Optional[bool]:
+    """目标进程是否为 32 位（在 64 位系统上运行）。无法判定返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    k = kernel32()
+    h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        wow = wt.BOOL(0)
+        if not k.IsWow64Process(h, ctypes.byref(wow)):
+            return None
+        return bool(wow.value)
     finally:
         k.CloseHandle(h)
 
@@ -194,35 +452,21 @@ def process_memory_mb(pid: int) -> float:
         return 0.0
 
 
-def is_elevated() -> bool:
-    """当前进程是否以管理员/SYSTEM 身份运行。"""
-    if not IS_WINDOWS:
-        return False
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-    shell = ctypes.WinDLL("shell32", use_last_error=True)
-    advapi.OpenProcessToken.restype = wt.HANDLE
-    advapi.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
-    advapi.GetTokenInformation.restype = wt.BOOL
-    advapi.GetTokenInformation.argtypes = [
-        wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD),
-    ]
-
-    class TOKEN_ELEVATION(ctypes.Structure):
-        _fields_ = [("TokenIsElevated", wt.DWORD)]
-
-    # 直接使用 Shell32 的 IsUserAnAdmin 简单可靠
-    shell.IsUserAnAdmin.restype = wt.BOOL
-    return bool(shell.IsUserAnAdmin())
-
-
 # ---------------------------------------------------------------- 进程控制
 
 
 def open_process(pid: int, access: int = PROCESS_ALL_ACCESS) -> wt.HANDLE:
-    k = kernel32()
-    k.OpenProcess.restype = wt.HANDLE
-    k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
-    return k.OpenProcess(access, False, pid)
+    return kernel32().OpenProcess(access, False, pid)
+
+
+def close_handle(handle) -> None:
+    """关闭句柄，失败不抛异常（句柄无效/句柄为 0 都不该影响主流程）。"""
+    if not handle:
+        return
+    try:
+        kernel32().CloseHandle(handle)
+    except Exception:  # pragma: no cover - 非 Windows 或已关闭
+        pass
 
 
 def terminate_process(pid: int) -> bool:
@@ -248,8 +492,7 @@ def suspend_process(pid: int) -> bool:
     try:
         return n.NtSuspendProcess(h) == 0
     finally:
-        k = kernel32()
-        k.CloseHandle(h)
+        kernel32().CloseHandle(h)
 
 
 def resume_process(pid: int) -> bool:
@@ -263,28 +506,65 @@ def resume_process(pid: int) -> bool:
     try:
         return n.NtResumeProcess(h) == 0
     finally:
-        k = kernel32()
+        kernel32().CloseHandle(h)
+
+
+def thread_suspend_count(tid: int) -> Optional[int]:
+    """查询线程的挂起计数（>0 表示被挂起）。失败返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    k = kernel32()
+    n = ntdll()
+    k.OpenThread.restype = wt.HANDLE
+    k.OpenThread.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    n.NtQueryInformationThread.restype = wt.LONG
+    n.NtQueryInformationThread.argtypes = [
+        wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+        ctypes.POINTER(wt.ULONG)]
+    h = k.OpenThread(THREAD_QUERY_INFORMATION, False, tid)
+    if not h:
+        return None
+    try:
+        count = wt.ULONG(0)
+        ret_len = wt.ULONG(0)
+        status = n.NtQueryInformationThread(
+            h, THREAD_SUSPEND_COUNT, ctypes.byref(count),
+            ctypes.sizeof(count), ctypes.byref(ret_len))
+        return int(count.value) if status == 0 else None
+    finally:
         k.CloseHandle(h)
 
 
-def is_suspended(pid: int) -> bool:
-    """占位：Windows 未提供公开的「进程是否被挂起」查询。
+def process_suspend_state(pid: int) -> Optional[bool]:
+    """判断进程是否处于「全部线程被挂起」状态。
 
-    实际使用中由 Controller 自行记录冻结状态（见 Controller._frozen），
-    因此这里不做猜测性实现。
+    返回 True=已冻结 / False=运行中 / None=无法判定（权限或平台限制）。
     """
-    return False
+    if not IS_WINDOWS:
+        return None
+    tids = enum_thread_ids(pid)
+    if not tids:
+        return None
+    counts: list[int] = []
+    for tid in tids:
+        c = thread_suspend_count(tid)
+        if c is not None:
+            counts.append(c)
+    if not counts:
+        return None
+    return all(c > 0 for c in counts)
 
 
 # ---------------------------------------------------------------- 注入
 
 
 def _loadlibrary_address() -> int:
-    """取得 kernel32!LoadLibraryW 地址（同一架构下所有进程地址一致）。"""
+    """取得 kernel32!LoadLibraryW 地址。
+
+    kernel32 在同一登录会话的所有进程中加载于相同基址，
+    因此控制器内的函数地址对目标进程同样有效（CreateRemoteThread 的标准做法）。
+    """
     k = kernel32()
-    k.LoadLibraryW.restype = wt.HMODULE
-    k.LoadLibraryW.argtypes = [wt.LPCWSTR]
-    # 用一个必定存在的模块取地址，避免真的加载
     addr = ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value
     return int(addr or 0)
 
@@ -295,7 +575,6 @@ def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
     返回远程线程的退出码（DLL 的 HMODULE，失败为 0）。
     """
     import os
-    import time
 
     k = kernel32()
     k.VirtualAllocEx.restype = wt.LPVOID
@@ -311,6 +590,7 @@ def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
     k.VirtualFreeEx.restype = wt.BOOL
     k.VirtualFreeEx.argtypes = [wt.HANDLE, wt.LPVOID, ctypes.c_size_t, wt.DWORD]
     k.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    k.GetExitCodeThread.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 
     dll_path = os.path.abspath(dll_path)
     data = (dll_path + "\0").encode("utf-16-le")

@@ -107,7 +107,8 @@ jobs:
           path: native/build/SuperInjectAgent.dll
 
   # ---------------------------------------------------------------
-  # 3) 纯逻辑单元测试：双平台
+  # 3) 纯逻辑单元测试 + 静态检查：双平台
+  #    （含本地预览服务、资源转换、自检报告等跨平台可跑的用例）
   # ---------------------------------------------------------------
   unit-tests:
     name: 单元测试 (${{ matrix.os }})
@@ -131,8 +132,12 @@ jobs:
       - name: 语法编译检查
         run: python -m compileall -q superinject build tests run_superinject.py
 
-      - name: 跳过注入集成测试的 pytest
-        run: python -m pytest tests -q --ignore=tests/test_integration_windows.py --junitxml=pytest-results/unit-${{ matrix.os }}.xml
+      - name: 代码风格检查 (ruff)
+        run: python -m ruff check superinject build tests run_superinject.py
+
+      - name: 单元测试（跳过需要注入真实进程的集成测试）
+        run: |
+          python -m pytest tests -q --ignore=tests/test_integration_windows.py --junitxml=pytest-results/unit-${{ matrix.os }}.xml
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -141,7 +146,7 @@ jobs:
           path: pytest-results/unit-${{ matrix.os }}.xml
 
   # ---------------------------------------------------------------
-  # 4) Windows runner 上跑真实注入集成测试（注入 notepad 并控制）
+  # 4) Windows runner 上跑真实注入集成测试（注入 ping.exe 并控制它）
   # ---------------------------------------------------------------
   integration:
     name: 注入集成测试 (Windows)
@@ -165,23 +170,27 @@ jobs:
           name: dll-msvc
           path: native/build
 
-      - name: 确认当前进程具备提权能力
+      - name: 确认当前进程具备提权能力（注入前提）
         shell: bash
         run: |
-          python -c "import ctypes;print('admin=',bool(ctypes.windll.shell32.IsUserAnAdmin()))"
+          python -c "import ctypes,sys; ok=bool(ctypes.windll.shell32.IsUserAnAdmin()); print('admin=',ok); sys.exit(0 if ok else 1)"
 
-      - name: 注入 / 内存读写 / 冻结 / 卸载 / 终止 端到端
+      - name: 注入 / 内存读写 / 冻结 / 资源 / 卸载 / 终止 端到端
+        shell: bash
         env:
           SUPERINJECT_DLL_PATH: native/build/SuperInjectAgent.dll
           SUPERINJECT_DEBUG: "1"
+        run: python -m pytest tests/test_integration_windows.py -v --timeout=300
+        timeout-minutes: 20
+
+      - name: IPC 调试日志（末尾 160 行）
+        if: always()
+        shell: bash
         run: |
-          python -m pytest tests/test_integration_windows.py -v -x --timeout=180
-          echo "===== IPC 调试日志（末尾 120 行）====="
-          if [ -f superinject-debug.log ]; then tail -n 120 superinject-debug.log; else echo "(无日志文件)"; fi
-        timeout-minutes: 15
+          if [ -f supinject-debug.log ]; then tail -n 160 supinject-debug.log; else echo "(无日志文件)"; fi
 
   # ---------------------------------------------------------------
-  # 5) 用 Windows runner + PyInstaller 打包可执行文件
+  # 5) Windows runner + PyInstaller 打包，并压成发布用的 zip
   # ---------------------------------------------------------------
   package:
     name: 打包 SuperInject.exe
@@ -225,6 +234,7 @@ jobs:
         run: |
           python -m PyInstaller --noconfirm --clean --name SuperInject --windowed `
             --onedir --add-data "superinject/web;superinject/web" `
+            --collect-submodules webview `
             --hidden-import webview.platforms.edgechromium run_superinject.py
 
       - name: 冒烟检查产物
@@ -238,18 +248,82 @@ jobs:
           print("OK:", exe, exe.stat().st_size, "bytes")
           PY
 
+      - name: 压缩为发布包
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/SuperInject/* -DestinationPath dist/SuperInject-win-x64.zip -Force
+          Get-Item dist/SuperInject-win-x64.zip | Select-Object Name, Length
+
       - uses: actions/upload-artifact@v4
         with:
           name: SuperInject-win-x64
-          path: dist/SuperInject
+          path: dist
 
   # ---------------------------------------------------------------
-  # 6) 打 tag 自动发版
+  # 6) 对「打包产物」做真实验证：运行 exe 的无界面自检
+  #    校验内嵌 DLL → 注入真实进程 → 内存读写 → 冻结 → 卸载 → 重新注入 → 终止
+  # ---------------------------------------------------------------
+  exe-self-test:
+    name: 打包产物自检 (SuperInject.exe --self-test)
+    needs: [package]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SuperInject-win-x64
+          path: dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 确认 runner 具备提权能力
+        shell: pwsh
+        run: |
+          $admin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "admin=$admin"
+          if (-not $admin) { exit 1 }
+
+      - name: 运行打包产物的无界面自检
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\SuperInject\SuperInject.exe" `
+            -ArgumentList "--self-test" -Wait -PassThru -NoNewWindow
+          Write-Host "exit code: $($p.ExitCode)"
+          $report = "dist\SuperInject\self-test-report.json"
+          if (-not (Test-Path $report)) { Write-Error "自检报告未生成"; exit 1 }
+          Get-Content $report -Raw
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: 断言自检报告全部通过
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path("dist/SuperInject/self-test-report.json")
+                            .read_text(encoding="utf-8"))
+          for step in data["steps"]:
+              mark = "PASS" if step["ok"] else "FAIL"
+              print(f"[{mark}] {step['name']}: {step['detail']}")
+          assert data["ok"], f"自检失败 {data['failed']} 步"
+          assert len(data["steps"]) >= 10, "自检步骤过少，链路没跑全"
+          print(f"OK: {data['passed']}/{len(data['steps'])} 步通过, "
+                f"版本 {data['version']}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: self-test-report
+          path: dist/SuperInject/self-test-report.json
+
+  # ---------------------------------------------------------------
+  # 7) 打 tag 自动发版（正式版 + zip 资产，自动更新只认这个 zip）
   # ---------------------------------------------------------------
   release:
     name: 发布 GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package]
+    needs: [package, exe-self-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -261,7 +335,8 @@ jobs:
       - name: 生成 Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SuperInject/*
+          files: dist/SuperInject-win-x64.zip
+          prerelease: false
           generate_release_notes: true
           body: |
             ## ⚠️ 使用前必读
@@ -272,3 +347,12 @@ jobs:
             - 严禁用于绕过软件的授权 / 保护机制；
             - 未经授权对第三方进程注入 DLL 可能违反当地法律与服务条款，
               由此产生的一切后果由使用者自行承担。
+
+            ## 本版验证情况
+
+            CI 在 windows-latest 上完成了两层真实验证：
+            1. `pytest tests/test_integration_windows.py` —— 真实注入 `ping.exe`，
+               覆盖注入检查 / 内存搜索与读写（含只读页改写）/ 冻结与解除（核实线程挂起状态）/
+               资源提取 / 卸载 / 重新注入 / 自我终止；
+            2. `SuperInject.exe --self-test` —— 直接跑**本页下载的打包产物**，
+               用内嵌 DLL 走一遍完整链路，报告见该次 CI 运行的 `self-test-report` 工件。

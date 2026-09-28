@@ -18,7 +18,7 @@ import queue
 import struct
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .version import pipe_name
 
@@ -176,6 +176,33 @@ class PipeServer:
 
     def targets(self) -> set[int]:
         return set(self._targets)
+
+    def attached_pids(self) -> set[int]:
+        """当前已建立控制通道的目标 PID 集合。"""
+        with self._lock:
+            return {pid for pid, c in self._conns.items() if c.alive}
+
+    def wait_attach(self, pid: int, timeout: float = 10.0,
+                    interval: float = 0.05) -> bool:
+        """等待注入端建立连接（注入后确认控制通道真的通了）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_attached(pid):
+                return True
+            if pid not in self._targets:
+                return False
+            time.sleep(interval)
+        return self.is_attached(pid)
+
+    def wait_detach(self, pid: int, timeout: float = 8.0,
+                    interval: float = 0.05) -> bool:
+        """等待目标进程断开（卸载 DLL / 进程退出后使用）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_attached(pid):
+                return True
+            time.sleep(interval)
+        return not self.is_attached(pid)
 
     def request(self, pid: int, cmd: dict, timeout: float = 20.0) -> dict:
         """向目标进程发送一条命令并等待响应。"""

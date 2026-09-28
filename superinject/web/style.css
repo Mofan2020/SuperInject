@@ -129,3 +129,34 @@ td.path { color: var(--muted); font-size: 11.5px; word-break: break-all; }
 .modal-box .row.end { justify-content: flex-end; }
 .muted { color: var(--muted); font-size: 12px; }
 .hidden { display: none !important; }
+
+/* --------------------------------------------------- 进程资源预览 */
+.res-grid {
+  display: grid; gap: 10px; padding: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  max-height: 460px; overflow: auto;
+}
+.res-group {
+  grid-column: 1 / -1; color: var(--muted); font-size: 11.5px;
+  border-bottom: 1px solid var(--line); padding-bottom: 4px; margin-top: 4px;
+}
+.res-card {
+  background: var(--bg3); border: 1px solid var(--line); border-radius: 9px;
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.res-media {
+  height: 132px; background: #0b0d11; display: grid; place-items: center; overflow: hidden;
+}
+.res-media img { max-width: 100%; max-height: 132px; object-fit: contain; display: block; }
+.res-media video { width: 100%; height: 132px; background: #000; }
+.res-media audio { width: 92%; }
+.no-preview { color: var(--muted); font-size: 11.5px; padding: 0 8px; text-align: center; }
+.res-meta { padding: 7px 9px; display: flex; flex-direction: column; gap: 3px; }
+.res-title { font-size: 12px; font-weight: 600; }
+.res-sub { color: var(--muted); font-size: 11px; }
+.res-path {
+  color: var(--muted); font-size: 11px; word-break: break-all;
+  max-height: 32px; overflow: hidden;
+}
+.res-meta .row { display: flex; gap: 6px; margin-top: 4px; }
+.res-meta .row button { padding: 3px 8px; font-size: 11.5px; }

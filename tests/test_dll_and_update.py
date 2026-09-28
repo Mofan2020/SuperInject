@@ -7,12 +7,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from superinject import dll_manager, updater
-from superinject.version import __version__
 
 
 # ------------------------------------------------------------- SHA 自校验
@@ -108,11 +106,30 @@ def _release_payload(tag="v9.9.9", assets=None):
         "tag_name": tag,
         "html_url": "https://example/releases",
         "body": "notes",
+        "draft": False,
+        "prerelease": False,
+        "published_at": "2026-09-28T00:00:00Z",
         "assets": assets or [
             {"name": "SuperInject-win-x64.zip",
              "browser_download_url": "https://example/a.zip"},
         ],
     }
+
+
+class FakeResponse:
+    """模拟 urllib 的上下文管理返回对象。"""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._payload
 
 
 def test_release_info_detects_newer():
@@ -134,28 +151,60 @@ def test_windows_asset_pick():
     assert rel.windows_asset()["browser_download_url"].endswith("w.zip")
 
 
-def test_fetch_latest_uses_api(monkeypatch):
+def test_fetch_latest_prefers_release_list(monkeypatch):
+    """先走 Release 列表接口（预发布版本也能看到）。"""
     captured = {}
-
-    class FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return json.dumps(_release_payload()).encode()
+    payload = [
+        _release_payload(tag="v1.0.1", assets=[]),
+        _release_payload(tag="v1.0.0"),
+    ]
+    payload[0]["published_at"] = "2026-09-28T00:00:00Z"
+    payload[1]["published_at"] = "2026-09-01T00:00:00Z"
 
     def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
-        return FakeResp()
+        return FakeResponse(json.dumps(payload).encode())
 
     monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
     rel = updater.fetch_latest()
-    assert captured["url"] == updater.GITHUB_API
+    assert captured["url"] == updater.GITHUB_RELEASES_API
+    assert rel.version == "1.0.1"
+
+
+def test_fetch_latest_skips_drafts_and_uses_prerelease(monkeypatch):
+    """只有预发布版本时也要能发现更新（/releases/latest 这时会 404）。"""
+    payload = [
+        {"tag_name": "v9.9.9", "draft": True, "assets": []},
+        {"tag_name": "v1.2.0", "prerelease": True, "assets": [],
+         "published_at": "2026-09-27T00:00:00Z"},
+    ]
+    monkeypatch.setattr(updater.urllib.request, "urlopen",
+                        lambda req, timeout=None: FakeResponse(json.dumps(payload).encode()))
+    rel = updater.fetch_latest()
+    assert rel.version == "1.2.0" and rel.prerelease is True and rel.has_newer
+
+
+def test_fetch_latest_missing_tag_is_skipped(monkeypatch):
+    payload = [{"draft": False, "assets": []},
+               _release_payload(tag="v3.0.0")]
+    monkeypatch.setattr(updater.urllib.request, "urlopen",
+                        lambda req, timeout=None: FakeResponse(json.dumps(payload).encode()))
+    assert updater.fetch_latest().version == "3.0.0"
+
+
+def test_fetch_latest_falls_back_to_latest_endpoint(monkeypatch):
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if req.full_url == updater.GITHUB_RELEASES_API:
+            raise OSError("list down")
+        return FakeResponse(json.dumps(_release_payload()).encode())
+
+    monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
+    rel = updater.fetch_latest()
+    assert calls == [updater.GITHUB_RELEASES_API, updater.GITHUB_API]
     assert rel.version == "9.9.9"
-    assert rel.has_newer
 
 
 def test_fetch_latest_swallows_errors(monkeypatch):

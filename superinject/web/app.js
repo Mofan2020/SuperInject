@@ -27,6 +27,18 @@
     box.scrollTop = box.scrollHeight;
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  function humanSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1048576).toFixed(2) + " MB";
+  }
+
   // ---------------------------------------------------------- 进程表
   function render() {
     const tb = $("#proc-table tbody");
@@ -40,12 +52,15 @@
     rows.forEach((p) => {
       const tr = document.createElement("tr");
       if (state.sel.has(p.pid)) tr.className = "sel";
+      const flags = [];
+      if (p.injected) flags.push('<span class="pill on">已注入</span>');
+      if (p.frozen) flags.push('<span class="pill frozen">❄ 冻结</span>');
       tr.innerHTML = `
         <td class="c-sel"><input type="checkbox" ${state.sel.has(p.pid) ? "checked" : ""} /></td>
         <td>${p.pid}</td>
         <td>${escapeHtml(p.name)}</td>
         <td>${p.mem_mb}</td>
-        <td><span class="pill ${p.injected ? "on" : ""}">${p.injected ? "已注入" : "—"}</span>${p.frozen ? ' <span class="pill frozen">❄ 冻结</span>' : ""}</td>
+        <td>${flags.join(" ") || '<span class="pill">—</span>'}</td>
         <td class="path">${escapeHtml(p.path || "")}</td>`;
       tr.querySelector("input").addEventListener("change", (e) => {
         if (e.target.checked) state.sel.add(p.pid);
@@ -63,11 +78,6 @@
     updateCounts();
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"]/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  }
-
   function selected() {
     return Array.from(state.sel);
   }
@@ -82,7 +92,6 @@
     const list = await call("list_processes");
     if (!Array.isArray(list)) return;
     state.procs = list.filter((p) => p.pid);
-    // 清理已不存在的选择
     const alive = new Set(state.procs.map((p) => p.pid));
     state.sel = new Set(Array.from(state.sel).filter((p) => alive.has(p)));
     render();
@@ -115,6 +124,9 @@
       try {
         const res = await call(cfg.method, pids);
         summarize(cfg.title, res);
+        if (key === "resources") renderResources(res);
+        if (key === "freeze" || key === "unfreeze") reportSuspend(cfg.title, res);
+        if (key === "unload" || key === "terminate") setTimeout(refresh, 600);
       } finally {
         btn.disabled = false;
       }
@@ -135,15 +147,103 @@
       mods.slice(0, 12).forEach((m) =>
         log(`    ${m.name}  base=0x${Number(m.base).toString(16)}  ${m.size}`));
     });
-    if (title === "查看进程资源") res.forEach((r) => {
-      const items = (r.resp && r.resp.items) || [];
-      const dir = (r.resp && r.resp.dir) || "";
-      log(`  PID ${r.pid} 提取 ${items.length} 个资源 → ${dir}`, "ok");
-      items.slice(0, 20).forEach((it) =>
-        log(`    [${it.ext}] ${it.size} bytes  ${it.module}  ${it.path}`));
-      if (dir) call("reveal", dir);
+  }
+
+  function reportSuspend(title, res) {
+    (res || []).forEach((r) => {
+      if (!r.ok) return;
+      if (r.verified === true) log(`  PID ${r.pid} 已确认全部线程被挂起（无响应）`, "ok");
+      else if (r.verified === false) log(`  PID ${r.pid} 已确认线程全部恢复运行`, "ok");
+      else log(`  PID ${r.pid} 挂起状态无法核实（权限限制）`, "warn");
     });
   }
+
+  // ---------------------------------------------------------- 资源预览
+  function renderResources(res) {
+    const grid = $("#res-grid");
+    grid.innerHTML = "";
+    let total = 0;
+    let dir = "";
+    (res || []).forEach((r) => {
+      const items = (r.resp && r.resp.items) || [];
+      dir = (r.resp && r.resp.dir) || dir;
+      total += items.length;
+      log(`PID ${r.pid} 提取 ${items.length} 个资源` +
+        `（PE 资源 ${(r.resp && r.resp.resource_count) || 0} / ` +
+        `内存映射 ${(r.resp && r.resp.mapped_count) || 0}）→ ${r.resp && r.resp.dir}`,
+        items.length ? "ok" : "warn");
+      if (!items.length) return;
+      const head = document.createElement("div");
+      head.className = "res-group";
+      head.textContent = `PID ${r.pid}`;
+      grid.appendChild(head);
+      items.forEach((it) => grid.appendChild(resCard(r.pid, it)));
+    });
+    $("#res-summary").textContent = total ? `共 ${total} 个资源` : "没有找到可预览的图片/音频/视频";
+  }
+
+  function resCard(pid, it) {
+    const card = document.createElement("div");
+    card.className = "res-card";
+    const media = document.createElement("div");
+    media.className = "res-media";
+    const url = it.previewable ? it.url : "";
+    if (url && it.kind === "image") {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = url;
+      img.alt = it.ext;
+      media.appendChild(img);
+    } else if (url && it.kind === "video") {
+      const v = document.createElement("video");
+      v.src = url;
+      v.controls = true;
+      v.preload = "metadata";
+      media.appendChild(v);
+    } else if (url && it.kind === "audio") {
+      const a = document.createElement("audio");
+      a.src = url;
+      a.controls = true;
+      media.appendChild(a);
+    } else {
+      const none = document.createElement("div");
+      none.className = "no-preview";
+      none.textContent = it.kind === "other" ? "非媒体文件" : "无法预览（体积过大或格式不支持）";
+      media.appendChild(none);
+    }
+    card.appendChild(media);
+
+    const meta = document.createElement("div");
+    meta.className = "res-meta";
+    const source = it.source === "mapped" ? "内存映射" : "PE 资源";
+    meta.innerHTML = `
+      <div class="res-title">${it.ext.toUpperCase()} · ${humanSize(it.size)}${it.truncated ? " · 已截断" : ""}</div>
+      <div class="res-sub">${source}${it.rtype ? " · 类型 " + it.rtype : ""}</div>
+      <div class="res-path" title="${escapeHtml(it.origin || "")}">${escapeHtml(it.origin || it.path)}</div>`;
+    const row = document.createElement("div");
+    row.className = "row";
+    const open = document.createElement("button");
+    open.className = "ghost";
+    open.textContent = "定位文件";
+    open.addEventListener("click", () => call("reveal", it.path));
+    row.appendChild(open);
+    if (it.origin && it.origin !== it.path) {
+      const src = document.createElement("button");
+      src.className = "ghost";
+      src.textContent = "定位来源";
+      src.addEventListener("click", () => call("reveal", it.origin));
+      row.appendChild(src);
+    }
+    meta.appendChild(row);
+    card.appendChild(meta);
+    return card;
+  }
+
+  $("#btn-reveal-all").addEventListener("click", () => {
+    const first = $("#res-grid").querySelector(".res-path");
+    if (first) call("reveal", first.getAttribute("title") || "");
+    else log("还没有提取过资源", "warn");
+  });
 
   // ---------------------------------------------------------- 内存
   $("#btn-search").addEventListener("click", async () => {
@@ -202,20 +302,37 @@
     }
   });
 
-  // ---------------------------------------------------------- 注入 / DLL
+  // ---------------------------------------------------------- 注入
   $("#btn-inject").addEventListener("click", async () => {
     const pids = selected();
     if (!pids.length) return log("请先选择目标进程", "warn");
+
+    log(`注入检查：${pids.length} 个进程…`);
+    const checks = await call("preflight", pids);
+    const list = Array.isArray(checks) ? checks : [];
+    list.forEach((c) => {
+      (c.warnings || []).forEach((w) => log(`  PID ${c.pid} 提醒: ${w}`, "warn"));
+      if (c.blocked) log(`  PID ${c.pid} 无法注入: ${c.reason}`, "err");
+    });
+    const okPids = list.filter((c) => !c.blocked).map((c) => c.pid);
+    if (!okPids.length) return log("没有可注入的进程", "err");
+    log(`注入检查通过 ${okPids.length}/${pids.length}`, "ok");
+
     const ok = await confirmBox("注入确认",
-      `即将向 ${pids.length} 个进程注入 SuperInjectAgent.dll。\n\n` +
+      `即将向 ${okPids.length} 个进程注入 SuperInjectAgent.dll。\n\n` +
       `请确认这些是你自己拥有或已获授权调试的进程。`);
     if (!ok) return;
-    log(`开始注入 ${pids.join(", ")}…`);
-    const res = await call("inject", pids);
+
+    log(`开始注入 ${okPids.join(", ")}…`);
+    const res = await call("inject", okPids);
     let okCount = 0;
     (res || []).forEach((r) => {
-      if (r.ok) { okCount++; log(`  PID ${r.pid} 注入成功 ${r.image || ""}`, "ok"); }
-      else log(`  PID ${r.pid} 注入失败: ${r.error}`, "err");
+      if (r.ok) {
+        okCount++;
+        log(`  PID ${r.pid} 注入成功并已建立控制通道 ${r.image || ""}`, "ok");
+      } else {
+        log(`  PID ${r.pid} 注入失败: ${r.error}`, "err");
+      }
     });
     log(`注入完成 ${okCount}/${(res || []).length}`, okCount ? "ok" : "warn");
     setTimeout(refresh, 800);
@@ -291,12 +408,18 @@
     $("#up-later").onclick = () => $("#update-modal").classList.add("hidden");
   }
 
+  const PRIV_LABELS = { system: "SYSTEM ✓", admin: "管理员 ✓", user: "未提权 ✗" };
+
   // ---------------------------------------------------------- 后端事件
   window.SI = {
     onEvent(name, payload) {
       if (name === "state") {
-        const inj = Object.keys(payload.injected || {});
-        state.procs.forEach((p) => (p.injected = inj.includes(String(p.pid))));
+        const inj = Object.keys(payload.injected || {}).map(String);
+        const frozen = (payload.frozen || []).map((f) => String(f.pid));
+        state.procs.forEach((p) => {
+          p.injected = inj.includes(String(p.pid));
+          p.frozen = frozen.includes(String(p.pid));
+        });
         render();
       } else if (name === "dll") {
         log("DLL: " + payload.message, payload.ok ? "ok" : "err");
@@ -318,15 +441,19 @@
     try {
       const info = await call("bootstrap");
       $("#badge-ver").textContent = "v" + info.version;
+      $("#badge-arch").textContent = (info.arch || "?") + " / " + (info.app || "");
       const admin = $("#badge-admin");
-      admin.textContent = info.is_admin ? "权限 ✓" : "权限 ✗";
-      admin.className = "badge " + (info.is_admin ? "ok" : "bad");
+      admin.textContent = "权限 " + (PRIV_LABELS[info.privilege] || "未知");
+      admin.className = "badge " + (info.privilege === "user" ? "bad" : "ok");
       const dll = $("#badge-dll");
       dll.textContent = info.dll.ok ? "DLL " + info.dll.action : "DLL 异常";
       dll.className = "badge " + (info.dll.ok ? "ok" : "bad");
       $("#dll-path").textContent = info.dll.path || "";
       log("启动自检: " + info.identity);
       log(info.dll.message || "");
+      if (info.dll.embedded_sha) {
+        log(`DLL SHA256（运行时计算）: ${String(info.dll.embedded_sha).slice(0, 32)}…`);
+      }
     } catch (e) {
       log("初始化失败: " + e, "err");
     }

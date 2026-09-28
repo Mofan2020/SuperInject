@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TARGET_IMG = "ping.exe"
+PAGE_READWRITE = 0x04
 
 
 def _dll_path() -> Path:
@@ -49,6 +51,11 @@ def _wait_until(fn, timeout=25.0, interval=0.5):
     return result
 
 
+def kill(pid: int) -> None:
+    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                   capture_output=True, check=False)
+
+
 @pytest.fixture(scope="module")
 def target():
     """模块级目标进程：整个模块复用，模块结束时强制回收。"""
@@ -57,11 +64,6 @@ def target():
     pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
     yield pid
     kill(pid)
-
-
-def kill(pid: int) -> None:
-    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                   capture_output=True, check=False)
 
 
 @pytest.fixture()
@@ -73,6 +75,20 @@ def ctrl():
     c.server.shutdown()
 
 
+@pytest.fixture()
+def injected(ctrl):
+    """每个用例一个自己的、已注入的目标进程。"""
+    pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
+    try:
+        res = ctrl.inject([pid])[0]
+        assert res["ok"], f"注入失败: {res.get('error')}"
+        assert res["attached"], "控制通道未建立"
+        assert _ping(ctrl, pid), "注入端无响应"
+        yield pid
+    finally:
+        kill(pid)
+
+
 def _ping(ctrl, pid, timeout=30):
     """等待注入端连接并返回 ping 结果。"""
     return _wait_until(
@@ -82,9 +98,15 @@ def _ping(ctrl, pid, timeout=30):
     )
 
 
-def test_dll_is_valid_pe():
-    import struct
+def _pid_alive(pid: int) -> bool:
+    from superinject import winapi
 
+    return winapi.pid_alive(pid)
+
+
+# ------------------------------------------------------------------ DLL / 列表
+
+def test_dll_is_valid_pe():
     data = _dll_path().read_bytes()
     assert data[:2] == b"MZ"
     pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -102,42 +124,102 @@ def test_process_listing_includes_target(target):
     assert target in pids
 
 
-def test_inject_ping_info_and_unload(target, ctrl):
-    res = ctrl.inject([target])
-    assert res[0]["ok"], f"注入失败: {res[0].get('error')}"
+# ------------------------------------------------------------------ 注入检查
 
-    assert _ping(ctrl, target), "注入端未连接或无响应"
+def test_preflight_blocks_self_and_system(ctrl, target):
+    """自己与系统关键进程必须被拦下，普通进程放行。"""
+    checks = {c["pid"]: c for c in ctrl.preflight([os.getpid(), 4, 0, target])}
+    assert checks[os.getpid()]["blocked"]
+    assert checks[4]["blocked"] and "关键" in checks[4]["reason"]
+    assert checks[0]["blocked"]
+    assert checks[target]["ok"] and not checks[target]["blocked"]
+    assert checks[target]["name"].lower().startswith("ping")
+    assert checks[target]["accessible"]
 
-    info = ctrl.server.request(target, {"type": "info"}, timeout=15)
+
+def test_preflight_flags_already_injected(injected, ctrl):
+    check = ctrl.preflight([injected])[0]
+    assert check["attached"] and check["dll_loaded"]
+    assert any("重新注入" in w for w in check["warnings"])
+
+
+def test_preflight_reports_nonexistent_pid(ctrl):
+    check = ctrl.preflight([0x7FFFFFF0])[0]
+    assert check["blocked"]
+
+
+# ------------------------------------------------------------------ 注入 / 控制
+
+def test_inject_ping_info_and_unload(injected, ctrl):
+    pid = injected
+    info = ctrl.server.request(pid, {"type": "info"}, timeout=15)
     assert info.get("ok")
     names = [m["name"].lower() for m in info["modules"]]
     assert any("ping" in n for n in names), names
 
-    regions = ctrl.server.request(target, {"type": "mem_regions"}, timeout=30)
+    regions = ctrl.server.request(pid, {"type": "mem_regions"}, timeout=30)
     assert regions.get("ok") and len(regions["regions"]) > 0
 
     # 内存搜索：MZ 头几乎必然命中主模块
-    found = ctrl.mem_search([target], "4D 5A", 8)
+    found = ctrl.mem_search([pid], "4D 5A ?? ??", 8)
     assert found and found[0]["ok"], found
     results = found[0]["resp"]["results"]
     assert results, "未搜索到 MZ 头"
 
-    # 写入再读回，验证读写链路，最后还原
-    addr = results[0]["address"]
-    original = ctrl.mem_read(target, addr, 1)
-    assert original.get("ok"), original
-    old_byte = original["hex"][:2]
-    new_byte = "90" if old_byte != "90" else "91"
-    w = ctrl.mem_write(target, addr, new_byte)
-    assert w.get("ok"), w
-    time.sleep(0.3)
-    back = ctrl.mem_read(target, addr, 1)
-    assert back["hex"][:2] == new_byte, back
-    ctrl.mem_write(target, addr, old_byte)
-
-    out = ctrl.unload([target])
+    out = ctrl.unload([pid])
     assert out[0]["ok"], out
-    assert not ctrl.server.is_attached(target)
+    assert out[0]["detached"], "卸载后控制通道应断开"
+    assert not ctrl.server.is_attached(pid)
+
+
+def test_reinject_while_attached_hot_swaps(injected, ctrl):
+    """已注入时再注入：应自动先卸载旧 DLL，再注入并重新连上。"""
+    pid = injected
+    res = ctrl.inject([pid])[0]
+    assert res["ok"], res.get("error")
+    assert res["reinjected"] is True, "没有走「先卸载再注入」的热更新路径"
+    assert res["attached"] and _ping(ctrl, pid)
+
+
+def test_mem_read_write_roundtrip(injected, ctrl):
+    pid = injected
+
+    # 1) 可写区域：读 8 字节 -> 改写 -> 读回 -> 还原
+    regions = ctrl.server.request(pid, {"type": "mem_regions"}, timeout=30)["regions"]
+    writable = [r for r in regions
+                if r["protect"] == PAGE_READWRITE and r["size"] >= 4096]
+    assert writable, "目标进程内没有找到可写内存区域"
+    addr = int(writable[0]["base"]) + 0x100
+
+    original = ctrl.mem_read(pid, addr, 8)
+    assert original.get("ok") and len(original["hex"]) == 16, original
+    new_byte = "90" if original["hex"][:2] != "90" else "91"
+    payload = new_byte + original["hex"][2:]
+    w = ctrl.mem_write(pid, addr, payload)
+    assert w.get("ok"), w
+    back = ctrl.mem_read(pid, addr, 8)
+    assert back["hex"].lower() == payload.lower(), back
+    assert ctrl.mem_write(pid, addr, original["hex"]).get("ok")
+
+    # 2) 只读页（PE 头）：必须靠临时改保护写进去，这正是调试器改代码的路径
+    found = ctrl.mem_search([pid], "4D 5A ?? ??", 4)
+    mz = found[0]["resp"]["results"][0]
+    head = ctrl.mem_read(pid, int(mz["address"]), 2)
+    assert head.get("ok"), head
+    old = head["hex"][:2]
+    new = "4E" if old.lower() != "4e" else "4D"
+    patched = ctrl.mem_write(pid, int(mz["address"]), new)
+    assert patched.get("ok"), f"只读页写入失败: {patched}"
+    after = ctrl.mem_read(pid, int(mz["address"]), 2)
+    assert after["hex"][:2].lower() == new.lower(), after
+    assert ctrl.mem_write(pid, int(mz["address"]), old).get("ok")
+
+
+def test_mem_search_max_results_respected(injected, ctrl):
+    pid = injected
+    found = ctrl.mem_search([pid], "00 00 00 00", 3)
+    assert found[0]["ok"]
+    assert len(found[0]["resp"]["results"]) <= 3
 
 
 def test_request_to_non_injected_process_fails(ctrl):
@@ -157,25 +239,77 @@ def test_terminate_via_dll(ctrl):
     assert _wait_until(lambda: not _pid_alive(pid), timeout=20), "目标进程未被终止"
 
 
-def _pid_alive(pid: int) -> bool:
+# ------------------------------------------------------------------ 冻结
+
+def test_freeze_really_suspends_and_resumes(ctrl):
+    """冻结 / 解除冻结：不仅记录状态，还要核实线程真的被挂起。"""
     from superinject import winapi
 
-    try:
-        return bool(winapi.open_process(pid, winapi.PROCESS_QUERY_LIMITED_INFORMATION))
-    except Exception:
-        return False
-
-
-def test_freeze_and_resume(ctrl):
-    """冻结 / 解除冻结：进程应变为无响应后又恢复。"""
     pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
     try:
-        assert ctrl.freeze([pid])[0]["ok"]
-        time.sleep(1.0)
-        assert pid in ctrl._frozen
-        assert ctrl.unfreeze([pid])[0]["ok"]
-        time.sleep(1.0)
-        assert pid not in ctrl._frozen
+        state_before = winapi.process_suspend_state(pid)
+        assert state_before is not True, "冻结前进程不应处于挂起状态"
+
+        frozen = ctrl.freeze([pid])[0]
+        assert frozen["ok"], frozen
+        assert frozen["verified"] is not False, "冻结后线程仍未挂起"
+
+        thawed = ctrl.unfreeze([pid])[0]
+        assert thawed["ok"], thawed
+        assert thawed["verified"] is not True, "解除冻结后线程仍被挂起"
         assert _pid_alive(pid)
     finally:
         kill(pid)
+
+
+def test_freeze_blocks_control_then_recovers(ctrl):
+    """冻结期间 DLL 无法响应，解除后控制通道必须恢复。"""
+    pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
+    try:
+        assert ctrl.inject([pid])[0]["ok"]
+        assert _ping(ctrl, pid)
+        assert ctrl.freeze([pid])[0]["ok"]
+        blocked = ctrl.server.request(pid, {"type": "ping"}, timeout=2)
+        assert blocked["ok"] is False, "冻结期间不该还能响应命令"
+        assert ctrl.unfreeze([pid])[0]["ok"]
+        assert _ping(ctrl, pid), "解除冻结后控制通道未恢复"
+    finally:
+        kill(pid)
+
+
+# ------------------------------------------------------------------ 资源
+
+def test_resources_returns_items_and_dir(injected, ctrl):
+    pid = injected
+    res = ctrl.resources([pid])[0]
+    assert res["ok"], res.get("error")
+    resp = res["resp"]
+    assert isinstance(resp["items"], list)
+    assert resp["dir"], "未返回导出目录"
+    assert Path(resp["dir"]).is_dir(), resp["dir"]
+    for item in resp["items"]:
+        assert item["kind"] in ("image", "video", "audio", "other")
+        assert Path(item["path"]).exists(), item["path"]
+        assert item["source"] in ("resource", "mapped")
+    # ping.exe 带图标资源：DIB 应被转成可打开的 ico/bmp
+    converted = [i for i in resp["items"] if i.get("dump")]
+    for item in converted:
+        assert item["ext"] in ("bmp", "ico", "cur"), item
+
+
+def test_resources_preview_url_when_server_running(injected, ctrl, tmp_path):
+    """导出目录里的图片应能通过本地预览服务拿到 URL。"""
+    from superinject.fileserver import PreviewServer
+
+    pid = injected
+    srv = PreviewServer(Path(ctrl.resources([pid])[0]["resp"]["dir"]).parent)
+    srv.start()
+    try:
+        ctrl.preview_url = srv.url_for
+        res = ctrl.resources([pid])[0]
+        for item in res["resp"]["items"]:
+            if item["previewable"]:
+                assert item["url"].startswith("http://127.0.0.1:")
+    finally:
+        ctrl.preview_url = None
+        srv.stop()
