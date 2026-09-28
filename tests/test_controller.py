@@ -55,7 +55,8 @@ def test_inject_registers_pipe_then_injects(fake_procs, tmp_path, monkeypatch):
 
     c = Controller(dll_path=dll)
     monkeypatch.setattr(c.server, "register", lambda pid: registered.append(pid))
-    monkeypatch.setattr(ctl_mod.winapi, "inject_dll", lambda p: 0x140000000)
+    monkeypatch.setattr(ctl_mod.winapi, "inject_dll",
+                        lambda pid, path, timeout=0: 0x140000000)
 
     res = c.inject([100, 200])
     assert registered == [100, 200]
@@ -68,7 +69,7 @@ def test_inject_failure_is_reported(fake_procs, tmp_path, monkeypatch):
     c = Controller(dll_path=dll)
     monkeypatch.setattr(c.server, "register", lambda pid: None)
 
-    def boom(pid):
+    def boom(pid, path, timeout=0):
         raise OSError("拒绝访问")
 
     monkeypatch.setattr(ctl_mod.winapi, "inject_dll", boom)
