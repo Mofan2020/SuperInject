@@ -70,11 +70,19 @@ class Controller:
             return [{"error": str(exc)}]
 
         for pid, name in raw:
+            try:
+                path = winapi.process_path(pid)
+            except Exception:
+                path = ""
+            try:
+                mem = winapi.process_memory_mb(pid)
+            except Exception:
+                mem = 0.0
             items.append({
                 "pid": pid,
                 "name": name,
-                "path": winapi.process_path(pid),
-                "mem_mb": winapi.process_memory_mb(pid),
+                "path": path,
+                "mem_mb": mem,
                 "injected": pid in self._injected or self.server.is_attached(pid),
                 "frozen": pid in self._frozen,
             })

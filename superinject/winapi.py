@@ -153,22 +153,45 @@ def process_path(pid: int) -> str:
         k.CloseHandle(h)
 
 
-def process_memory_mb(pid: int) -> float:
+def _get_process_memory_info():
+    """定位 GetProcessMemoryInfo：Win10+ 在 kernel32(K32…)，旧系统在 psapi。"""
     k = kernel32()
-    k.GetProcessMemoryInfo.argtypes = [
-        wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wt.DWORD,
-    ]
-    h = k.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-    if not h:
-        return 0.0
+    for name in ("K32GetProcessMemoryInfo", "GetProcessMemoryInfo"):
+        if hasattr(k, name):
+            fn = getattr(k, name)
+            fn.restype = wt.BOOL
+            fn.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wt.DWORD]
+            return fn
     try:
-        c = PROCESS_MEMORY_COUNTERS()
-        c.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-        if not k.GetProcessMemoryInfo(h, ctypes.byref(c), ctypes.sizeof(c)):
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        fn = psapi.GetProcessMemoryInfo
+        fn.restype = wt.BOOL
+        fn.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wt.DWORD]
+        return fn
+    except (OSError, AttributeError):  # pragma: no cover
+        return None
+
+
+def process_memory_mb(pid: int) -> float:
+    """进程工作集大小（MB）。任何失败都返回 0，不影响进程列表渲染。"""
+    try:
+        k = kernel32()
+        fn = _get_process_memory_info()
+        if fn is None:
             return 0.0
-        return round(c.WorkingSetSize / (1024 * 1024), 1)
-    finally:
-        k.CloseHandle(h)
+        h = open_process(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+        if not h:
+            return 0.0
+        try:
+            c = PROCESS_MEMORY_COUNTERS()
+            c.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if not fn(h, ctypes.byref(c), ctypes.sizeof(c)):
+                return 0.0
+            return round(c.WorkingSetSize / (1024 * 1024), 1)
+        finally:
+            k.CloseHandle(h)
+    except Exception:  # pragma: no cover - 任何异常都不应中断列表
+        return 0.0
 
 
 def is_elevated() -> bool:
