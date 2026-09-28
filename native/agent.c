@@ -980,6 +980,72 @@ static int dump_resources(si_json *out)
     return res_items + mapped_items;
 }
 
+/*
+ * 写入目标内存：先直接写，失败再按当前页属性临时改保护重试（改完立刻还原）。
+ *
+ * 两个坑（CI 上真实踩到过，报错信息都写进去了）：
+ *   1. 新保护属性要按当前页属性选：可执行页给 PAGE_EXECUTE_READWRITE，
+ *      否则给 PAGE_READWRITE；
+ *   2. 范围必须整页对齐。只请求 1 字节时，若地址贴近区域末尾，
+ *      VirtualProtect 会跨到未提交页并直接 ERROR_INVALID_PARAMETER(0x57)，
+ *      看起来像「地址非法」，其实只是范围算错了。
+ */
+static int mem_write_bytes(void *target, const unsigned char *bytes, size_t n,
+                           int *patched_out, char *err, size_t errsz)
+{
+    SIZE_T                   put = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD                    old_prot = 0, new_prot = PAGE_READWRITE, tmp = 0;
+    SIZE_T                   span;
+    uintptr_t                page, tail;
+    char                     why[64];
+
+    *patched_out = 0;
+    if (WriteProcessMemory(GetCurrentProcess(), target, bytes, n, &put) && put == n)
+        return 1;
+
+    snprintf(why, sizeof(why), "WriteProcessMemory 失败 (0x%lX)",
+             (unsigned long)GetLastError());
+    if (VirtualQuery(target, &mbi, sizeof(mbi)) == 0) {
+        snprintf(err, errsz, "%s；VirtualQuery 也失败", why);
+        return 0;
+    }
+    if (mbi.State != MEM_COMMIT) {
+        snprintf(err, errsz, "%s；目标地址未提交 (State=0x%lX)",
+                 why, (unsigned long)mbi.State);
+        return 0;
+    }
+    if (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        new_prot = PAGE_EXECUTE_READWRITE;
+
+    page = (uintptr_t)target & ~(uintptr_t)0xFFF;
+    tail = (uintptr_t)target + (uintptr_t)n;
+    span = (SIZE_T)(((tail + 0xFFF) & ~(uintptr_t)0xFFF) - page);
+    if (span == 0) span = 0x1000;
+
+    if (!VirtualProtect((LPVOID)page, span, new_prot, &old_prot)) {
+        snprintf(err, errsz,
+                 "%s；VirtualProtect(0x%llX, 0x%llX 字节, 0x%lX) 失败 (0x%lX) "
+                 "[区域 Protect=0x%lX Type=0x%lX]",
+                 why, (unsigned long long)page, (unsigned long long)span,
+                 (unsigned long)new_prot, (unsigned long)GetLastError(),
+                 (unsigned long)mbi.Protect, (unsigned long)mbi.Type);
+        return 0;
+    }
+    put = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), target, bytes, n, &put) || put != n) {
+        snprintf(err, errsz, "%s；改保护后可写但仍失败 (0x%lX)",
+                 why, (unsigned long)GetLastError());
+        VirtualProtect((LPVOID)page, span, old_prot, &tmp);
+        return 0;
+    }
+    *patched_out = 1;
+    FlushInstructionCache(GetCurrentProcess(), target, n);
+    VirtualProtect((LPVOID)page, span, old_prot, &tmp);
+    return 1;
+}
+
 /* ------------------------- 指令分发 ------------------------- */
 
 static void agent_handle(const char *text)
@@ -1101,45 +1167,22 @@ static void agent_handle(const char *text)
         }
 
     } else if (strcmp(type, "mem_write") == 0) {
-        long long    addr = si_json_get_int(msg, "address", 0);
-        const char  *hex  = si_json_get_str(msg, "hex", "");
-        size_t       n    = strlen(hex) / 2;
-        unsigned char *b  = si_hex_to_bytes(hex, NULL);
+        long long      addr = si_json_get_int(msg, "address", 0);
+        const char    *hex  = si_json_get_str(msg, "hex", "");
+        size_t         n    = strlen(hex) / 2;
+        unsigned char *b    = si_hex_to_bytes(hex, NULL);
         if (b && n > 0) {
-            SIZE_T put = 0;
-            LPVOID target = (LPVOID)(uintptr_t)addr;
-            int    ok = WriteProcessMemory(GetCurrentProcess(), target,
-                                           b, (SIZE_T)n, &put) && put == n;
-            int    patched = 0;
-            DWORD  old_prot = 0;
-            if (!ok) {
-                /*
-                 * 代码段/只读数据段（例如 PE 头）默认不可写。调试器要改这些地方
-                 * 必须先临时换页属性 —— 改完立刻还原，并冲刷指令缓存。
-                 */
-                if (VirtualProtect(target, n, PAGE_EXECUTE_READWRITE, &old_prot)) {
-                    put = 0;
-                    ok = WriteProcessMemory(GetCurrentProcess(), target,
-                                            b, (SIZE_T)n, &put) && put == n;
-                    patched = 1;
-                    if (ok) {
-                        DWORD tmp;
-                        FlushInstructionCache(GetCurrentProcess(), target, n);
-                        VirtualProtect(target, n, old_prot, &tmp);
-                    }
-                }
-            }
-            if (ok) {
+            int  patched = 0;
+            char err[320];   /* 给「哪一步失败 + 区域属性」留足空间（-Werror=format-truncation） */
+            err[0] = 0;
+            if (mem_write_bytes((void *)(uintptr_t)addr, b, n, &patched,
+                                err, sizeof(err))) {
                 si_json_set_bool(out, "ok", 1);
-                si_json_set_int(out, "written", (long long)put);
+                si_json_set_int(out, "written", (long long)n);
                 si_json_set_bool(out, "protection_changed", patched);
             } else {
-                char msg_err[64];
-                snprintf(msg_err, sizeof(msg_err),
-                         "WriteProcessMemory 失败 (0x%lX)",
-                         (unsigned long)GetLastError());
                 si_json_set_bool(out, "ok", 0);
-                si_json_set_str(out, "error", msg_err);
+                si_json_set_str(out, "error", err[0] ? err : "写入失败");
             }
         } else {
             si_json_set_bool(out, "ok", 0);

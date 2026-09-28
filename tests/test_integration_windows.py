@@ -201,18 +201,27 @@ def test_mem_read_write_roundtrip(injected, ctrl):
     assert back["hex"].lower() == payload.lower(), back
     assert ctrl.mem_write(pid, addr, original["hex"]).get("ok")
 
-    # 2) 只读页（PE 头）：必须靠临时改保护写进去，这正是调试器改代码的路径
-    found = ctrl.mem_search([pid], "4D 5A ?? ??", 4)
-    mz = found[0]["resp"]["results"][0]
-    head = ctrl.mem_read(pid, int(mz["address"]), 2)
+    # 2) 只读页：目标自己的 PE 头那一页。必须靠「临时改页保护」写进去，
+    #    这正是调试器给已加载模块打补丁的路线。
+    #    这里用模块基址，而不是「搜到的第一个 MZ」——第一个 MZ 可能落在
+    #    别的只读映射里（例如只读文件映射），那种失败说明不了这条路子行不行。
+    info = ctrl.server.request(pid, {"type": "info"}, timeout=30)
+    assert info.get("ok"), info
+    image = Path(TARGET_IMG).name.lower()
+    bases = {m["name"].lower(): int(m["base"]) for m in info["modules"]}
+    assert image in bases, f"模块表里没有 {image}，实际有 {list(bases)[:6]}"
+    hdr = bases[image] + 0x100        # PE 头页内的 DOS stub 区，永远不会被执行
+    head = ctrl.mem_read(pid, hdr, 2)
     assert head.get("ok"), head
     old = head["hex"][:2]
     new = "4E" if old.lower() != "4e" else "4D"
-    patched = ctrl.mem_write(pid, int(mz["address"]), new)
+    patched = ctrl.mem_write(pid, hdr, new)
     assert patched.get("ok"), f"只读页写入失败: {patched}"
-    after = ctrl.mem_read(pid, int(mz["address"]), 2)
+    assert patched.get("protection_changed"), (
+        f"PE 头页本应只读，写入却不需要改保护（地址挑错了？）: {patched}")
+    after = ctrl.mem_read(pid, hdr, 2)
     assert after["hex"][:2].lower() == new.lower(), after
-    assert ctrl.mem_write(pid, int(mz["address"]), old).get("ok")
+    assert ctrl.mem_write(pid, hdr, old).get("ok")
 
 
 def test_mem_search_max_results_respected(injected, ctrl):

@@ -9,6 +9,7 @@ import ctypes
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,8 @@ MAX_WORKERS = 8
 DLL_NAME = dll_manager.DLL_FILENAME
 ATTACH_TIMEOUT = 12.0
 DETACH_TIMEOUT = 8.0
+# 等目标进程把旧 DLL 真正卸载掉（FreeLibraryAndExitThread 的卸载是异步的）
+UNLOAD_TIMEOUT = 8.0
 
 # 注入所需的最小权限集合
 INJECT_ACCESS = (
@@ -224,6 +227,12 @@ class Controller:
                 if not self.server.wait_detach(pid, DETACH_TIMEOUT):
                     return {**base, "ok": False,
                             "error": "旧 DLL 卸载失败（目标可能被冻结或无响应）"}
+                if not self._wait_module_gone(pid, UNLOAD_TIMEOUT):
+                    return {**base, "ok": False,
+                            "error": "旧 DLL 已断开但模块仍留在目标进程内"
+                                     "（卸载是异步的，或仍有其它引用），"
+                                     "此时再 LoadLibraryW 不会触发 DllMain，"
+                                     "请重启目标进程后再注入"}
                 base["reinjected"] = True
             elif winapi.module_loaded(pid, DLL_NAME):
                 # 模块已在但没连上：agent 线程可能仍在建连，给它一点时间
@@ -253,6 +262,22 @@ class Controller:
             return {**base, "ok": False, "error": str(exc)}
 
     # ---------------------------------------------------------- 控制指令
+
+
+    def _wait_module_gone(self, pid: int, timeout: float) -> bool:
+        """等目标进程里真的看不到我们的 DLL 了。
+
+        为什么必须等：卸载命令走的是 FreeLibraryAndExitThread，它先结束线程、
+        再由加载器异步把模块摘掉 —— socket 断开只证明线程退了，模块可能还在
+        映射里。这一瞬间 LoadLibraryW 拿到的是旧模块（引用计数 +1、不触发
+        DllMain），于是重新注入永远建立不了控制通道（CI 上实测如此）。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not winapi.module_loaded(pid, DLL_NAME):
+                return True
+            time.sleep(0.05)
+        return not winapi.module_loaded(pid, DLL_NAME)
 
     def _control(self, pids: List[int], cmd: str, timeout: float = 15.0
                  ) -> List[dict]:
