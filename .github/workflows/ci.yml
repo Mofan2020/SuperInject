@@ -73,11 +73,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 显示工具链
-        run: |
-          cl 2>&1 | findstr /C:"Version"
-          where cl
-
       - name: 定位 MSVC 环境
         shell: cmd
         run: |
