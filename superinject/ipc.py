@@ -105,8 +105,35 @@ class Connection:
         self.alive = True
         self._write_lock = threading.Lock()
 
-    def send(self, payload: dict) -> None:
+    def send(self, payload: dict, timeout: float = 10.0) -> None:
+        """把一帧写进管道。
+
+        写入放在独立线程里做并设上限：如果目标进程的注入端卡住（例如它自己
+        阻塞在别的地方），内核里的 WriteFile 会一直不返回，整个界面/测试就
+        会跟着卡死。超时后主动关闭连接，让阻塞的调用立刻返回错误。
+        """
         data = encode_frame(payload)
+        box: dict = {}
+
+        def worker() -> None:
+            try:
+                self._send_blocking(data)
+                box["ok"] = True
+            except Exception as exc:      # pragma: no cover - 依赖真实管道
+                box["error"] = exc
+
+        t = threading.Thread(target=worker, name=f"si-send-{self.pid}",
+                             daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            log.warning("写入管道超时 %ss (pid=%s)，关闭连接", timeout, self.pid)
+            self.close()
+            raise TimeoutError(f"写入管道超时（{timeout}s），目标进程可能已无响应")
+        if "error" in box:
+            raise box["error"]
+
+    def _send_blocking(self, data: bytes) -> None:
         k = _win_pipes()
         with self._write_lock:
             sent = 0
@@ -114,7 +141,8 @@ class Connection:
             buf = (ctypes.c_ubyte * total).from_buffer_copy(data)
             while sent < total:
                 n = ctypes.c_ulong(0)
-                if not k.WriteFile(self.handle, ctypes.byref(buf, sent),
+                if not k.WriteFile(ctypes.c_void_p(self.handle),
+                                   ctypes.byref(buf, sent),
                                    total - sent, ctypes.byref(n), None):
                     raise OSError(ctypes.get_last_error(), "WriteFile")
                 if n.value == 0:
@@ -219,7 +247,9 @@ class PipeServer:
         payload["id"] = mid
         log.debug("发送命令 pid=%s type=%s id=%s", pid, cmd.get("type"), mid)
         try:
-            conn.send(payload)
+            conn.send(payload, timeout=max(2.0, min(timeout, 10.0)))
+            log.debug("命令已写入 pid=%s id=%s bytes=%s", pid, mid,
+                      len(payload) and len(encode_frame(payload)))
         except Exception as exc:  # pragma: no cover - 管道断开
             with self._lock:
                 self._waiters.pop(mid, None)
@@ -255,7 +285,7 @@ class PipeServer:
             name, PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
-            1 << 20, 1 << 20, 5000, None,
+            64 * 1024, 64 * 1024, 5000, None,
         )
         if handle in (0, INVALID_HANDLE_VALUE):
             raise OSError(ctypes.get_last_error(), f"CreateNamedPipe {name}")

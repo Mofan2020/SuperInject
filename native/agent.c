@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <wchar.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,54 @@ static HMODULE g_module = NULL;
 static HANDLE  g_pipe   = INVALID_HANDLE_VALUE;
 static HANDLE  g_done   = NULL;
 static DWORD   g_pid    = 0;
+static HANDLE  g_log    = INVALID_HANDLE_VALUE;
+
+/*
+ * 诊断日志：%TEMP%\SuperInject\agent-<pid>.log
+ * 目标进程无响应时，只有进程内部才知道它卡在哪一步 —— 出问题时
+ * 把这份日志和控制器日志放在一起看，能立刻定位（CI 失败时会自动打印）。
+ */
+static void log_msg(const char *fmt, ...)
+{
+    char    line[512];
+    DWORD   n = 0;
+    int     used;
+    va_list ap;
+
+    if (g_log == INVALID_HANDLE_VALUE) return;
+    used = snprintf(line, sizeof(line), "[%lu] ", (unsigned long)GetTickCount());
+    if (used < 0) return;
+    va_start(ap, fmt);
+    vsnprintf(line + used, sizeof(line) - (size_t)used, fmt, ap);
+    va_end(ap);
+    {
+        size_t len = strlen(line);
+        if (len + 2 < sizeof(line)) {
+            line[len]     = '\r';
+            line[len + 1] = '\n';
+            line[len + 2] = 0;
+        }
+    }
+    WriteFile(g_log, line, (DWORD)strlen(line), &n, NULL);
+}
+
+static void log_open(void)
+{
+    WCHAR path[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, path) == 0) return;
+    lstrcatW(path, L"SuperInject");
+    CreateDirectoryW(path, NULL);
+    lstrcatW(path, L"\\");
+    {
+        WCHAR name[64];
+        swprintf(name, 64, L"agent-%lu.log", (unsigned long)g_pid);
+        lstrcatW(path, name);
+    }
+    g_log = CreateFileW(path, FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_log == INVALID_HANDLE_VALUE) g_log = 0;
+}
 
 /* 资源提取输出目录与状态（仅在命令处理线程内使用） */
 static char  g_out_dir[MAX_PATH] = {0};
@@ -88,10 +137,29 @@ static int send_json(si_json *j)
     char  *text = si_json_dump(j);
     DWORD  n;
     int    ok;
-    if (!text) return 0;
+    char  *frame;
+    if (!text) {
+        log_msg("send_json: dump 返回空");
+        return 0;
+    }
     n = (DWORD)strlen(text);
-    ok = write_all((const char *)&n, 4) && write_all(text, n);
+    /*
+     * 一次 WriteFile 写出「长度+正文」：避免两次写之间被别的写法打断，
+     * 也让接收端一次就能拿到完整帧（更容易排查问题）。
+     */
+    frame = (char *)malloc(n + 4);
+    if (!frame) {
+        si_free(text);
+        log_msg("send_json: 内存不足");
+        return 0;
+    }
+    memcpy(frame, &n, 4);
+    memcpy(frame + 4, text, n);
+    ok = write_all(frame, n + 4);
     si_free(text);
+    free(frame);
+    if (!ok) log_msg("send_json: 写管道失败 err=%lu bytes=%lu",
+                     (unsigned long)GetLastError(), (unsigned long)(n + 4));
     return ok;
 }
 
@@ -157,9 +225,13 @@ static int agent_connect(void)
     while (GetTickCount() < phase1_end) {
         swprintf(name, 160, L"SuperInject-%lu-%lu", find_controller_pid(), g_pid);
         swprintf(full, 320, L"\\\\.\\pipe\\%s", name);
-        if (try_connect(full)) return 1;
+        if (try_connect(full)) {
+            log_msg("已连接(阶段1) %ls handle=%p", full, (void *)g_pipe);
+            return 1;
+        }
         if (WaitForSingleObject(g_done, 100) == WAIT_OBJECT_0) return 0;
     }
+    log_msg("阶段1未找到 SuperInject.exe，转入管道枚举");
 
     /*
      * 阶段 2：枚举命名管道命名空间，寻找以 "-<本进程PID>" 结尾的
@@ -177,14 +249,18 @@ static int agent_connect(void)
                     swprintf(full, 320, L"\\\\.\\pipe\\%s", fd.cFileName);
                     if (try_connect(full)) {
                         FindClose(f);
+                        log_msg("已连接(阶段2) %ls handle=%p", full, (void *)g_pipe);
                         return 1;
                     }
+                    log_msg("连接 %ls 失败 err=%lu", full,
+                            (unsigned long)GetLastError());
                 }
             } while (FindNextFileW(f, &fd));
             FindClose(f);
         }
         if (WaitForSingleObject(g_done, 200) == WAIT_OBJECT_0) return 0;
     }
+    log_msg("60 秒内未能连上控制端，放弃");
     return 0;
 }
 
@@ -206,7 +282,8 @@ static void send_hello(void)
     GetModuleFileNameW(NULL, wpath, MAX_PATH);
     utf8_path(wpath, mpath, MAX_PATH);
     si_json_set_str(j, "image", mpath);
-    send_json(j);
+    log_msg("发送 hello 版本=%s 镜像=%s", SI_VERSION, mpath);
+    log_msg("hello 写入结果=%d", send_json(j));
     si_json_free(j);
 }
 
@@ -812,8 +889,10 @@ static void agent_handle(const char *text)
     si_json     *msg = si_json_parse(text);
     const char  *type;
     si_json     *out;
+    DWORD        t0 = GetTickCount();
 
     if (!msg) {
+        log_msg("收到无法解析的 JSON: %.80s", text);
         out = si_json_new();
         if (out) {
             si_json_set_str(out, "type", "error");
@@ -825,6 +904,7 @@ static void agent_handle(const char *text)
     }
 
     type  = si_json_get_str(msg, "type", "");
+    log_msg("收到命令 type=%s id=%lld", type, (long long)si_json_get_int(msg, "id", 0));
     out   = si_json_new();
     si_json_set_str(out, "type", "response");
     si_json_set_str(out, "cmd", type);
@@ -1003,6 +1083,8 @@ static void agent_handle(const char *text)
     }
 
     send_json(out);
+    log_msg("命令 %s 处理完成 用时=%lums", type,
+            (unsigned long)(GetTickCount() - t0));
     si_json_free(out);
     si_json_free(msg);
 }
@@ -1010,18 +1092,36 @@ static void agent_handle(const char *text)
 static DWORD WINAPI agent_thread(LPVOID param)
 {
     (void)param;
-    if (!agent_connect()) return 0;
+    log_open();
+    log_msg("agent 线程启动 pid=%lu 版本=%s", (unsigned long)g_pid, SI_VERSION);
+    if (!agent_connect()) {
+        log_msg("未建立控制通道，线程退出");
+        return 0;
+    }
     send_hello();
+    log_msg("hello 已发出，进入读循环等待命令");
 
     for (;;) {
         DWORD len = 0;
         char *payload;
+        DWORD t_read;
         if (g_pipe == INVALID_HANDLE_VALUE) break;
-        if (!read_exact(&len, 4) || len == 0) break;
-        if (len > (32u * 1024u * 1024u)) break;
+        t_read = GetTickCount();
+        if (!read_exact(&len, 4) || len == 0) {
+            log_msg("读帧头失败 err=%lu（对端已断开）", (unsigned long)GetLastError());
+            break;
+        }
+        if (len > (32u * 1024u * 1024u)) {
+            log_msg("帧长度异常 len=%lu，断开", (unsigned long)len);
+            break;
+        }
+        log_msg("读到帧 len=%lu（等待 %lums）", (unsigned long)len,
+                (unsigned long)(GetTickCount() - t_read));
         payload = (char *)malloc(len + 1);
         if (!payload) break;
         if (!read_exact(payload, len)) {
+            log_msg("读帧正文失败 err=%lu len=%lu", (unsigned long)GetLastError(),
+                    (unsigned long)len);
             free(payload);
             break;
         }
@@ -1029,6 +1129,7 @@ static DWORD WINAPI agent_thread(LPVOID param)
         agent_handle(payload);
         free(payload);
     }
+    log_msg("读循环结束，关闭管道");
     if (g_pipe != INVALID_HANDLE_VALUE) {
         CloseHandle(g_pipe);
         g_pipe = INVALID_HANDLE_VALUE;

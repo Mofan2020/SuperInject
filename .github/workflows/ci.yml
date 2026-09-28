@@ -189,6 +189,19 @@ jobs:
         run: |
           if [ -f supinject-debug.log ]; then tail -n 160 supinject-debug.log; else echo "(无日志文件)"; fi
 
+      - name: 注入端诊断日志 (agent-<pid>.log)
+        if: always()
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:TEMP "SuperInject"
+          Write-Host "== $dir =="
+          if (-not (Test-Path $dir)) { Write-Host "(目录不存在)"; exit 0 }
+          Get-ChildItem -Path $dir -Filter "agent-*.log" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Write-Host "---- $($_.FullName) ----"
+              Get-Content $_.FullName -Raw
+            }
+
   # ---------------------------------------------------------------
   # 5) Windows runner + PyInstaller 打包，并压成发布用的 zip
   # ---------------------------------------------------------------
@@ -310,6 +323,21 @@ jobs:
           print(f"OK: {data['passed']}/{len(data['steps'])} 步通过, "
                 f"版本 {data['version']}")
           PY
+
+      - name: 自检失败时的诊断日志
+        if: failure()
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:TEMP "SuperInject"
+          if (Test-Path $dir) {
+            Get-ChildItem -Path $dir -Filter "*.log" -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Write-Host "---- $($_.FullName) ----"
+                Get-Content $_.FullName -Raw
+              }
+          }
+          $log = Join-Path $env:LOCALAPPDATA "SuperInject\supinject.log"
+          if (Test-Path $log) { Write-Host "---- $log ----"; Get-Content $log -Tail 120 }
 
       - uses: actions/upload-artifact@v4
         if: always()
