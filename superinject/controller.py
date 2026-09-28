@@ -128,7 +128,7 @@ class Controller:
 
     def _inject_one(self, pid: int, path: Path) -> dict:
         try:
-            module = winapi.inject_dll(str(path))
+            module = winapi.inject_dll(pid, str(path))
             if module:
                 return {"pid": pid, "ok": True, "module": hex(module),
                         "image": winapi.process_path(pid)}
