@@ -187,6 +187,10 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在每次 push / P
 6. 对**打包产物**再跑一次 `SuperInject.exe --self-test`，把整条链路在发布件上重验一遍；
 7. 打 `v*` tag 时自动发布正式版 Release（附加 zip 资产，自动更新只认它）。
 
+> 改动前先读 [`docs/notes.md`](docs/notes.md)：那里记录了本版修掉的遗留缺陷及根因
+> （控制通道方向性死锁、数组序列化无限互递归、重新注入竞态、`pid_alive` 假存活等）、
+> 架构约定、已知边界，以及「哪些没做、为什么没做」。
+
 ---
 
 ## 常见问题
