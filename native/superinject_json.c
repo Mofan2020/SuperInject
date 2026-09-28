@@ -475,7 +475,7 @@ char *si_bytes_to_hex(const void *bytes, size_t len)
 
 #if defined(_WIN32)
 
-const char *si_mem_type(DWORD protect)
+const char *si_mem_type(unsigned long protect)
 {
     if (protect & PAGE_GUARD)      return "GUARD";
     if (protect & PAGE_NOACCESS)   return "NOACCESS";

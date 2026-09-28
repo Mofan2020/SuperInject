@@ -49,8 +49,11 @@ char      *si_bytes_to_hex(const void *bytes, size_t len);      /* si_free */
 void        si_free(void *p);
 
 #if defined(_WIN32)
-/* Win32 专用：非 Windows 编译（本机单测）时不参与，头文件保持自包含 */
-const char *si_mem_type(DWORD protect);
+/*
+ * Win32 专用（只有 agent.dll 用）。参数故意写成 unsigned long 而不是 DWORD：
+ * 本头文件不拉 windows.h，保持自包含，JSON 层才能被本机编译器直接编译自测。
+ */
+const char *si_mem_type(unsigned long protect);
 int         si_is_elevated(void);
 #endif
 
