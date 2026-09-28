@@ -39,7 +39,7 @@ def native_arch() -> str:
 @dataclass
 class Controller:
     dll_path: Optional[Path] = None
-    server: ipc.PipeServer = field(default_factory=ipc.PipeServer)
+    server: ipc.AgentServer = field(default_factory=ipc.AgentServer)
     max_workers: int = MAX_WORKERS
     preview_base_url: str = ""
     preview_url: Optional[Callable[[str], str]] = None

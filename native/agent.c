@@ -1,7 +1,7 @@
 /*
  * SuperInject Agent - 被注入的 DLL
  *
- * 目标：在被调试进程内建立一条反向控制通道（命名管道），
+ * 目标：在被调试进程内建立一条反向控制通道（回环 TCP，127.0.0.1），
  * 接受 SuperInject 控制器的指令：
  *   ping / info / mem_regions / mem_search / mem_read / mem_write
  *   resources（提取内存里的图片/音频/视频：PE 资源 + 内存映射文件）
@@ -11,8 +11,13 @@
  * 这里不做「冻结」——从进程内部挂起自己只会让唯一的工作线程睡死，
  * 既冻结不了目标，也永远回不来。
  *
- * 协议：4 字节小端长度 + UTF-8 JSON
- * 管道名：\\.\pipe\SuperInject-<controllerPid>-<targetPid>
+ * 协议：4 字节小端长度 + UTF-8 JSON（接收端一次读一大块再自己切帧）
+ *
+ * 连接方式（反向连接：控制器不往目标进程写任何东西）：
+ *   1. 控制器把「回环端口 + 一次性令牌」写进
+ *      %TEMP%\SuperInject\port-<目标PID>.txt
+ *   2. 注入后本 DLL 读该文件，connect 到 127.0.0.1:<端口>
+ *   3. 首帧 hello 带上令牌，控制器校验通过才认这条连接
  *
  * 仅供开发人员调试自己的程序使用，禁止用于未授权的第三方进程。
  */
@@ -20,6 +25,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <wchar.h>
@@ -43,7 +50,8 @@
 #define SI_MEM_SCAN_CHUNK    (1u << 20)
 #define SI_MEM_SCAN_MS       30000u
 #define SI_MAPPED_SCAN_MS    20000u
-#define SI_READ_BUF          (1u << 20)   /* 接收缓冲：必须一次读一大块 */
+#define SI_READ_BUF          (1u << 20)   /* 接收缓冲：一次读一大块，读满再切帧 */
+#define SI_CONNECT_MS        60000u       /* 最多尝试 60 秒连上控制器 */
 
 /* NtQueryVirtualMemory 信息类（等价于 winternl.h 的 MemoryMappedFilenameInformation） */
 #define SI_MemoryMappedFilenameInformation 2
@@ -52,10 +60,10 @@ typedef LONG(NTAPI *si_NtQueryVirtualMemory_t)(HANDLE, LPCVOID, ULONG,
                                                PVOID, SIZE_T, PSIZE_T);
 
 static HMODULE g_module = NULL;
-static HANDLE  g_pipe   = INVALID_HANDLE_VALUE;
-static HANDLE  g_done   = NULL;
+static SOCKET  g_sock   = INVALID_SOCKET;
 static DWORD   g_pid    = 0;
 static HANDLE  g_log    = INVALID_HANDLE_VALUE;
+static char    g_token[80] = {0};   /* 控制器写入的一次性令牌，hello 时回传 */
 
 /*
  * 诊断日志：%TEMP%\SuperInject\agent-<pid>.log
@@ -119,16 +127,15 @@ static void utf8_path(LPCWSTR w, char *out, int outsz)
         out[0] = 0;
 }
 
-/* ------------------------- 管道传输 ------------------------- */
+/* ------------------------- 通道传输 ------------------------- */
 
-static int write_all(const char *buf, DWORD len)
+static int send_all(const char *buf, size_t len)
 {
-    DWORD sent = 0;
+    size_t sent = 0;
     while (sent < len) {
-        DWORD w = 0;
-        if (!WriteFile(g_pipe, buf + sent, len - sent, &w, NULL) || w == 0)
-            return 0;
-        sent += w;
+        int w = send(g_sock, buf + sent, (int)(len - sent), 0);
+        if (w <= 0) return 0;
+        sent += (size_t)w;
     }
     return 1;
 }
@@ -156,22 +163,17 @@ static int send_json(si_json *j)
     }
     memcpy(frame, &n, 4);
     memcpy(frame + 4, text, n);
-    ok = write_all(frame, n + 4);
+    ok = send_all(frame, (size_t)n + 4);
     si_free(text);
     free(frame);
-    if (!ok) log_msg("send_json: 写管道失败 err=%lu bytes=%lu",
-                     (unsigned long)GetLastError(), (unsigned long)(n + 4));
+    if (!ok) log_msg("send_json: 发送失败 err=%d bytes=%lu",
+                     WSAGetLastError(), (unsigned long)(n + 4));
     return ok;
 }
 
 /*
- * 接收帧。
- *
- * 这里刻意「一次读一大块再自己切帧」，而不是先读 4 字节长度、再读正文：
- * 命名管道两端都是阻塞读写时，接收方挂着的读请求缓冲过小会让对端的写入
- * 迟迟无法完成（实测：控制器写 25 字节的命令、注入端只挂着 4 字节的读请求
- * 时，写入端会一直阻塞，双方对等死等 5 分钟直到测试超时）。读大块能彻底
- * 避开这种情况，顺带还省掉每帧一次系统调用。
+ * 接收帧：一次读一大块（1MB）再自己切帧，而不是先读 4 字节长度再读正文。
+ * 这样既避免「小缓冲阻塞读」这类坑，也省掉每帧一次系统调用。
  */
 static unsigned char *g_rbuf = NULL;
 static size_t         g_rlen = 0;
@@ -224,101 +226,101 @@ static int recv_frame(char **out)
             return 0;
         }
         {
-            DWORD got = 0;
-            DWORD want = (DWORD)(SI_READ_BUF - g_rlen);
-            if (!ReadFile(g_pipe, g_rbuf + g_rlen, want, &got, NULL)) {
-                log_msg("读管道失败 err=%lu（对端已断开）",
-                        (unsigned long)GetLastError());
+            int got;
+            int want = (int)(SI_READ_BUF - g_rlen);
+            got = recv(g_sock, (char *)g_rbuf + g_rlen, want, 0);
+            if (got <= 0) {
+                log_msg("接收失败 err=%d", WSAGetLastError());
                 return 0;
             }
-            if (got == 0) return 0;
-            log_msg("收到 %lu 字节（缓冲 %lu/%u）", (unsigned long)got,
-                    (unsigned long)(g_rlen + got), (unsigned)SI_READ_BUF);
-            g_rlen += got;
+            log_msg("收到 %d 字节（缓冲 %lu/%u）", got,
+                    (unsigned long)(g_rlen + (size_t)got), (unsigned)SI_READ_BUF);
+            g_rlen += (size_t)got;
         }
     }
 }
 
-/* 找到控制端 SuperInject.exe 的 PID，用于构造唯一的管道名 */
-static DWORD find_controller_pid(void)
-{
-    HANDLE          snap;
-    PROCESSENTRY32W pe;
-    DWORD           srv = 0;
+/* ---------------------- 与控制端建立连接 ---------------------- */
 
-    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 1;
-    pe.dwSize = sizeof(pe);
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"SuperInject.exe") == 0) {
-                srv = pe.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(snap, &pe));
+/*
+ * 读 %TEMP%\SuperInject\port-<本进程PID>.txt，内容为「<回环端口> <一次性令牌>」。
+ * 控制器在注入之前就把这个文件写好，所以正常情况下第一次读就能拿到。
+ */
+static int read_port_file(DWORD *port_out)
+{
+    WCHAR  path[MAX_PATH];
+    WCHAR  num[32];
+    HANDLE h;
+    char   buf[128];
+    DWORD  got = 0;
+    unsigned long port;
+    char  *sp;
+
+    if (GetTempPathW(MAX_PATH, path) == 0) return 0;
+    lstrcatW(path, L"SuperInject");
+    lstrcatW(path, L"\\port-");
+    swprintf(num, 32, L"%lu.txt", (unsigned long)g_pid);
+    lstrcatW(path, num);
+
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!ReadFile(h, buf, sizeof(buf) - 1, &got, NULL)) {
+        CloseHandle(h);
+        return 0;
     }
-    CloseHandle(snap);
-    return srv ? srv : 1;
+    CloseHandle(h);
+    buf[got] = 0;
+
+    port = strtoul(buf, NULL, 10);
+    if (port == 0 || port > 65535) return 0;
+    sp = strchr(buf, ' ');
+    if (sp) {
+        size_t n;
+        sp++;
+        while (*sp == ' ') sp++;
+        n = strlen(sp);
+        while (n > 0 && (sp[n - 1] == '\r' || sp[n - 1] == '\n' || sp[n - 1] == ' ')) n--;
+        if (n >= sizeof(g_token)) n = sizeof(g_token) - 1;
+        memcpy(g_token, sp, n);
+        g_token[n] = 0;
+    }
+    *port_out = (DWORD)port;
+    return 1;
 }
 
-static int try_connect(const wchar_t *full)
-{
-    HANDLE h = CreateFileW(full, GENERIC_READ | GENERIC_WRITE,
-                           0, NULL, OPEN_EXISTING, 0, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        g_pipe = h;
-        return 1;
-    }
-    return 0;
-}
-
+/* 反向连接：注入端主动连控制器的回环端口 */
 static int agent_connect(void)
 {
-    wchar_t full[320], name[160], suffix[64];
-    DWORD   phase1_end, deadline;
+    DWORD    deadline = GetTickCount() + SI_CONNECT_MS;
+    WSADATA  wsa;
 
-    swprintf(suffix, 64, L"-%lu", g_pid);
-    deadline = GetTickCount() + 60000;
-
-    /* 阶段 1：按约定尝试（控制器通常就是 SuperInject.exe） */
-    phase1_end = GetTickCount() + 3000;
-    while (GetTickCount() < phase1_end) {
-        swprintf(name, 160, L"SuperInject-%lu-%lu", find_controller_pid(), g_pid);
-        swprintf(full, 320, L"\\\\.\\pipe\\%s", name);
-        if (try_connect(full)) {
-            log_msg("已连接(阶段1) %ls handle=%p", full, (void *)g_pipe);
-            return 1;
-        }
-        if (WaitForSingleObject(g_done, 100) == WAIT_OBJECT_0) return 0;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        log_msg("WSAStartup 失败 err=%d", WSAGetLastError());
+        return 0;
     }
-    log_msg("阶段1未找到 SuperInject.exe，转入管道枚举");
-
-    /*
-     * 阶段 2：枚举命名管道命名空间，寻找以 "-<本进程PID>" 结尾的
-     * SuperInject 管道。这样即使控制器不是 SuperInject.exe
-     * （例如从源码用 python 启动、或 exe 被重命名）也能连上。
-     */
     while (GetTickCount() < deadline) {
-        WIN32_FIND_DATAW fd;
-        HANDLE f = FindFirstFileW(L"\\\\.\\pipe\\SuperInject-*", &fd);
-        if (f != INVALID_HANDLE_VALUE) {
-            do {
-                size_t n  = wcslen(fd.cFileName);
-                size_t sl = wcslen(suffix);
-                if (n > sl && _wcsicmp(fd.cFileName + n - sl, suffix) == 0) {
-                    swprintf(full, 320, L"\\\\.\\pipe\\%s", fd.cFileName);
-                    if (try_connect(full)) {
-                        FindClose(f);
-                        log_msg("已连接(阶段2) %ls handle=%p", full, (void *)g_pipe);
-                        return 1;
-                    }
-                    log_msg("连接 %ls 失败 err=%lu", full,
-                            (unsigned long)GetLastError());
+        DWORD  port = 0;
+        SOCKET s;
+
+        if (read_port_file(&port)) {
+            struct sockaddr_in a;
+            s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s != INVALID_SOCKET) {
+                memset(&a, 0, sizeof(a));
+                a.sin_family      = AF_INET;
+                a.sin_port        = htons((unsigned short)port);
+                a.sin_addr.s_addr = htonl(0x7F000001u);   /* 127.0.0.1 */
+                if (connect(s, (struct sockaddr *)&a, (int)sizeof(a)) == 0) {
+                    g_sock = s;
+                    log_msg("已连接控制端 127.0.0.1:%lu sock=%llu",
+                            (unsigned long)port, (unsigned long long)s);
+                    return 1;
                 }
-            } while (FindNextFileW(f, &fd));
-            FindClose(f);
+                closesocket(s);
+            }
         }
-        if (WaitForSingleObject(g_done, 200) == WAIT_OBJECT_0) return 0;
+        Sleep(200);
     }
     log_msg("60 秒内未能连上控制端，放弃");
     return 0;
@@ -342,7 +344,9 @@ static void send_hello(void)
     GetModuleFileNameW(NULL, wpath, MAX_PATH);
     utf8_path(wpath, mpath, MAX_PATH);
     si_json_set_str(j, "image", mpath);
-    log_msg("发送 hello 版本=%s 镜像=%s", SI_VERSION, mpath);
+    si_json_set_str(j, "token", g_token);
+    log_msg("发送 hello 版本=%s 镜像=%s 令牌=%s", SI_VERSION, mpath,
+            g_token[0] ? "有" : "无");
     log_msg("hello 写入结果=%d", send_json(j));
     si_json_free(j);
 }
@@ -1127,12 +1131,14 @@ static void agent_handle(const char *text)
         si_json_free(out);
         si_json_free(msg);
         /*
-         * 必须先关掉管道：句柄属于进程而不是线程，FreeLibraryAndExitThread
-         * 只结束线程，句柄会一直留着，控制器永远等不到断开，重新注入就连不上。
+         * 必须先断开连接：socket 属于进程而不是线程，FreeLibraryAndExitThread
+         * 只结束线程，连接会一直留着，控制器永远等不到断开，重新注入就会
+         * 误判成「已注入」。
          */
-        if (g_pipe != INVALID_HANDLE_VALUE) {
-            CloseHandle(g_pipe);
-            g_pipe = INVALID_HANDLE_VALUE;
+        if (g_sock != INVALID_SOCKET) {
+            shutdown(g_sock, SD_BOTH);
+            closesocket(g_sock);
+            g_sock = INVALID_SOCKET;
         }
         Sleep(200);
         FreeLibraryAndExitThread(g_module, 0);
@@ -1163,16 +1169,18 @@ static DWORD WINAPI agent_thread(LPVOID param)
 
     for (;;) {
         char *payload = NULL;
-        if (g_pipe == INVALID_HANDLE_VALUE) break;
+        if (g_sock == INVALID_SOCKET) break;
         if (!recv_frame(&payload)) break;
         agent_handle(payload);
         free(payload);
     }
-    log_msg("读循环结束，关闭管道");
-    if (g_pipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pipe);
-        g_pipe = INVALID_HANDLE_VALUE;
+    log_msg("读循环结束，关闭连接");
+    if (g_sock != INVALID_SOCKET) {
+        shutdown(g_sock, SD_BOTH);
+        closesocket(g_sock);
+        g_sock = INVALID_SOCKET;
     }
+    WSACleanup();
     return 0;
 }
 
@@ -1184,11 +1192,18 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_module = (HMODULE)inst;
         g_pid    = GetCurrentProcessId();
         DisableThreadLibraryCalls(inst);
-        g_done = CreateEventW(NULL, TRUE, FALSE, NULL);
+        /*
+         * 在线程里建连、收发（不在 DllMain 里做 I/O）：
+         * DllMain 持着加载器锁，任何可能触发模块加载的调用都可能卡住。
+         */
         CreateThread(NULL, 0, agent_thread, NULL, 0, NULL);
         break;
     case DLL_PROCESS_DETACH:
-        if (g_done) SetEvent(g_done);
+        if (g_sock != INVALID_SOCKET) {
+            shutdown(g_sock, SD_BOTH);
+            closesocket(g_sock);
+            g_sock = INVALID_SOCKET;
+        }
         break;
     default:
         break;

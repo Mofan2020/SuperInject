@@ -14,13 +14,17 @@ GITHUB_RELEASES = f"https://github.com/{REPO}/releases"
 
 __version__ = "1.0.1"
 
-# 命名管道前缀：注入端 DLL 用 \\.\pipe\SuperInject-<控制器PID>-<目标PID>
-PIPE_PREFIX = r"\\.\pipe\SuperInject-"
+# 控制通道：注入端（DLL）主动反向连接到控制器的回环 TCP 端口。
+# 控制器把「端口 + 一次性令牌」写到这里，注入端按自己的 PID 取用：
+#   %TEMP%\SuperInject\port-<目标PID>.txt   内容：<端口> <令牌>
+CHANNEL_DIR_NAME = "SuperInject"
+PORT_FILE_FMT = "port-{pid}.txt"
 
 
-def pipe_name(controller_pid: int, target_pid: int) -> str:
-    """构造控制器与注入端之间唯一的管道名。"""
-    return f"{PIPE_PREFIX}{controller_pid}-{target_pid}"
+def port_file_name(target_pid: int) -> str:
+    """注入端读取回环端口所用的文件名。"""
+    return PORT_FILE_FMT.format(pid=int(target_pid))
+
 
 
 def compare_version(a: str, b: str) -> int:

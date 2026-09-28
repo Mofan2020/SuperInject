@@ -38,7 +38,7 @@ jobs:
         run: |
           x86_64-w64-mingw32-gcc -shared -O2 -Wall -Wextra -Werror \
             -DUNICODE -D_UNICODE native/agent.c native/superinject_json.c \
-            -o /tmp/si_warncheck.dll -ladvapi32 -lshell32 -luser32
+            -o /tmp/si_warncheck.dll -lws2_32 -ladvapi32 -lshell32 -luser32
 
       - name: 校验产物为 64 位 PE DLL
         run: |
@@ -82,7 +82,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force native\build | Out-Null
-          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent.dll /link advapi32.lib shell32.lib user32.lib
+          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item native\build\SuperInjectAgent.dll
 

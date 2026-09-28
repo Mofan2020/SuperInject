@@ -73,7 +73,7 @@ def build_mingw() -> bool:
         "-lmingw32", "-static-libgcc",
         *[str(s) for s in SOURCES],
         "-o", str(DLL),
-        "-ladvapi32", "-lshell32", "-luser32",
+        "-lws2_32", "-ladvapi32", "-lshell32", "-luser32",
     ]
     print("[build_native] MinGW:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -89,7 +89,7 @@ def build_msvc() -> bool:
     cmd = [
         "cl", "/nologo", "/LD", "/O2", "/W3", "/DUNICODE", "/D_UNICODE",
         *[str(s) for s in SOURCES],
-        f"/Fe:{DLL}", "/link", "advapi32.lib", "shell32.lib", "user32.lib",
+        f"/Fe:{DLL}", "/link", "ws2_32.lib", "advapi32.lib", "shell32.lib", "user32.lib",
     ]
     print("[build_native] MSVC:", " ".join(cmd))
     subprocess.run(cmd, check=True)

@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from superinject.ipc import decode_frames, encode_frame, normalize_hex, parse_int
-from superinject.version import compare_version, pipe_name
+from superinject.version import compare_version, port_file_name
 
 # ------------------------------------------------------------------ 版本
 
@@ -28,8 +28,9 @@ def test_compare_version(a, b, expect):
     assert compare_version(a, b) == expect
 
 
-def test_pipe_name():
-    assert pipe_name(1234, 5678) == r"\\.\pipe\SuperInject-1234-5678"
+def test_port_file_name():
+    """注入端按自己的 PID 找控制器写的端口文件。"""
+    assert port_file_name(5678) == "port-5678.txt"
 
 
 # ------------------------------------------------------------------ 帧协议
