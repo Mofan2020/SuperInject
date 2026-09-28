@@ -4,9 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(_WIN32)
-#include <windows.h>   /* 只有尾部的 si_mem_type/si_is_elevated 需要；JSON 层本身是纯 C99 */
-#endif
 #include "superinject_json.h"
 
 typedef struct si_member {
@@ -473,35 +470,4 @@ char *si_bytes_to_hex(const void *bytes, size_t len)
     return out;
 }
 
-#if defined(_WIN32)
 
-const char *si_mem_type(unsigned long protect)
-{
-    if (protect & PAGE_GUARD)      return "GUARD";
-    if (protect & PAGE_NOACCESS)   return "NOACCESS";
-    switch (protect & 0xFF) {
-    case PAGE_READONLY:            return "R";
-    case PAGE_READWRITE:           return "RW";
-    case PAGE_WRITECOPY:           return "WC";
-    case PAGE_EXECUTE:             return "X";
-    case PAGE_EXECUTE_READ:        return "XR";
-    case PAGE_EXECUTE_READWRITE:   return "XRW";
-    case PAGE_EXECUTE_WRITECOPY:   return "XWC";
-    default:                       return "?";
-    }
-}
-
-int si_is_elevated(void)
-{
-    HANDLE tok = NULL;
-    TOKEN_ELEVATION elv;
-    DWORD len = 0;
-    int elevated = 0;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 0;
-    if (GetTokenInformation(tok, TokenElevation, &elv, sizeof(elv), &len))
-        elevated = elv.TokenIsElevated ? 1 : 0;
-    CloseHandle(tok);
-    return elevated;
-}
-
-#endif /* _WIN32：非 Windows 主机上只编译 JSON 层，便于用本机编译器做单元测试 */

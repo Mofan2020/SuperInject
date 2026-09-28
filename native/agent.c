@@ -38,6 +38,40 @@
 
 #include "superinject_json.h"
 
+/*
+ * 两个 Win32 小工具。原先放在 superinject_json.c 里，逼得那一层必须拉
+ * windows.h 并链接 advapi32 —— 现在归回 agent.c，JSON 层保持纯 C99，
+ * 本机编译器可以直接编译并运行它的自测。
+ */
+static const char *si_mem_type(DWORD protect)
+{
+    if (protect & PAGE_GUARD)      return "GUARD";
+    if (protect & PAGE_NOACCESS)   return "NOACCESS";
+    switch (protect & 0xFF) {
+    case PAGE_READONLY:            return "R";
+    case PAGE_READWRITE:           return "RW";
+    case PAGE_WRITECOPY:           return "WC";
+    case PAGE_EXECUTE:             return "X";
+    case PAGE_EXECUTE_READ:        return "XR";
+    case PAGE_EXECUTE_READWRITE:   return "XRW";
+    case PAGE_EXECUTE_WRITECOPY:   return "XWC";
+    default:                       return "?";
+    }
+}
+
+static int si_is_elevated(void)
+{
+    HANDLE tok = NULL;
+    TOKEN_ELEVATION elv;
+    DWORD len = 0;
+    int elevated = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 0;
+    if (GetTokenInformation(tok, TokenElevation, &elv, sizeof(elv), &len))
+        elevated = elv.TokenIsElevated ? 1 : 0;
+    CloseHandle(tok);
+    return elevated;
+}
+
 #define SI_VERSION "1.0.1"
 
 /* 资源导出上限，避免被调试进程里几十万个小文件拖死 */
