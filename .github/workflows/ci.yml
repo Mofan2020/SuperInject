@@ -10,6 +10,12 @@ on:
 permissions:
   contents: write
 
+# Windows runner 的控制台默认 cp1252：脚本里 print 中文会 UnicodeEncodeError
+# 直接打挂构建步骤（真实踩到过）。统一切到 UTF-8。
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

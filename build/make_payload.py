@@ -7,7 +7,15 @@
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
+
+# Windows 控制台默认 cp1252，直接 print 中文会 UnicodeEncodeError 把构建打挂
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # pragma: no cover - 输出被重定向/无控制台
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 DLL = ROOT / "native" / "build" / "SuperInjectAgent.dll"
