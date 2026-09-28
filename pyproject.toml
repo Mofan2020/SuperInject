@@ -32,3 +32,10 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+exclude = ["superinject/embedded", "native/build", "dist", "build/SuperInject.spec"]
+
+[tool.ruff.lint]
+# 只启用确定性的静态检查：pycodestyle 错误类 + pyflakes + import 排序。
+# 显式声明规则集，避免 ruff 升级后默认集合变化导致 CI 突然变红。
+select = ["E4", "E7", "E9", "F", "W", "I"]
+ignore = ["E501"]

@@ -19,8 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .version import (GITHUB_API, GITHUB_RELEASES, GITHUB_RELEASES_API,
-                      __version__, compare_version)
+from .version import GITHUB_API, GITHUB_RELEASES, GITHUB_RELEASES_API, __version__, compare_version
 
 log = logging.getLogger("supinject.updater")
 

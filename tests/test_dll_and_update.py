@@ -7,11 +7,9 @@ import sys
 import zipfile
 from pathlib import Path
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from superinject import dll_manager, updater
-
 
 # ------------------------------------------------------------- SHA 自校验
 

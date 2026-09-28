@@ -3,6 +3,6 @@
 ⚠️ 仅供开发人员调试自己的程序使用，严禁用于未授权的第三方进程。
 """
 
-from .version import __version__, APP_NAME, PROJECT_URL
+from .version import APP_NAME, PROJECT_URL, __version__
 
 __all__ = ["__version__", "APP_NAME", "PROJECT_URL"]

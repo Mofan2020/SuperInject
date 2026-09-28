@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from superinject.ipc import decode_frames, encode_frame, normalize_hex, parse_int
 from superinject.version import compare_version, pipe_name
 
-
 # ------------------------------------------------------------------ 版本
 
 @pytest.mark.parametrize("a,b,expect", [
