@@ -174,7 +174,8 @@ jobs:
         env:
           SUPERINJECT_DLL_PATH: native/build/SuperInjectAgent.dll
         run: |
-          python -m pytest tests/test_integration_windows.py -v -x
+          python -m pytest tests/test_integration_windows.py -v -x --timeout=180
+        timeout-minutes: 15
 
   # ---------------------------------------------------------------
   # 5) 用 Windows runner + PyInstaller 打包可执行文件

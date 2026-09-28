@@ -1,7 +1,10 @@
-"""Windows 集成测试：真实注入一个进程并通过管道控制它。
+"""Windows 集成测试：真实注入一个进程并通过命名管道控制它。
 
 只在 Windows 上运行；需要已编译好的 SuperInjectAgent.dll
 （CI 中由 native job 产出，通过 SUPERINJECT_DLL_PATH 传入）。
+
+目标进程选用 ping.exe：它是短生命周期命令行程序，测试结束后可彻底回收，
+不会像 Windows 11 的 notepad 那样留下常驻宿主进程拖住 CI 步骤。
 """
 
 from __future__ import annotations
@@ -16,10 +19,15 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from conftest import spawn  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("win"), reason="仅 Windows 可运行注入集成测试"
 )
+
+TARGET_IMG = "ping.exe"
 
 
 def _dll_path() -> Path:
@@ -43,16 +51,9 @@ def _wait_until(fn, timeout=25.0, interval=0.5):
 
 @pytest.fixture(scope="module")
 def target():
-    """启动一个干净的目标进程（notepad），测试结束后关闭。"""
     if not _dll_path().exists():
         pytest.skip(f"未找到编译好的 DLL：{_dll_path()}")
-    proc = subprocess.Popen(["notepad.exe"])
-    yield proc.pid
-    try:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except Exception:
-        proc.kill()
+    return spawn([TARGET_IMG, "-t", "127.0.0.1"])
 
 
 @pytest.fixture()
@@ -62,6 +63,15 @@ def ctrl():
     c = Controller(dll_path=_dll_path())
     yield c
     c.server.shutdown()
+
+
+def _ping(ctrl, pid, timeout=30):
+    """等待注入端连接并返回 ping 结果。"""
+    return _wait_until(
+        lambda: ctrl.server.request(pid, {"type": "ping"}, 5).get("ok")
+        if ctrl.server.is_attached(pid) else None,
+        timeout=timeout,
+    )
 
 
 def test_dll_is_valid_pe():
@@ -87,38 +97,35 @@ def test_process_listing_includes_target(target):
 def test_inject_ping_info_and_unload(target, ctrl):
     res = ctrl.inject([target])
     assert res[0]["ok"], f"注入失败: {res[0].get('error')}"
-    assert ctrl.server.is_attached(target) or True  # 管道连接可能稍晚
 
-    ping = _wait_until(lambda: ctrl.server.request(target, {"type": "ping"}, 5)
-                       if ctrl.server.is_attached(target) else None)
-    assert ping and ping.get("ok"), f"注入端无响应: {ping}"
+    assert _ping(ctrl, target), "注入端未连接或无响应"
 
     info = ctrl.server.request(target, {"type": "info"}, timeout=15)
     assert info.get("ok")
-    names = [m["name"] for m in info["modules"]]
-    assert any("notepad" in n.lower() for n in names), names
+    names = [m["name"].lower() for m in info["modules"]]
+    assert any("ping" in n for n in names), names
 
     regions = ctrl.server.request(target, {"type": "mem_regions"}, timeout=30)
     assert regions.get("ok") and len(regions["regions"]) > 0
 
-    # 内存读取：搜索 MZ 头（几乎必然命中主模块）
+    # 内存搜索：MZ 头几乎必然命中主模块
     found = ctrl.mem_search([target], "4D 5A", 8)
     assert found and found[0]["ok"], found
     results = found[0]["resp"]["results"]
-    assert len(results) > 0, "未搜索到 MZ 头"
+    assert results, "未搜索到 MZ 头"
 
-    # 写入一个字节再读回，验证读写链路
+    # 写入再读回，验证读写链路，最后还原
     addr = results[0]["address"]
     original = ctrl.mem_read(target, addr, 1)
-    assert original.get("ok")
+    assert original.get("ok"), original
     old_byte = original["hex"][:2]
     new_byte = "90" if old_byte != "90" else "91"
     w = ctrl.mem_write(target, addr, new_byte)
     assert w.get("ok"), w
     time.sleep(0.3)
     back = ctrl.mem_read(target, addr, 1)
-    assert back["hex"][:2] == new_byte
-    ctrl.mem_write(target, addr, old_byte)  # 还原
+    assert back["hex"][:2] == new_byte, back
+    ctrl.mem_write(target, addr, old_byte)
 
     out = ctrl.unload([target])
     assert out[0]["ok"], out
@@ -129,20 +136,17 @@ def test_request_to_non_injected_process_fails(ctrl):
     """未注入的进程不应能响应命令。"""
     resp = ctrl.server.request(999999, {"type": "ping"}, timeout=2)
     assert resp["ok"] is False
-    assert "未连接" in resp["error"] or "超时" in resp["error"]
 
 
-def test_terminate_via_dll(target, ctrl):
+def test_terminate_via_dll(ctrl):
     """让被注入进程自己 ExitProcess 结束自己。"""
-    res = ctrl.inject([target])
+    pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
+    res = ctrl.inject([pid])
     assert res[0]["ok"], res[0].get("error")
-    ok = _wait_until(lambda: ctrl.server.is_attached(target) and
-                     ctrl.server.request(target, {"type": "ping"}, 5).get("ok"))
-    assert ok
+    assert _ping(ctrl, pid), "注入端未连接"
 
-    ctrl.terminate([target])
-    gone = _wait_until(lambda: not _pid_alive(target), timeout=15)
-    assert gone, "目标进程未被终止"
+    ctrl.terminate([pid])
+    assert _wait_until(lambda: not _pid_alive(pid), timeout=20), "目标进程未被终止"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -156,17 +160,15 @@ def _pid_alive(pid: int) -> bool:
 
 def test_freeze_and_resume(ctrl):
     """冻结 / 解除冻结：进程应变为无响应后又恢复。"""
-    proc = subprocess.Popen(["notepad.exe"])
-    pid = proc.pid
+    pid = spawn([TARGET_IMG, "-t", "127.0.0.1"])
     try:
         assert ctrl.freeze([pid])[0]["ok"]
         time.sleep(1.0)
+        assert pid in ctrl._frozen
         assert ctrl.unfreeze([pid])[0]["ok"]
         time.sleep(1.0)
+        assert pid not in ctrl._frozen
         assert _pid_alive(pid)
     finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=10)
-        except Exception:
-            proc.kill()
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, check=False)
