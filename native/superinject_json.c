@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#if defined(_WIN32)
+#include <windows.h>   /* 只有尾部的 si_mem_type/si_is_elevated 需要；JSON 层本身是纯 C99 */
+#endif
 #include "superinject_json.h"
 
 typedef struct si_member {
@@ -51,18 +53,28 @@ void si_json_free(si_json *j)
     free(j);
 }
 
+/*
+ * 自带 strdup：本层不依赖 _strdup（MSVC 专有），保持纯 C99、可在任意主机上编译自测。
+ */
+static char *si_dup(const char *s)
+{
+    size_t n;
+    char  *p;
+    if (!s) s = "";
+    n = strlen(s) + 1;
+    p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
 static void obj_set(si_json *j, const char *key, si_json *val)
 {
     si_member *m;
     if (!j || !val) { si_json_free(val); return; }
-    if (j->type == SI_ARR) {           /* 数组直接追加 */
-        si_json_array_push(j, val);
-        return;
-    }
-    if (j->type != SI_OBJ) { si_json_free(val); return; }
+    if (j->type != SI_OBJ && j->type != SI_ARR) { si_json_free(val); return; }
     m = (si_member *)calloc(1, sizeof(si_member));
     if (!m) { si_json_free(val); return; }
-    m->key = _strdup(key);
+    m->key = si_dup(key ? key : "");   /* 数组元素 key 为空串，序列化时忽略 */
     m->val = val;
     if (j->tail) j->tail->next = m; else j->head = m;
     j->tail = m;
@@ -73,7 +85,7 @@ void si_json_set_str(si_json *j, const char *key, const char *val)
 {
     si_json *v = j_new(SI_STR);
     if (!v) return;
-    v->str = _strdup(val ? val : "");
+    v->str = si_dup(val ? val : "");
     obj_set(j, key, v);
 }
 
@@ -98,12 +110,15 @@ void si_json_set_arr(si_json *j, const char *key, si_json *val) { obj_set(j, key
 
 void si_json_array_push(si_json *arr, si_json *item)
 {
-    char tmp[1];
     if (!arr || !item) { si_json_free(item); return; }
-    if (arr->type != SI_ARR) { obj_set(arr, "", item); return; }
+    /*
+     * 只走 obj_set 一条路（obj_set 对 SI_ARR 也是直接追加成员、自增 count）。
+     * 早期版本这里 obj_set 又回调本函数，两个函数无限互递归：凡是真往
+     * 数组里塞过元素的命令（info 模块表 / mem_regions 内存区 / mem_search
+     * 匹配结果）全部永久卡死，而数组恰好为空的 resources 反而「正常」，
+     * 解析器解析数组走同一条路 —— 含数组的 JSON 也解析不了。
+     */
     obj_set(arr, "", item);
-    arr->count++;
-    (void)tmp;
 }
 
 size_t si_json_count(si_json *arr) { return arr ? arr->count : 0; }
@@ -458,6 +473,8 @@ char *si_bytes_to_hex(const void *bytes, size_t len)
     return out;
 }
 
+#if defined(_WIN32)
+
 const char *si_mem_type(DWORD protect)
 {
     if (protect & PAGE_GUARD)      return "GUARD";
@@ -486,3 +503,5 @@ int si_is_elevated(void)
     CloseHandle(tok);
     return elevated;
 }
+
+#endif /* _WIN32：非 Windows 主机上只编译 JSON 层，便于用本机编译器做单元测试 */

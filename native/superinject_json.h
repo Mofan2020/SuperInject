@@ -46,9 +46,13 @@ si_json *si_json_parse(const char *text);
 /* 工具 */
 void       *si_hex_to_bytes(const char *hex, size_t *out_len); /* malloc */
 char      *si_bytes_to_hex(const void *bytes, size_t len);      /* si_free */
+void        si_free(void *p);
+
+#if defined(_WIN32)
+/* Win32 专用：非 Windows 编译（本机单测）时不参与，头文件保持自包含 */
 const char *si_mem_type(DWORD protect);
 int         si_is_elevated(void);
-void        si_free(void *p);
+#endif
 
 #ifdef __cplusplus
 }

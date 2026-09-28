@@ -201,6 +201,14 @@ class AgentServer:
             c.close()
         if listener:
             try:
+                # Linux 上 close() 不会唤醒阻塞在 accept() 的线程：内核还持着这个
+                # 监听 socket，新连接照样能进 backlog（macOS 会立刻拒绝），同一份
+                # 代码在两平台表现不同。先 shutdown 再 close，阻塞的 accept() 才会
+                # 立即返回。
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:  # pragma: no cover - 未连接/不支持
+                pass
+            try:
                 listener.close()
             except OSError:  # pragma: no cover
                 pass

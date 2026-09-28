@@ -34,6 +34,14 @@ jobs:
       - name: 编译 agent.dll
         run: python build/build_native.py
 
+      - name: JSON 层自测（宿主编译器真编译真运行）
+        run: |
+          # 钉死回归：si_json_array_push 与 obj_set 曾无限互递归 —— 数组里只要
+          # 真的塞过元素（info/mem_regions/mem_search）就会永久卡死。
+          cc -std=c99 -Wall -Wextra -Werror -I native \
+            tests/native/test_si_json.c native/superinject_json.c -o /tmp/test_si_json
+          /tmp/test_si_json
+
       - name: 零警告静态检查 (-Werror)
         run: |
           x86_64-w64-mingw32-gcc -shared -O2 -Wall -Wextra -Werror \
@@ -85,6 +93,15 @@ jobs:
           cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item native\build\SuperInjectAgent.dll
+
+      - name: JSON 层自测（MSVC 真编译真运行）
+        shell: pwsh
+        run: |
+          # 与 ubuntu 上同一份自测：数组 push / dump / parse 必须真的跑通
+          cl /nologo /W3 /wd4996 /I native tests\native\test_si_json.c native\superinject_json.c /Fe:tests\native\test_si_json.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          tests\native\test_si_json.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: 校验 MSVC 产物
         shell: bash

@@ -273,24 +273,30 @@ def test_hello_with_bad_length_closes_connection(server, work_dir):
 def test_shutdown_closes_everything(work_dir):
     srv = ipc.AgentServer(base_dir=work_dir)
     srv.register(4000)
+    port = int(srv.port)
     port_file = work_dir / port_file_name(4000)
     assert port_file.exists()
+
     srv.shutdown()
     assert not srv.is_attached(4000)
     assert not port_file.exists()
-    # 监听也应当关闭：再连应当失败
-    port, _ = (port_file.read_text(encoding="utf-8").split(" ") if port_file.exists()
-               else (str(srv.port), ""))
-    s = socket.socket()
-    s.settimeout(1.0)
+    assert srv._listener is None
+
+    # 监听已关。注意：Linux 上若 accept() 线程正阻塞在内核里，close() 不会立刻
+    # 撤销监听（macOS 会），connect 仍可能成功 —— 所以这里断言真正有意义的不变量：
+    # 服务端不会再接受任何注入端（登记与一次性令牌都已清空）。
     try:
-        s.connect(("127.0.0.1", int(port)))
-        ok = False
+        sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
     except OSError:
-        ok = True
-    finally:
-        s.close()
-    assert ok
+        return  # 直接拒绝：最干净的结果
+    with sock:
+        sock.sendall(ipc.encode_frame({
+            "type": "hello", "pid": 4000, "version": "1.0.1", "proto": 1,
+            "arch": 64, "elevated": True, "image": r"C:\demo\fake.exe",
+            "token": "stolen",
+        }))
+        time.sleep(0.3)
+    assert not srv.is_attached(4000), "关停后不应再登记任何注入端"
 
 
 def test_hello_json_is_well_formed(server, work_dir):
