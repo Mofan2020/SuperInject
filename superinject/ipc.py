@@ -285,7 +285,7 @@ class PipeServer:
             name, PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
-            64 * 1024, 64 * 1024, 5000, None,
+            1 << 20, 1 << 20, 5000, None,
         )
         if handle in (0, INVALID_HANDLE_VALUE):
             raise OSError(ctypes.get_last_error(), f"CreateNamedPipe {name}")
@@ -343,11 +343,16 @@ class PipeServer:
                     pass
 
     def _read_exact_chunk(self, handle: int) -> bytes:
+        """读一大块原始数据（帧的切分交给 decode_frames）。
+
+        缓冲必须够大：管道两端阻塞读写时，接收方挂着的读请求缓冲过小会让
+        对端的写入迟迟完不成（注入端按 4 字节读帧头时实测会双方死等）。
+        """
         k = _win_pipes()
         k.ReadFile.restype = wt.BOOL
         k.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD,
                                ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
-        size = 65536
+        size = 1 << 20
         buf = (ctypes.c_ubyte * size)()
         n = ctypes.c_ulong(0)
         if not k.ReadFile(ctypes.c_void_p(handle), buf, size, ctypes.byref(n), None):

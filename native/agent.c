@@ -43,6 +43,7 @@
 #define SI_MEM_SCAN_CHUNK    (1u << 20)
 #define SI_MEM_SCAN_MS       30000u
 #define SI_MAPPED_SCAN_MS    20000u
+#define SI_READ_BUF          (1u << 20)   /* 接收缓冲：必须一次读一大块 */
 
 /* NtQueryVirtualMemory 信息类（等价于 winternl.h 的 MemoryMappedFilenameInformation） */
 #define SI_MemoryMappedFilenameInformation 2
@@ -163,20 +164,79 @@ static int send_json(si_json *j)
     return ok;
 }
 
-/* 帧长度可能被拆到多次 ReadFile 返回，必须读满 */
-static int read_exact(void *buf, DWORD len)
+/*
+ * 接收帧。
+ *
+ * 这里刻意「一次读一大块再自己切帧」，而不是先读 4 字节长度、再读正文：
+ * 命名管道两端都是阻塞读写时，接收方挂着的读请求缓冲过小会让对端的写入
+ * 迟迟无法完成（实测：控制器写 25 字节的命令、注入端只挂着 4 字节的读请求
+ * 时，写入端会一直阻塞，双方对等死等 5 分钟直到测试超时）。读大块能彻底
+ * 避开这种情况，顺带还省掉每帧一次系统调用。
+ */
+static unsigned char *g_rbuf = NULL;
+static size_t         g_rlen = 0;
+static size_t         g_rpos = 0;
+
+static void recv_reset(void)
 {
-    char *p = (char *)buf;
-    DWORD got_total = 0;
-    while (got_total < len) {
-        DWORD got = 0;
-        if (!ReadFile(g_pipe, p + got_total, len - got_total, &got, NULL))
-            return 0;
-        if (got == 0)
-            return 0;
-        got_total += got;
+    g_rlen = 0;
+    g_rpos = 0;
+}
+
+/* 成功返回 1 并把堆上的 JSON 文本交给 *out（调用方 free）；断开返回 0 */
+static int recv_frame(char **out)
+{
+    *out = NULL;
+    if (!g_rbuf) {
+        g_rbuf = (unsigned char *)malloc(SI_READ_BUF);
+        if (!g_rbuf) return 0;
     }
-    return 1;
+
+    for (;;) {
+        /* 1) 缓冲里已经攒够一整帧了吗 */
+        if (g_rlen - g_rpos >= 4) {
+            DWORD len;
+            memcpy(&len, g_rbuf + g_rpos, 4);
+            if (len == 0 || len > (32u * 1024u * 1024u)) {
+                log_msg("帧长度异常 len=%lu，断开", (unsigned long)len);
+                return 0;
+            }
+            if (g_rlen - g_rpos >= 4 + (size_t)len) {
+                char *text = (char *)malloc((size_t)len + 1);
+                if (!text) return 0;
+                memcpy(text, g_rbuf + g_rpos + 4, len);
+                text[len] = 0;
+                g_rpos += 4 + (size_t)len;
+                if (g_rpos == g_rlen) recv_reset();
+                *out = text;
+                return 1;
+            }
+        }
+
+        /* 2) 数据不够：残余挪到开头，再整块读一次 */
+        if (g_rpos > 0) {
+            memmove(g_rbuf, g_rbuf + g_rpos, g_rlen - g_rpos);
+            g_rlen -= g_rpos;
+            g_rpos = 0;
+        }
+        if (g_rlen >= SI_READ_BUF) {
+            log_msg("单帧超过接收缓冲 %u 字节，断开", (unsigned)SI_READ_BUF);
+            return 0;
+        }
+        {
+            DWORD got = 0;
+            DWORD want = (DWORD)(SI_READ_BUF - g_rlen);
+            if (!ReadFile(g_pipe, g_rbuf + g_rlen, want, &got, NULL)) {
+                log_msg("读管道失败 err=%lu（对端已断开）",
+                        (unsigned long)GetLastError());
+                return 0;
+            }
+            if (got == 0) return 0;
+            log_msg("收到 %lu 字节（缓冲 %lu/%u）", (unsigned long)got,
+                    (unsigned long)(g_rlen + got), (unsigned)SI_READ_BUF);
+            g_rlen += got;
+        }
+    }
 }
 
 /* 找到控制端 SuperInject.exe 的 PID，用于构造唯一的管道名 */
@@ -1102,30 +1162,9 @@ static DWORD WINAPI agent_thread(LPVOID param)
     log_msg("hello 已发出，进入读循环等待命令");
 
     for (;;) {
-        DWORD len = 0;
-        char *payload;
-        DWORD t_read;
+        char *payload = NULL;
         if (g_pipe == INVALID_HANDLE_VALUE) break;
-        t_read = GetTickCount();
-        if (!read_exact(&len, 4) || len == 0) {
-            log_msg("读帧头失败 err=%lu（对端已断开）", (unsigned long)GetLastError());
-            break;
-        }
-        if (len > (32u * 1024u * 1024u)) {
-            log_msg("帧长度异常 len=%lu，断开", (unsigned long)len);
-            break;
-        }
-        log_msg("读到帧 len=%lu（等待 %lums）", (unsigned long)len,
-                (unsigned long)(GetTickCount() - t_read));
-        payload = (char *)malloc(len + 1);
-        if (!payload) break;
-        if (!read_exact(payload, len)) {
-            log_msg("读帧正文失败 err=%lu len=%lu", (unsigned long)GetLastError(),
-                    (unsigned long)len);
-            free(payload);
-            break;
-        }
-        payload[len] = 0;
+        if (!recv_frame(&payload)) break;
         agent_handle(payload);
         free(payload);
     }
