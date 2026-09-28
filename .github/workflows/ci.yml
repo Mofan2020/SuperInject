@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    name: 编译注入端 DLL (mingw-w64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: 编译 agent.dll
+        run: python build/build_native.py
+
+      - name: 校验产物为 64 位 PE DLL
+        run: |
+          python - <<'PY'
+          import pathlib, struct
+          p = pathlib.Path("native/build/SuperInjectAgent.dll")
+          data = p.read_bytes()
+          assert data[:2] == b"MZ", "不是有效的 PE 文件"
+          pe = struct.unpack_from("<I", data, 0x3C)[0]
+          assert data[pe:pe + 4] == b"PE\0\0", "缺少 PE 签名"
+          machine = struct.unpack_from("<H", data, pe + 4)[0]
+          assert machine == 0x8664, f"期望 x86-64 (0x8664)，实际 0x{machine:04x}"
+          characteristics = struct.unpack_from("<H", data, pe + 22)[0]
+          assert characteristics & 0x2000, "缺少 IMAGE_FILE_DLL 标志"
+          print(f"OK: PE32+ DLL, {len(data)} bytes, machine=0x{machine:04x}")
+          PY
+
+      - name: 静态检查 C 源码（-Wall -Wextra 无警告）
+        run: |
+          x86_64-w64-mingw32-gcc -shared -O2 -Wall -Wextra -Werror \
+            -DUNICODE -D_UNICODE native/agent.c native/superinject_json.c \
+            -o /tmp/si_warncheck.dll -ladvapi32 -lshell32 -luser32
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperInjectAgent-dll
+          path: native/build/SuperInjectAgent.dll
+
+  python:
+    name: Python 单元测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: 语法编译检查
+        run: python -m compileall -q superinject build tests run_superinject.py
+
+      - name: 运行 pytest
+        run: python -m pytest tests -q --junitxml=pytest-${{ matrix.os }}.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-${{ matrix.os }}
+          path: pytest-${{ matrix.os }}.xml
+
+  package:
+    name: 打包 Windows 可执行文件
+    needs: [native, python]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖（含 PyInstaller / WebView2）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt -r requirements.txt
+
+      - name: 拉取 mingw 编译出的 agent.dll
+        uses: actions/download-artifact@v4
+        with:
+          name: SuperInjectAgent-dll
+          path: native/build
+
+      - name: 内嵌 DLL 到 exe
+        run: python build/make_payload.py
+
+      - name: PyInstaller 打包
+        run: python -m PyInstaller --noconfirm --clean --name SuperInject --windowed --onedir --add-data "superinject/web;superinject/web" --hidden-import webview.platforms.edgechromium run_superinject.py
+
+      - name: 冒烟检查产物
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          exe = pathlib.Path("dist/SuperInject/SuperInject.exe")
+          assert exe.exists(), "未生成 SuperInject.exe"
+          payload = pathlib.Path("superinject/embedded/dll_payload.py").read_text("utf-8")
+          assert "DATA_B64" in payload
+          print("OK:", exe, exe.stat().st_size, "bytes")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperInject-win-x64
+          path: dist/SuperInject
+
+  release:
+    name: 发布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SuperInject-win-x64
+          path: dist
+      - name: 生成 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SuperInject/*
+          generate_release_notes: true
+          body: |
+            ## ⚠️ 使用前必读
+
+            **本工具仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！**
+            只能用于你自己拥有、或已获得明确授权的目标进程。
+            未经授权对第三方进程注入 DLL 可能违反当地法律、违反服务条款，
+            由此产生的一切后果由使用者自行承担。

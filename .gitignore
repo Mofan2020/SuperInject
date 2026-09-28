@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/SuperInject.spec
+native/build/
+superinject/embedded/dll_payload.py
+*.dll
+*.old
+*.bak
+.vscode/
+.idea/
+*.log

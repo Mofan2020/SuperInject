@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SuperInject</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="banner" class="warn">
+  ⚠️ <b>仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！</b>
+  只能用于你自己拥有或已获得授权的目标进程。
+</div>
+
+<header>
+  <div class="brand">
+    <span class="logo">SI</span>
+    <div>
+      <h1>SuperInject</h1>
+      <div class="sub">基于 DLL 注入的快捷调试工具 · 仅限 Windows</div>
+    </div>
+  </div>
+  <div class="checks">
+    <span id="badge-admin" class="badge">权限检查中…</span>
+    <span id="badge-dll" class="badge">DLL 校验中…</span>
+    <span id="badge-ver" class="badge">v–</span>
+    <button id="btn-refresh" class="ghost">刷新进程</button>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>进程</h2>
+      <input id="search" type="search" placeholder="按名称 / PID 搜索…" autocomplete="off" />
+      <label class="chk"><input type="checkbox" id="sel-all" /> 全选</label>
+      <label class="chk"><input type="checkbox" id="only-injected" /> 仅已注入</label>
+      <span class="grow"></span>
+      <input id="manual-pids" placeholder="手工输入 PID，逗号分隔" />
+      <button id="btn-add-pids" class="ghost">加入</button>
+    </div>
+    <div class="table-wrap">
+      <table id="proc-table">
+        <thead>
+          <tr>
+            <th class="c-sel"></th>
+            <th>PID</th>
+            <th>进程名</th>
+            <th>内存(MB)</th>
+            <th>状态</th>
+            <th class="c-path">路径</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>注入</h2>
+      <span id="dll-path" class="muted"></span>
+      <span class="grow"></span>
+      <button id="btn-verify" class="ghost">重新校验 DLL</button>
+      <button id="btn-inject" class="primary">注入选中 (0)</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>控制（批量）</h2>
+      <span id="sel-count" class="muted">已选 0 个进程</span>
+    </div>
+    <div class="actions">
+      <button class="act" data-act="ping">连通性检查</button>
+      <button class="act" data-act="info">查看模块</button>
+      <button class="act" data-act="freeze">❄ 冻结进程</button>
+      <button class="act" data-act="unfreeze">▶ 解除冻结</button>
+      <button class="act" data-act="resources">🖼 查看进程资源</button>
+      <button class="act warn" data-act="unload">卸载注入 DLL</button>
+      <button class="act danger" data-act="terminate">终止进程</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>内存调试</h2></div>
+    <div class="mem-bar">
+      <input id="mem-pattern" placeholder="十六进制模式，支持 ?? 通配，例如 4D 5A ?? ??" />
+      <input id="mem-max" type="number" value="128" min="1" max="2000" title="最大结果数" />
+      <button id="btn-search" class="primary">搜索选中进程内存</button>
+    </div>
+    <div id="mem-results" class="results"></div>
+    <div id="mem-editor" class="editor hidden">
+      <div class="row">
+        <input id="ed-addr" placeholder="地址（十进制或 0x…）" />
+        <input id="ed-size" type="number" value="64" />
+        <button id="btn-read" class="ghost">读取</button>
+      </div>
+      <textarea id="ed-data" spellcheck="false" placeholder="十六进制数据，如 00 10 20 30"></textarea>
+      <div class="row">
+        <button id="btn-write" class="danger">写入选中进程</button>
+        <span id="ed-msg" class="muted"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>日志 / 结果</h2>
+      <span class="grow"></span>
+      <button id="btn-clear" class="ghost">清空</button>
+    </div>
+    <div id="log" class="log"></div>
+  </section>
+</main>
+
+<div id="update-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>发现新版本 <span id="up-ver"></span></h3>
+    <p id="up-notes" class="muted"></p>
+    <div class="row end">
+      <button id="up-later" class="ghost">稍后再说</button>
+      <button id="up-install" class="primary">下载并安装</button>
+    </div>
+    <div id="up-progress" class="muted hidden"></div>
+  </div>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="modal-title">确认</h3>
+    <p id="modal-text"></p>
+    <div class="row end">
+      <button id="modal-cancel" class="ghost">取消</button>
+      <button id="modal-ok" class="danger">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
