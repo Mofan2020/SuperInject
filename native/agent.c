@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <wchar.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,20 +93,57 @@ static DWORD find_controller_pid(void)
     return srv ? srv : 1;
 }
 
+static int try_connect(const wchar_t *full)
+{
+    HANDLE h = CreateFileW(full, GENERIC_READ | GENERIC_WRITE,
+                           0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        g_pipe = h;
+        return 1;
+    }
+    return 0;
+}
+
 static int agent_connect(void)
 {
-    wchar_t name[128];
-    int     tries;
-    swprintf(name, 128, L"\\\\.\\pipe\\SuperInject-%lu-%lu",
-             find_controller_pid(), g_pid);
-    for (tries = 0; tries < 600; tries++) { /* 约 60s 内持续重试 */
-        HANDLE h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
-                               0, NULL, OPEN_EXISTING, 0, NULL);
-        if (h != INVALID_HANDLE_VALUE) {
-            g_pipe = h;
-            return 1;
-        }
+    wchar_t full[320], name[160], suffix[64];
+    DWORD   phase1_end, deadline;
+
+    swprintf(suffix, 64, L"-%lu", g_pid);
+    deadline = GetTickCount() + 60000;
+
+    /* 阶段 1：按约定尝试（控制器通常就是 SuperInject.exe） */
+    phase1_end = GetTickCount() + 3000;
+    while (GetTickCount() < phase1_end) {
+        swprintf(name, 160, L"SuperInject-%lu-%lu", find_controller_pid(), g_pid);
+        swprintf(full, 320, L"\\\\.\\pipe\\%s", name);
+        if (try_connect(full)) return 1;
         if (WaitForSingleObject(g_done, 100) == WAIT_OBJECT_0) return 0;
+    }
+
+    /*
+     * 阶段 2：枚举命名管道命名空间，寻找以 "-<本进程PID>" 结尾的
+     * SuperInject 管道。这样即使控制器不是 SuperInject.exe
+     * （例如从源码用 python 启动、或 exe 被重命名）也能连上。
+     */
+    while (GetTickCount() < deadline) {
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW(L"\\\\.\\pipe\\SuperInject-*", &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                size_t n  = wcslen(fd.cFileName);
+                size_t sl = wcslen(suffix);
+                if (n > sl && _wcsicmp(fd.cFileName + n - sl, suffix) == 0) {
+                    swprintf(full, 320, L"\\\\.\\pipe\\%s", fd.cFileName);
+                    if (try_connect(full)) {
+                        FindClose(f);
+                        return 1;
+                    }
+                }
+            } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+        if (WaitForSingleObject(g_done, 200) == WAIT_OBJECT_0) return 0;
     }
     return 0;
 }
