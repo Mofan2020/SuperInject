@@ -276,25 +276,28 @@ static int recv_frame(char **out)
 
 /* ---------------------- 与控制端建立连接 ---------------------- */
 
-/*
- * 读 %TEMP%\SuperInject\port-<本进程PID>.txt，内容为「<回环端口> <一次性令牌>」。
- * 控制器在注入之前就把这个文件写好，所以正常情况下第一次读就能拿到。
- */
-static int read_port_file(DWORD *port_out)
+/* 组装 <dir>\SuperInject\port-<本进程PID>.txt；装不下返回 0 */
+static int build_port_path(WCHAR *out, size_t cap, const WCHAR *dir)
 {
-    WCHAR  path[MAX_PATH];
-    WCHAR  num[32];
+    WCHAR num[32];
+    size_t need;
+
+    swprintf(num, 32, L"SuperInject\\port-%lu.txt", (unsigned long)g_pid);
+    need = lstrlenW(dir) + lstrlenW(num) + 1;
+    if (need > cap) return 0;
+    lstrcpynW(out, dir, (int)cap);
+    lstrcatW(out, num);
+    return 1;
+}
+
+/* 读指定路径的会合文件：内容为「<回环端口> <一次性令牌>」 */
+static int read_port_at(const WCHAR *path, DWORD *port_out)
+{
     HANDLE h;
     char   buf[128];
     DWORD  got = 0;
     unsigned long port;
     char  *sp;
-
-    if (GetTempPathW(MAX_PATH, path) == 0) return 0;
-    lstrcatW(path, L"SuperInject");
-    lstrcatW(path, L"\\port-");
-    swprintf(num, 32, L"%lu.txt", (unsigned long)g_pid);
-    lstrcatW(path, num);
 
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -320,6 +323,78 @@ static int read_port_file(DWORD *port_out)
         g_token[n] = 0;
     }
     *port_out = (DWORD)port;
+    return 1;
+}
+
+/* 文件是否可读（只读探测，不解析内容） */
+static int file_readable(const WCHAR *path)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    CloseHandle(h);
+    return 1;
+}
+
+/*
+ * 找会合文件。本进程的 TEMP 未必等于控制端的 TEMP：
+ *
+ * * 同一用户下的普通进程：两边 TEMP 相同，第一条路径就命中；
+ * * SYSTEM 服务这类高权限目标：它们的 TEMP 通常是 C:\Windows\Temp，而控制端
+ *   （以 SYSTEM 运行时）写在「启动它的那个用户」的 TEMP 里 —— 于是按
+ *   C:\Users\*\AppData\Local\Temp\SuperInject 逐个用户目录再找一遍。
+ *
+ * 只做只读扫描、不额外落盘，所以不会把一次性令牌暴露给别的用户
+ * （往 C:\Windows\Temp 这类公共目录写才是真隐患）。
+ */
+static int find_port_file(WCHAR *path_out, size_t cap)
+{
+    WCHAR  dir[MAX_PATH];
+    WCHAR  roots[MAX_PATH];      /* <SystemDrive>\Users\ ，别写死 C: */
+    WCHAR  pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE hf;
+    DWORD  n;
+
+    /* ① 自己的 TEMP */
+    if (GetTempPathW(MAX_PATH, dir) != 0 && build_port_path(path_out, cap, dir)) {
+        if (file_readable(path_out)) return 1;
+    }
+
+    /* ② 各用户的 TEMP（目标是 SYSTEM / 其他用户时） */
+    n = GetEnvironmentVariableW(L"SystemDrive", roots, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) lstrcpynW(roots, L"C:", MAX_PATH);
+    lstrcatW(roots, L"\\Users\\");
+    lstrcpynW(pat, roots, MAX_PATH);
+    lstrcatW(pat, L"*");
+
+    hf = FindFirstFileW(pat, &fd);
+    if (hf == INVALID_HANDLE_VALUE) return 0;
+    for (;;) {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+            fd.cFileName[0] != L'.') {
+            lstrcpynW(dir, roots, MAX_PATH);
+            lstrcatW(dir, fd.cFileName);
+            lstrcatW(dir, L"\\AppData\\Local\\Temp\\");
+            if (build_port_path(path_out, cap, dir) && file_readable(path_out)) {
+                FindClose(hf);
+                return 1;
+            }
+        }
+        if (!FindNextFileW(hf, &fd)) break;
+    }
+    FindClose(hf);
+    return 0;
+}
+
+static int read_port_file(DWORD *port_out)
+{
+    WCHAR path[MAX_PATH];
+
+    if (!find_port_file(path, MAX_PATH)) return 0;
+    if (!read_port_at(path, port_out)) return 0;
+    log_msg("会合文件: %ls", path);
     return 1;
 }
 

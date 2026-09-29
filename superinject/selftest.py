@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -143,6 +145,9 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not report.ok:
             return _finish(rec, explicit_report)
 
+        # ---------------------------------------------------------- SYSTEM 提权
+        _system_steps(rec)
+
         from .controller import Controller  # 延迟导入：非 Windows 下会抛错
 
         ctrl = Controller(dll_path=dll_path)
@@ -270,6 +275,69 @@ def run(argv: Optional[List[str]] = None) -> int:
             _kill(target_pid)
 
     return _finish(rec, explicit_report)
+
+
+def _system_steps(rec: "Recorder") -> None:
+    """验证 SYSTEM 提权链路：复制令牌 → 真的创建一个 SYSTEM 进程。
+
+    这是需求「提权自身到 SYSTEM」的可验证证据：不是只检查代码存在，而是
+    真复制令牌、真拉起一个进程，再读子进程写回的身份文件确认它是 SYSTEM。
+    环境不允许时（拿不到令牌）记为 unknown 并写明原因，不能静默当成通过。
+    """
+    from . import system_token
+
+    search = system_token.acquire_system_token()
+    if search.ok:
+        try:
+            _kernel32 = system_token._kernel32()  # noqa: SLF001 - 自检需要显式关句柄
+            _kernel32.CloseHandle(ctypes.c_void_p(search.token))
+        except Exception:  # pragma: no cover
+            pass
+    rec.soft("SYSTEM 令牌复制（SeDebugPrivilege + DuplicateTokenEx）",
+             True if search.ok else None,
+             (f"来源 {search.name} pid={search.pid} sid={search.sid}"
+              if search.ok else f"{search.reason}；已试 {len(search.tried)} 个进程"))
+    if not search.ok:
+        rec.soft("SYSTEM 提权链路（真实创建 SYSTEM 进程）", None,
+                 "跳过：没有可用的 SYSTEM 令牌")
+        return
+
+    probe = Path(tempfile.gettempdir()) / "SuperInject" / "system-probe.json"
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    res = system_token.launch_as_system(
+        ["--system-probe", str(probe)], wait=False, timeout=30.0)
+    if not res.ok:
+        rec.soft("SYSTEM 提权链路（真实创建 SYSTEM 进程）", None,
+                 f"环境不允许：{res.message}")
+        return
+
+    data = _wait_for_json(probe, timeout=30.0)
+    if not data:
+        rec.step("SYSTEM 提权链路（真实创建 SYSTEM 进程）", False,
+                 f"已创建 pid={res.pid} 但没等到身份文件 {probe}")
+        return
+    ok = data.get("privilege") == "system" and data.get("sid") == "S-1-5-18"
+    rec.step("SYSTEM 提权链路（真实创建 SYSTEM 进程）", ok,
+             f"{res.method} 创建 pid={data.get('pid')}，"
+             f"身份 {data.get('user')} 权限 {data.get('privilege')} "
+             f"sid={data.get('sid')} session={data.get('session')}")
+    rec.context["system_launch"] = {"method": res.method, "probe": data}
+
+
+def _wait_for_json(path: Path, timeout: float = 30.0) -> dict:
+    """等待子进程把 JSON 写完（原子性：先等到能解析为止）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.25)
+    return {}
 
 
 def _finish(rec: Recorder, explicit_report: str) -> int:

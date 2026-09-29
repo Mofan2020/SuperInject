@@ -191,6 +191,29 @@ def format_error(code: Optional[int] = None) -> str:
         return f"Win32 error {code}"
 
 
+def screen_work_area() -> Optional[tuple[int, int]]:
+    """主屏可用区域（已去掉任务栏）的宽高；失败返回 None。
+
+    用途：按屏幕算 GUI 初始尺寸 —— 早期版本把窗口写死成 1280x820 且
+    min_size 1040x640，在小屏/高缩放的机器上窗口比屏幕还大，底部功能区
+    永远露不出来。
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        rect = wt.RECT()
+        # SPI_GETWORKAREA = 0x0030
+        if not user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            return None
+        w, h = int(rect.right - rect.left), int(rect.bottom - rect.top)
+        if w <= 0 or h <= 0:
+            return None
+        return w, h
+    except Exception:  # pragma: no cover - 老系统或非 Windows
+        return None
+
+
 # ---------------------------------------------------------------- 权限判定
 
 

@@ -11,7 +11,7 @@ import logging
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import dll_manager, elevate, updater, winapi
 from .controller import Controller
@@ -22,10 +22,40 @@ log = logging.getLogger("supinject.gui")
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
+# 窗口默认/最小尺寸（逻辑像素）。上限不是为了好看，而是保证窗口永远塞得进屏幕。
+DEFAULT_WINDOW = (1280, 860)
+MIN_WINDOW = (720, 500)
+
+
+def window_size(screen: Optional[tuple] = None) -> tuple[int, int]:
+    """按屏幕可用区域算 GUI 初始尺寸（纯函数，方便测试）。
+
+    规则：取「默认尺寸」与「屏幕 92%」的较小值，并保证不小于最小尺寸。
+    这样小屏机器上窗口一定放得下，加上整页可滚动，所有功能区都能看到。
+    """
+    if not screen:
+        return DEFAULT_WINDOW
+    sw, sh = int(screen[0]), int(screen[1])
+    if sw <= 0 or sh <= 0:
+        return DEFAULT_WINDOW
+    w = max(MIN_WINDOW[0], min(DEFAULT_WINDOW[0], int(sw * 0.92)))
+    h = max(MIN_WINDOW[1], min(DEFAULT_WINDOW[1], int(sh * 0.92)))
+    return w, h
+
 
 def export_root() -> Path:
     """注入端导出资源的根目录（与 native/agent.c 中的约定一致）。"""
     return Path(tempfile.gettempdir()) / "SuperInject"
+
+
+def storage_dir() -> Path:
+    """WebView 的持久化目录（cookie / localStorage / 缓存）。
+
+    显式指定而不是让它落到 %LOCALAPPDATA%：以 SYSTEM 运行时环境变量里的
+    路径属于当前用户，交给 WebView 自己猜容易踩到权限问题。
+    """
+    return Path(tempfile.gettempdir()) / "SuperInject" / "webview"
+
 
 
 class Api:
@@ -38,6 +68,7 @@ class Api:
         self.controller.preview_url = self.preview.url_for
         self.dll_report: dict = {}
         self.update: dict = {}
+        self.elevation: dict = {}
         self.controller.on_change(self._broadcast_state)
 
     # -------------------------------------------------- 内部
@@ -81,6 +112,7 @@ class Api:
             "privilege": winapi.current_privilege(),
             "is_admin": elevate.is_admin(),
             "identity": elevate.current_identity(),
+            "elevation": self.elevation,
             "arch": self.controller.status().get("arch", ""),
             "dll": self.dll_report,
             "update": self.update,
@@ -213,22 +245,50 @@ class Api:
 
 
 def create_window(api: Api):
-    """创建 pywebview 窗口（供 __main__ 调用）。"""
+    """创建 pywebview 窗口（供 __main__ 调用）。
+
+    尺寸按屏幕可用区域自适应：小屏上不会再出现「窗口比屏幕大、底部看不到」
+    的情况（曾经的固定 1280x820 / min 1040x640 就是这个毛病）。
+    """
     import webview
 
+    width, height = window_size(winapi.screen_work_area())
+    log.info("GUI 窗口尺寸 %sx%s（屏幕可用区域 %s）", width, height,
+             winapi.screen_work_area())
     return webview.create_window(
         APP_NAME,
         str(WEB_DIR / "index.html"),
         js_api=api,
-        width=1280, height=820, min_size=(1040, 640),
+        width=width, height=height, min_size=MIN_WINDOW,
     )
+
+
+def start_kwargs(debug: bool = False) -> dict:
+    """webview.start 的参数（按版本能力裁剪，避免 TypeError）。"""
+    import inspect
+
+    import webview
+
+    kwargs: dict = {"debug": debug, "private_mode": False}
+    try:
+        params = inspect.signature(webview.start).parameters
+    except (TypeError, ValueError):  # pragma: no cover - 极端版本
+        params = {}
+    if "storage_path" in params:
+        path = storage_dir()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            kwargs["storage_path"] = str(path)
+        except OSError:  # pragma: no cover
+            log.debug("创建 WebView 存储目录失败，交回默认位置", exc_info=True)
+    return kwargs
 
 
 def run_gui(api: Api, window, debug: bool = False) -> None:
     import webview
 
     try:
-        webview.start(debug=debug, private_mode=False)
+        webview.start(**start_kwargs(debug))
     finally:
         api.shutdown()
 

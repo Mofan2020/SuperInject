@@ -379,6 +379,50 @@
   });
   $("#btn-clear").addEventListener("click", () => { $("#log").innerHTML = ""; });
 
+  // ---------------------------------------------------------- 分区导航
+  // 整页滚动后用一个分段控件在功能区之间跳转；滚动时自动高亮当前区。
+  (function initNav() {
+    const segs = Array.from(document.querySelectorAll(".nav-seg"));
+    const panels = segs
+      .map((s) => document.getElementById(s.dataset.target))
+      .filter(Boolean);
+    if (!panels.length) return;
+
+    const mark = (id) =>
+      segs.forEach((s) => s.classList.toggle("on", s.dataset.target === id));
+
+    segs.forEach((s) =>
+      s.addEventListener("click", () => {
+        const target = document.getElementById(s.dataset.target);
+        if (!target) return;
+        mark(s.dataset.target);
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      })
+    );
+
+    let ticking = false;
+    const sync = () => {
+      ticking = false;
+      const line = window.scrollY + 140;
+      let current = panels[0];
+      panels.forEach((p) => {
+        if (p.offsetTop <= line) current = p;
+      });
+      mark(current.id);
+    };
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (!ticking) {
+          ticking = true;
+          window.requestAnimationFrame(sync);
+        }
+      },
+      { passive: true }
+    );
+    mark(panels[0].id);
+  })();
+
   // ---------------------------------------------------------- 弹窗
   function confirmBox(title, text) {
     return new Promise((resolve) => {
@@ -444,12 +488,17 @@
       $("#badge-arch").textContent = (info.arch || "?") + " / " + (info.app || "");
       const admin = $("#badge-admin");
       admin.textContent = "权限 " + (PRIV_LABELS[info.privilege] || "未知");
-      admin.className = "badge " + (info.privilege === "user" ? "bad" : "ok");
+      admin.className = "badge " +
+        (info.privilege === "user" ? "bad" : info.privilege === "system" ? "ok" : "warn");
+      admin.title = (info.elevation && info.elevation.message) || "";
       const dll = $("#badge-dll");
       dll.textContent = info.dll.ok ? "DLL " + info.dll.action : "DLL 异常";
       dll.className = "badge " + (info.dll.ok ? "ok" : "bad");
       $("#dll-path").textContent = info.dll.path || "";
       log("启动自检: " + info.identity);
+      const elev = info.elevation || {};
+      if (elev.message) log(elev.message, elev.degraded ? "warn" : "ok");
+      if (elev.degraded && elev.reason) log("SYSTEM 提权说明: " + elev.reason, "warn");
       log(info.dll.message || "");
       if (info.dll.embedded_sha) {
         log(`DLL SHA256（运行时计算）: ${String(info.dll.embedded_sha).slice(0, 32)}…`);
@@ -460,6 +509,14 @@
     refresh();
   }
 
-  window.addEventListener("pywebviewready", boot);
-  if (window.pywebview && window.pywebview.api) boot();
+  // 只启动一次：pywebview 有时既已注入 api，又会再派发 pywebviewready，
+  // 早期版本会因此把自检与进程列表跑两遍（日志里出现两份）。
+  let booted = false;
+  function bootOnce() {
+    if (booted) return;
+    booted = true;
+    boot();
+  }
+  window.addEventListener("pywebviewready", bootOnce);
+  if (window.pywebview && window.pywebview.api) bootOnce();
 })();

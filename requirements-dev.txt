@@ -3,3 +3,6 @@ pytest>=8.0
 pytest-timeout>=2.3
 pyinstaller>=6.0
 ruff==0.16.9
+# 仅前端布局渲染检查（tests/ui/render_check.py）需要；CI 的 ui-layout job 会单独
+# 执行 playwright install --with-deps chromium 装浏览器。
+playwright>=1.40,<2

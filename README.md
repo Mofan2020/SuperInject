@@ -18,7 +18,7 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 
 | 能力 | 说明 |
 | --- | --- |
-| 启动自检 1 | 识别当前权限（SYSTEM / 管理员 / 普通用户）；普通用户则自动触发 UAC 提权 |
+| 启动自检 1 | 识别当前权限（SYSTEM / 管理员 / 普通用户）：普通用户先走 UAC 提到管理员，管理员再**自我提权到 SYSTEM**（复制 SYSTEM 进程令牌 + `CreateProcessAsUserW`），以便调试高权限进程；失败会明确降级为管理员并说明原因 |
 | 启动自检 2 | DLL 完整性校验：运行时计算 SHA256 与内嵌副本比对，不一致（或缺失）**自动替换** |
 | 进程选择 | 全量进程列表，支持按名称 / PID 搜索，支持多选批量，也支持手工粘贴 PID |
 | 注入检查 | 注入前逐个 PID 预检：进程是否还在、位数是否匹配、能否打开、是否系统关键进程、是否已注入 |
@@ -32,6 +32,8 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
 | 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
 | 自动更新 | 后台检查 GitHub Release（含预发布版本），有新版时询问是否下载安装 |
+| 界面 | 单页应用、**整页可滚动**、六个功能区按视口高度分配空间；外观跟随系统（浅色 / 深色）的 macOS 风格 |
+| 单文件交付 | 打包产物**只有 `SuperInject.exe` 一个文件**（无 `_internal` 目录），内置 DLL 与前端资源都在 exe 内 |
 
 ---
 
@@ -40,7 +42,7 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 ```
 ┌──────────────── SuperInject.exe（Python / PyWebView）────────────────┐
 │                                                                        │
-│  自检1 权限  →  自检2 DLL SHA 校验替换  →  GUI 启动  →  后台检查更新      │
+│  自检1 权限（UAC → SYSTEM 提权重启）→ 自检2 DLL SHA 校验替换 → GUI 启动     │
 │                                                                        │
 │  Controller ──► 注入检查 → CreateRemoteThread + LoadLibraryW 注入       │
 │      │                                                                 │
@@ -77,6 +79,15 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
   注入端阻塞读」并存时会出现方向性死等（写端与读端一起卡死数分钟），故换成 socket。
 * DLL 字节在打包时以 base64 **内嵌进 exe**，运行时的 SHA256 **全部实时计算**，
   源码与配置中不存在任何手写哈希常量（有单元测试守护这条规则）。
+* **SYSTEM 提权不改会话**。做法是：打开 `SeDebugPrivilege` → 在**当前会话**里找一个
+  以 SYSTEM 运行的进程（首选 `winlogon.exe`，它未被 PPL 保护）→ 复制其令牌为**主令牌**
+  → 用该令牌把自己重新拉起。新进程是 SYSTEM，但仍在你当前的桌面/会话里，
+  所以 GUI 照常显示（用计划任务以 SYSTEM 启动会掉进 session 0，界面根本看不见）。
+  候选限定在同会话，因此完全不需要 `SeTcbPrivilege`。
+* **会合文件跨 TEMP 也能找到**。注入端除了读自己的 `%TEMP%\SuperInject\`，
+  在找不到时会再只读扫描各用户的 `%TEMP%\SuperInject\` —— 因为 SYSTEM 服务这类
+  目标进程的 `GetTempPathW()` 往往是 `C:\Windows\Temp`，而控制器写在启动它的
+  那个用户的 TEMP 里。只读扫描，不往公共目录写令牌。
 
 ---
 
@@ -85,9 +96,14 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 ### 方式一：下载 Release
 
 从 [Releases](https://github.com/Mofan2020/SuperInject/releases) 下载 `SuperInject-win-x64.zip`，
-解压后运行 `SuperInject.exe`，按提示同意 UAC 提权。
+解压得到**单个 `SuperInject.exe`**（没有 `_internal` 目录，也不需要安装），双击运行，
+按提示同意 UAC。
 
 > 依赖：Windows 10/11 x64 + [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Win11 自带）。
+>
+> 首次运行会在 exe 同目录释放内置的 `SuperInjectAgent.dll`（自检2 会实时校验它的
+> SHA256）；若 exe 放在不可写的位置（如 `Program Files`），DLL 会自动改释放到
+> `%LOCALAPPDATA%\SuperInject\`。
 
 ### 方式二：从源码运行
 
@@ -115,6 +131,28 @@ python run_superinject.py
 5. **内存调试** —— 输入十六进制模式（如 `4D 5A ?? ??`）搜索，选中结果后即可查看与修改；
    写入只读页（例如 PE 头、代码段）时会自动临时改页属性并还原。
 
+### 命令行参数
+
+```
+SuperInject.exe                  启动自检 → 提权到 SYSTEM → 图形界面
+SuperInject.exe --as-admin       只提到管理员（不提 SYSTEM），调试普通进程时用
+SuperInject.exe --self-test      无界面全链路自检
+SuperInject.exe --help           帮助
+```
+
+### 关于 SYSTEM 权限
+
+- **默认就会提权到 SYSTEM**：注入检查、内存读写、冻结这些能力对高权限进程
+  （SYSTEM 服务、其他用户的进程）同样有效；界面右上角会显示当前真实权限
+  （`权限 SYSTEM ✓` / `权限 管理员 ✓` / `权限 未提权 ✗`）。
+- **拿不到 SYSTEM 也能用**：若系统策略不允许（例如没有可用的 SYSTEM 令牌来源、
+  安全软件拦截令牌复制），程序会**降级为管理员继续运行**，并在日志里写明原因，
+  不会硬性退出 —— 调试普通进程用管理员权限足够。
+- **不想提 SYSTEM** 时加 `--as-admin`。
+- **可以调试哪些高权限进程**：在 SYSTEM 模式下，目标进程只要不是内核/受保护进程
+  （PPL）都可以尝试注入；`lsass.exe`、`csrss.exe`、`services.exe` 等系统关键进程
+  被本工具主动拦下（注入它们会导致系统崩溃，这不是能力不足而是必须的护栏）。
+
 ### 无界面自检（CI 与自测用）
 
 ```powershell
@@ -124,7 +162,7 @@ SuperInject.exe --self-test --keep-target
 ```
 
 它从**打包产物**本身出发，用内嵌的 DLL 去注入一个真实进程，逐项验证：
-权限自检 → DLL 校验与 SHA 一致 → 拉起目标进程 → 注入检查 → 注入并建连 →
+权限自检 → DLL 校验与 SHA 一致 → SYSTEM 令牌复制 → **真实创建一个 SYSTEM 进程并核对身份** → 拉起目标进程 → 注入检查 → 注入并建连 →
 ping / info / mem_regions / 内存搜索 / 内存读写还原 → 资源提取 →
 冻结与解除（核实线程挂起状态）→ 卸载 → 重新注入 → 热更新重注入 → 自我终止。
 退出码 0 表示全部通过，报告为 JSON（`self-test-report.json`）。
@@ -145,7 +183,8 @@ SuperInject/
 │  ├─ media.py           媒体类型判定与预览条目组装
 │  ├─ resconv.py         裸 DIB → BMP / ICO / CUR（PE 资源补文件头）
 │  ├─ dll_manager.py     DLL 内嵌副本与 SHA256 自校验替换（自检2）
-│  ├─ elevate.py         权限自检与 UAC 提权（自检1）
+│  ├─ elevate.py         权限自检、UAC 提权与 SYSTEM 提权策略（自检1）
+│  ├─ system_token.py    SYSTEM 令牌复制与 CreateProcessAsUserW 重启（Windows 专用）
 │  ├─ updater.py         GitHub Release 更新检查与安装
 │  ├─ selftest.py        无界面全链路自检（--self-test）
 │  ├─ web/               前端界面（index.html / app.js / style.css）
@@ -155,6 +194,7 @@ SuperInject/
 │  └─ superinject_json.c/.h  DLL 侧零依赖 JSON 实现
 ├─ build/                编译 / 内嵌 / 打包脚本
 ├─ tests/                单元测试（跨平台） + Windows 真实注入集成测试
+│  └─ ui/render_check.py 前端布局的无头渲染检查（Playwright + 假后端）
 └─ .github/workflows/ci.yml  CI：编译 DLL + 测试 + 打包 + 产物自检 + 自动发布
 ```
 
@@ -167,6 +207,10 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests -q --ignore=tests/test_integration_windows.py   # 跨平台单元测试
 python -m ruff check superinject build tests run_superinject.py
 python build/build_native.py       # 交叉编译 DLL（Ubuntu 上装 mingw-w64 即可）
+
+# 前端布局检查（无头 Chromium，装一次浏览器即可）
+python -m pip install playwright && python -m playwright install chromium
+python tests/ui/render_check.py --shots-dir /tmp/si-ui
 ```
 
 Windows 上（管理员终端）跑真实注入集成测试：
@@ -180,10 +224,15 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在每次 push / P
 
 1. 用 **MinGW-w64** 交叉编译 `SuperInjectAgent.dll`（`-Wall -Wextra -Werror`），并校验产物是 64 位 PE DLL；
 2. 用 **MSVC**（`/W4 /WX`）在 windows runner 上再编译一次，保证两套工具链都能过；
-3. 在 **Ubuntu + Windows** 上跑单元测试、`compileall` 与 `ruff`；
+3. 在 **Ubuntu + Windows** 上跑单元测试、`compileall` 与 `ruff`
+   （Windows 上还会跑 `tests/test_system_token_windows.py`：真复制 SYSTEM 令牌、
+   以 SYSTEM 创建进程并核对子进程身份）；
+3b. 用 **Playwright + Chromium** 把前端渲染三档窗口尺寸 + 深浅两套外观，
+   断言「整页可滚动 / 无横向溢出 / 各功能区都能完整看到」，并真点一遍交互路径；
 4. 在 **windows-latest** 上跑**真实注入集成测试**（注入 `ping.exe`，
    覆盖内存读写含只读页、冻结与解除、资源提取、卸载、重新注入、自我终止）；
-5. 用 PyInstaller 打包，压成 `SuperInject-win-x64.zip`；
+5. 用 PyInstaller **单文件**打包（`--onefile`），断言产物只有 `SuperInject.exe`、
+   zip 里也只有这一个文件，再压成 `SuperInject-win-x64.zip`；
 6. 对**打包产物**再跑一次 `SuperInject.exe --self-test`，把整条链路在发布件上重验一遍；
 7. 打 `v*` tag 时自动发布正式版 Release（附加 zip 资产，自动更新只认它）。
 
@@ -213,6 +262,16 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在每次 push / P
 
 **Q：冻结后怎么恢复？**
 「解除冻结」按钮，或直接结束进程。冻结期间目标进程完全不响应，包括它的注入端 DLL。
+
+**Q：界面显示「权限 管理员 ✓」而不是 SYSTEM？**
+说明 SYSTEM 提权没成功，日志里会写明原因（常见：安全软件拦截令牌复制、
+没有可用的 SYSTEM 进程令牌）。功能仍然可用，只是调试不了 SYSTEM 级别的目标。
+
+**Q：能不能只以管理员运行、不要 SYSTEM？**
+可以，加 `--as-admin` 参数启动（例如做快捷方式时带上它）。
+
+**Q：为什么任务管理器里看到 SuperInject 的进程名/用户变了？**
+提权到 SYSTEM 时程序会「用 SYSTEM 令牌重新启动自己」再退出原进程，属于预期行为。
 
 **Q：资源提取为什么有些图片打不开？**
 内存映射文件是按「当时被映射进内存的那段内容」导出的，如果程序只映射了文件的一部分，

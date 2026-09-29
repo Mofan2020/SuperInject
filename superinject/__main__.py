@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 from . import dll_manager, elevate
 from .version import APP_NAME, __version__
@@ -23,10 +25,12 @@ BANNER = r"""
 
 USAGE = """用法: SuperInject [选项]
 
-  （无参数）        执行启动自检并拉起图形界面
+  （无参数）        执行启动自检，提权到 SYSTEM 并拉起图形界面
+  --as-admin       只提到管理员，不提权到 SYSTEM（调试普通进程时用）
   --self-test      无界面自检：真跑一遍「校验 DLL → 注入 → 控制 → 卸载 → 终止」
   --report PATH    自检报告输出路径（默认写在程序目录下的 self-test-report.json）
   --keep-target    自检结束后保留目标进程（默认回收）
+  --system-probe F 以当前身份把身份信息写到文件 F 后退出（自检内部使用）
   -h, --help       显示本帮助
 
 ⚠️ 仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！
@@ -66,6 +70,32 @@ def _set_app_user_model_id() -> None:
         pass
 
 
+def run_system_probe(argv: list[str]) -> int:
+    """``--system-probe <文件>``：把当前进程的身份写盘后退出。
+
+    自检用它来证明「SYSTEM 提权真的创建出了一个 SYSTEM 进程」：
+    父进程以 SYSTEM 拉起自己并带上这个参数，子进程只汇报身份，不启动 GUI。
+    """
+    out = ""
+    for i, a in enumerate(argv):
+        if a == "--system-probe" and i + 1 < len(argv):
+            out = argv[i + 1]
+    from . import system_token
+
+    data = system_token.probe_identity()
+    if not out:
+        return 0
+    path = Path(out)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError as exc:  # pragma: no cover
+        log.error("写入身份文件失败 %s: %s", path, exc)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     setup_logging()
@@ -75,22 +105,32 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE)
         return 0
 
+    # ---- 身份探针：任何权限下都要能跑，且必须在提权逻辑之前
+    if "--system-probe" in argv:
+        return run_system_probe(argv)
+
     # ---- 无界面自检：供 CI 与用户验证打包产物
     if "--self-test" in argv:
         from . import selftest
 
         return selftest.run(argv)
 
-    # ---- 自检1：权限（管理员 / SYSTEM）
-    elev = elevate.ensure_admin(auto_relaunch=True)
+    # ---- 自检1：权限（普通用户 → UAC；管理员 → SYSTEM）
+    elev = elevate.ensure_privilege(argv, auto_relaunch=True)
+    if elev.relaunched:
+        print(f"[自检1] {elev.message}")
+        log.info("已重新启动（%s），退出当前进程", elev.message)
+        return 0
     if not elev.ok:
         print("[自检1] " + elev.message)
         log.error("权限自检失败: %s", elev.message)
         return 1
-    if elev.relaunched:
-        log.info("已请求 UAC 提权，退出当前进程")
-        return 0
-    print(f"[自检1] 权限自检通过（{elev.identity}）")
+    if elev.degraded:
+        print(f"[自检1] {elev.message}")
+        print(f"        {elev.reason}")
+        log.warning("SYSTEM 提权降级: %s / %s", elev.message, elev.reason)
+    else:
+        print(f"[自检1] 权限自检通过（{elev.identity}）")
 
     # ---- 自检2：DLL 校验（SHA256 全部运行时自动计算）
     report = dll_manager.verify_and_sync()
@@ -99,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
 
     api_holder: dict = {}
     api = Api(api_holder)
+    api.elevation = elev.to_dict()
     api.dll_report = {
         "ok": report.ok, "action": report.action, "path": str(report.path),
         "embedded_sha": report.embedded_sha, "disk_sha": report.disk_sha,

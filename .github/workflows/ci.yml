@@ -169,6 +169,37 @@ jobs:
           path: pytest-results/unit-${{ matrix.os }}.xml
 
   # ---------------------------------------------------------------
+  # 3b) 前端布局的无头渲染检查（Playwright + Chromium）
+  #     界面在 pywebview 里，CI 上没有桌面，过去只能人肉看 —— 这一 job 用假后端
+  #     把真实页面渲染出来，断言「整页可滚动 / 无横向溢出 / 各功能区都看得全」，
+  #     并把「最小窗口」这种以前会看不全的场景固化下来。
+  # ---------------------------------------------------------------
+  ui-layout:
+    name: 前端布局渲染检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Playwright + Chromium
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: 渲染检查（布局 + 真实交互路径）
+        run: python tests/ui/render_check.py --shots-dir ui-shots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-shots
+          path: ui-shots
+
+  # ---------------------------------------------------------------
   # 4) Windows runner 上跑真实注入集成测试（注入 ping.exe 并控制它）
   # ---------------------------------------------------------------
   integration:
@@ -205,6 +236,10 @@ jobs:
           SUPERINJECT_DEBUG: "1"
         run: python -m pytest tests/test_integration_windows.py -v --timeout=300
         timeout-minutes: 20
+
+      - name: SYSTEM 提权链路（真实令牌复制 + 真实创建 SYSTEM 进程）
+        shell: bash
+        run: python -m pytest tests/test_system_token_windows.py -v -rs --timeout=180
 
       - name: IPC 调试日志（末尾 160 行）
         if: always()
@@ -266,29 +301,41 @@ jobs:
           print("embedded sha256:", hashlib.sha256(emb).hexdigest())
           PY
 
-      - name: PyInstaller 打包
+      - name: PyInstaller 打包（单文件，无 _internal 目录）
         run: |
           python -m PyInstaller --noconfirm --clean --name SuperInject --windowed `
-            --onedir --add-data "superinject/web;superinject/web" `
+            --onefile --add-data "superinject/web;superinject/web" `
             --collect-submodules webview `
             --hidden-import webview.platforms.edgechromium run_superinject.py
 
-      - name: 冒烟检查产物
+      - name: 冒烟检查产物（必须只有单个 exe）
         shell: bash
         run: |
           python - <<'PY'
           import pathlib
-          exe = pathlib.Path("dist/SuperInject/SuperInject.exe")
-          assert exe.exists(), "未生成 SuperInject.exe"
-          assert (pathlib.Path("dist/SuperInject/_internal/superinject/web/index.html")).exists()
-          print("OK:", exe, exe.stat().st_size, "bytes")
+          exe = pathlib.Path("dist/SuperInject.exe")
+          assert exe.exists(), "未生成 dist/SuperInject.exe"
+          # 单文件产物的硬判据：不能再有 _internal 目录 / 同名文件夹
+          stray = [p for p in pathlib.Path("dist").iterdir()]
+          assert not pathlib.Path("dist/SuperInject").exists(), f"出现目录产物: {stray}"
+          assert exe.stat().st_size > 5 * 1024 * 1024, "exe 体积异常（可能没打进 webview）"
+          print("OK 单文件:", exe, exe.stat().st_size, "bytes")
+          print("dist/ 内容:", [p.name for p in stray])
           PY
 
-      - name: 压缩为发布包
+      - name: 压缩为发布包（zip 里只有单个 exe）
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/SuperInject/* -DestinationPath dist/SuperInject-win-x64.zip -Force
+          Compress-Archive -Path dist/SuperInject.exe -DestinationPath dist/SuperInject-win-x64.zip -Force
           Get-Item dist/SuperInject-win-x64.zip | Select-Object Name, Length
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path dist/SuperInject-win-x64.zip))
+          $names = $zip.Entries | ForEach-Object { $_.FullName }
+          $zip.Dispose()
+          Write-Host "zip 内文件: $names"
+          if ($names.Count -ne 1 -or $names[0] -ne "SuperInject.exe") {
+            Write-Error "发布包里不只有单个 exe: $names"; exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -336,7 +383,7 @@ jobs:
         run: |
           python - <<'PY'
           import json, pathlib, sys
-          data = json.loads(pathlib.Path("dist/SuperInject/self-test-report.json")
+          data = json.loads(pathlib.Path("dist/self-test-report.json")
                             .read_text(encoding="utf-8"))
           for step in data["steps"]:
               mark = "PASS" if step["ok"] else "FAIL"
@@ -366,7 +413,7 @@ jobs:
         if: always()
         with:
           name: self-test-report
-          path: dist/SuperInject/self-test-report.json
+          path: dist/self-test-report.json
 
   # ---------------------------------------------------------------
   # 7) 打 tag 自动发版（正式版 + zip 资产，自动更新只认这个 zip）
@@ -374,7 +421,7 @@ jobs:
   release:
     name: 发布 GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package, exe-self-test]
+    needs: [package, exe-self-test, ui-layout]
     runs-on: ubuntu-latest
     permissions:
       contents: write

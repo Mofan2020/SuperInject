@@ -345,3 +345,38 @@ def test_resources_preview_url_when_server_running(injected, ctrl, tmp_path):
     finally:
         ctrl.preview_url = None
         srv.stop()
+
+
+# ------------------------------------------------- 高权限 / 跨 TEMP 目标
+def test_inject_target_with_foreign_temp(ctrl, tmp_path):
+    """目标进程的 TEMP 与控制端不同时也必须能建连。
+
+    这条是 SYSTEM 提权场景的回归：SYSTEM 服务这类目标的 ``GetTempPathW()``
+    往往是 ``C:\\Windows\\Temp``，而控制器写在启动它的那个用户的 TEMP 里。
+    过去注入端只读自己 TEMP 下的会合文件，于是「注入成功但一直连不上」。
+    现在注入端会再扫一遍各用户 TEMP。
+
+    构造方式：给目标进程显式设一个陌生的 TEMP —— 它自己的 TEMP 里没有会合
+    文件，只有走「扫用户目录」那条回退路径才能拿到端口和令牌。
+    """
+    fake_temp = tmp_path / "foreign-temp"
+    fake_temp.mkdir()
+    env = dict(os.environ)
+    env["TEMP"] = env["TMP"] = str(fake_temp)
+
+    proc = subprocess.Popen(
+        [TARGET_IMG, "-t", "127.0.0.1"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    pid = proc.pid
+    try:
+        res = ctrl.inject([pid])[0]
+        assert res["ok"], f"注入失败: {res.get('error')}"
+        assert res["attached"], (
+            f"控制通道未建立（跨 TEMP 会合失败）: {res.get('error')}")
+        assert _ping(ctrl, pid), "注入端无响应（跨 TEMP 会合失败）"
+        # 确认确实没有把会合文件写进目标的 TEMP（否则这条用例没测到回退路径）
+        assert not list(fake_temp.rglob("port-*.txt")), \
+            "会合文件不该出现在目标自己的 TEMP 里，用例构造有误"
+    finally:
+        ctrl.unload([pid])
+        kill(pid)

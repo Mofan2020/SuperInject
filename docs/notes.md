@@ -69,10 +69,15 @@ dist\SuperInject\SuperInject.exe --self-test               # 打包产物全链�
 ## 四、已知限制（不是 bug，是当前边界）
 
 - **仅 Windows**：注入、冻结、内存读写依赖 Win32；macOS/Linux 只能跑纯 Python 单测。
-- **提权到不了 SYSTEM**：UAC 只能拿到管理员。真需要 SYSTEM 请自行用计划任务或
-  PsExec 拉起（`elevate.py` 里有说明）。
-- **GUI 无法在 CI 里自动验证**：Pywebview 需要桌面会话，CI 只验证到「打包成功 +
-  `--self-test` 全链路」。GUI 的交互仍需人工过一遍。
+- **SYSTEM 提权有条件**：令牌复制（`SeDebugPrivilege` + `DuplicateTokenEx` +
+  `CreateProcessAsUserW`，失败回退 `CreateProcessWithTokenW`）需要管理员，且要有
+  一个**同会话**的、未被 PPL 保护的 SYSTEM 进程可作令牌来源（`winlogon.exe` 首选）。
+  拿不到就降级为管理员并写明原因，不硬失败。详见第四节之后「SYSTEM 提权」。
+- **受保护进程（PPL）无法注入**：`lsass.exe`、`csrss.exe` 这类由 Windows 自身保护，
+  连打开令牌都会被拒；本工具把它们与系统关键进程一起拦在注入检查里。
+- **GUI 的自动化验证边界**：Playwright 现在能在 CI 里渲染真实页面（布局 + 交互路径，
+  `tests/ui/render_check.py`），但 **pywebview 容器本身**（Windows 上的 WebView2 窗口、
+  SYSTEM 身份下的 WebView 行为）仍需人工过一遍。
 - **资源查看靠嗅探**：提取 PE 资源 + 扫描内存映射里的媒体文件；对没有媒体资源的
   目标（如 `ping.exe`）条目为 0 属正常。
 - **残留模块**：若目标进程内 DLL 线程已死但模块被别处引用着（罕见），只能重启目标
@@ -86,3 +91,61 @@ dist\SuperInject\SuperInject.exe --self-test               # 打包产物全链�
 - **未实现进程内存的写回历史/撤销**：调试场景下写入是小步试错，控制器只提供
   「读 → 改 → 读回」，需要还原时由调用方自己写回（`selftest` 就是这么做的）。
 - **命名管道相关代码已删除**，不保留兼容分支：两套通道并存只会让排查更难。
+
+## 六、本轮（v1.0.2）：UI 重做 / SYSTEM 提权 / 单文件打包
+
+需求原文：「修复 UI 问题…请允许整体页面滚动，并处理好各个功能区的空间大小分配」、
+「提权自身到 SYSTEM 权限」、「打包为单个 EXE 文件（无 _internal 文件夹）」、
+「UI 尽可能使用 Apple 风格」。
+
+| # | 问题 | 根因 | 处理 |
+|---|------|------|------|
+| 1 | 界面「绝大多数情况下显示不全」 | 窗口写死 `1280x820`、`min_size=(1040,640)`：小屏/高缩放机器上窗口比屏幕还大，底部功能区永远在屏幕外；同时 6 个面板各自 `max-height` 固定像素，与窗口高度无关 | 窗口尺寸按屏幕可用区域计算（≤ 屏幕 92%，最小 720x500，`winapi.screen_work_area()`）；`html/body` 去掉 `height:100%`，改由**整页滚动**；各功能区改用 `clamp(…, vh, …)` 分配高度 |
+| 2 | 视觉不统一 | 深色单一主题、控件样式拼凑 | 重写 `style.css`：macOS 设计语言（系统蓝 / 圆角 8-14px / 毛玻璃吸顶栏 / 分段导航 / 覆盖式滚动条），**跟随系统自动切浅色深色** |
+| 3 | 提权只到管理员 | `elevate.py` 只有 UAC | 新增 `system_token.py`：同会话找 SYSTEM 进程 → 复制主令牌 → `CreateProcessAsUserW` 重启自身（回退 `CreateProcessWithTokenW`），GUI 仍在当前桌面 |
+| 4 | 交付物是一个文件夹 | PyInstaller `--onedir` | 改 `--onefile`，并在 `build_exe.py` 与 CI 里双重断言「只有单个 exe、zip 里也只有它」 |
+| 5 | 高权限目标「注入成功但连不上」 | 注入端只读**自己** TEMP 下的会合文件；SYSTEM 服务的 `GetTempPathW()` 是 `C:\Windows\Temp`，而控制器写在启动它的用户 TEMP 里 | 注入端加只读回退：扫各用户 `%TEMP%\SuperInject\`（**不往公共目录写令牌**，避免把一次性令牌暴露给其他本地用户）；`tests/test_integration_windows.py::test_inject_target_with_foreign_temp` 专门构造「目标 TEMP 与控制端不同」来跑这条路径 |
+| 6 | 前端启动跑两遍 | `pywebviewready` 与「api 已就绪」两条路都调 `boot()` | 加 `booted` 守卫，只启动一次 |
+
+### SYSTEM 提权的关键决策
+
+- **用「复制令牌 + CreateProcessAsUserW」而不是计划任务 / PsExec**：计划任务以 SYSTEM
+  启动会掉进 **session 0**（没有交互桌面），GUI 根本显示不出来；PsExec 是外部二进制、
+  还会注册服务。令牌复制只用系统自带 API。
+- **候选进程必须同会话**：跨会话创建进程需要 `SeTcbPrivilege`（只有 SYSTEM 自己有），
+  同会话则完全不需要。
+- **首选 `winlogon.exe`**：它是 SYSTEM、每个交互会话都有，且**未被 PPL 保护**；
+  `lsass.exe` / `csrss.exe` 在 Win10+ 受保护，`OpenProcessToken` 直接 ACCESS_DENIED。
+- **`lpDesktop` 先空着**（继承父进程窗口站/桌面，同会话下最稳），失败再显式
+  `winsta0\default` 重试。
+- **必须传显式环境块**：`TEMP` 要原样继承 —— 控制器与注入端靠
+  `%TEMP%\SuperInject\port-<PID>.txt` 会合，TEMP 变了就连不上。同时用
+  `SUPERINJECT_SYSTEM_LAUNCH=1` 给子进程打标，防止自我重启死循环。
+- **降级而不是硬失败**：提权不成 / 用户加了 `--as-admin` 时以管理员继续，日志写明原因。
+
+### 可验证性（怎么证明不是「写着好看」）
+
+- `tests/test_system_token.py`（跨平台，31 例）：结构体 ABI 断言 —— `STARTUPINFOW`
+  必须正好 104 字节、`PROCESS_INFORMATION` 24、`LUID` 8、`TOKEN_PRIVILEGES` 16。
+  **这里踩过一个坑**：最初用 `ctypes.wintypes.DWORD`（= `c_ulong`），在本机算出的是
+  Windows 的两倍大小，布局错误只有到 Windows 才暴露；改成定宽类型后本机就能拦。
+- `tests/test_system_token_windows.py`（Windows + 管理员）：真复制 SYSTEM 令牌，
+  并**真创建一个 SYSTEM 进程**，读子进程写回的身份文件断言
+  `privilege == "system"` 且 SID 是 `S-1-5-18`。
+- `--self-test` 增加两步（`SYSTEM 令牌复制` / `SYSTEM 提权链路（真实创建 SYSTEM 进程）`），
+  报告里带上令牌来源进程、子进程 PID、会话与 SID；环境不允许时记为 `unknown` 并写明原因，
+  不静默当通过。
+- `tests/ui/render_check.py`（Playwright）：假后端 `tests/ui/mock_bridge.js` 把真实
+  页面渲染出来，在 1280x800 / 1024x640 / 760x520 + 深浅两套外观下断言整页可滚动、
+  无横向溢出、六个功能区都能滚进视口且标题不被吸顶栏遮挡、滚到底日志区完整可见，
+  并真点一遍交互路径（选进程 → 资源墙 → 内存搜索 → 危险操作确认框）。
+
+## 七、本轮没动 / 没做的部分与原因
+
+- **没有给通道加文件系统以外的会合方式**（注册表、`\.\mailslot`、共享内存等）：
+  当前只读扫描已覆盖「同用户」「SYSTEM 服务」两类目标；再加通道只会扩大攻击面。
+- **没有引入单实例互斥**：同时开两个 GUI 仍然是两个独立控制器（与旧版一致）。
+  这属于产品行为变更，等确有必要再做。
+- **没有把前端换成框架**：还是原生 JS + 一个 CSS 文件，避免为一次视觉重做引入构建链。
+- **没有做 UI 的像素级视觉回归**（截图对比）：只断言布局不变量，截图仅作 CI 工件留档；
+  像素对比在不同 runner 字体/渲染下抖动太大，收益不成正比。

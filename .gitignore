@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 dist/
 build/SuperInject.spec
+SuperInject.spec
+ui-shots/
 native/build/
 superinject/embedded/dll_payload.py
 *.dll
@@ -13,3 +15,5 @@ superinject/embedded/dll_payload.py
 *.log
 .DS_Store
 build/SuperInject.spec
+SuperInject.spec
+ui-shots/

@@ -53,11 +53,31 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _writable_dir(base: Path) -> Path:
+    """返回一个确实可写的目录：优先 ``base``，不行就退到用户目录。
+
+    单文件 exe 经常被放进 Program Files、只读共享盘或压缩包解出来的目录，
+    这时把内置 DLL 释放到 exe 旁边会直接失败（写文件报拒绝访问）。
+    这里先探测再决定，保证自检2 在任何位置都能把 DLL 释放出来。
+    """
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        probe = base / ".si_write_probe"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return base
+    except OSError:
+        fallback = Path(os.environ.get("LOCALAPPDATA")
+                        or tempfile.gettempdir()) / "SuperInject"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def target_dll_path() -> Path:
     env = os.environ.get("SUPERINJECT_DLL_PATH")
     if env:
         return Path(env)
-    return _base_dir() / DLL_FILENAME
+    return _writable_dir(_base_dir()) / DLL_FILENAME
 
 
 def embedded_bytes() -> Optional[bytes]:

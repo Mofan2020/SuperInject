@@ -7,30 +7,43 @@
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<div id="banner" class="warn">
-  ⚠️ <b>仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！</b>
-  只能用于你自己拥有或已获得授权的目标进程。
+<div class="topbar">
+  <div id="banner">
+    <span>⚠️</span>
+    <span><b>仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！</b>
+      <span class="dim">只能用于你自己拥有或已获得授权的目标进程。</span></span>
+  </div>
+
+  <header>
+    <div class="brand">
+      <span class="logo">SI</span>
+      <div>
+        <h1>SuperInject</h1>
+        <div class="sub">基于 DLL 注入的快捷调试工具 · 仅限 Windows</div>
+      </div>
+    </div>
+    <span class="grow"></span>
+    <div class="checks">
+      <span id="badge-admin" class="badge">权限检查中…</span>
+      <span id="badge-dll" class="badge">DLL 校验中…</span>
+      <span id="badge-arch" class="badge">–</span>
+      <span id="badge-ver" class="badge">v–</span>
+      <button id="btn-refresh" class="ghost">刷新进程</button>
+    </div>
+  </header>
+
+  <nav class="nav">
+    <button class="nav-seg" data-target="panel-procs">进程</button>
+    <button class="nav-seg" data-target="panel-inject">注入</button>
+    <button class="nav-seg" data-target="panel-control">控制</button>
+    <button class="nav-seg" data-target="panel-res">资源</button>
+    <button class="nav-seg" data-target="panel-mem">内存</button>
+    <button class="nav-seg" data-target="panel-log">日志</button>
+  </nav>
 </div>
 
-<header>
-  <div class="brand">
-    <span class="logo">SI</span>
-    <div>
-      <h1>SuperInject</h1>
-      <div class="sub">基于 DLL 注入的快捷调试工具 · 仅限 Windows</div>
-    </div>
-  </div>
-  <div class="checks">
-    <span id="badge-admin" class="badge">权限检查中…</span>
-    <span id="badge-dll" class="badge">DLL 校验中…</span>
-    <span id="badge-arch" class="badge">–</span>
-    <span id="badge-ver" class="badge">v–</span>
-    <button id="btn-refresh" class="ghost">刷新进程</button>
-  </div>
-</header>
-
 <main>
-  <section class="panel">
+  <section class="panel" id="panel-procs">
     <div class="panel-head">
       <h2>进程</h2>
       <input id="search" type="search" placeholder="按名称 / PID 搜索…" autocomplete="off" />
@@ -57,7 +70,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="panel-inject">
     <div class="panel-head">
       <h2>注入</h2>
       <span id="dll-path" class="muted"></span>
@@ -67,23 +80,51 @@
     </div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head"><h2>控制（批量）</h2>
+  <section class="panel" id="panel-control">
+    <div class="panel-head">
+      <h2>控制（批量）</h2>
       <span id="sel-count" class="muted">已选 0 个进程</span>
     </div>
     <div class="actions">
-      <button class="act" data-act="ping">连通性检查</button>
-      <button class="act" data-act="info">查看模块</button>
-      <button class="act" data-act="freeze">❄ 冻结进程</button>
-      <button class="act" data-act="unfreeze">▶ 解除冻结</button>
-      <button class="act" data-act="resources">🖼 查看进程资源</button>
-      <button class="act warn" data-act="unload">卸载注入 DLL</button>
-      <button class="act danger" data-act="terminate">终止进程</button>
+      <button class="act" data-act="ping">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <path d="M1.5 8h3l1.5-4 2.5 8 1.5-4h4.5"/></svg>连通性检查</button>
+      <button class="act" data-act="info">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <rect x="2.2" y="2.2" width="11.6" height="11.6" rx="3"/>
+          <path d="M5.5 6.8h5M5.5 9.4h3"/></svg>查看模块</button>
+      <button class="act" data-act="freeze">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <path d="M8 2v12M3 5l10 6M13 5 3 11"/></svg>冻结进程</button>
+      <button class="act" data-act="unfreeze">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M5.5 3.5 12 8l-6.5 4.5z"/></svg>解除冻结</button>
+      <button class="act" data-act="resources">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+          <rect x="2" y="3" width="12" height="10" rx="2.5"/>
+          <path d="M2.6 11.4 6 8.2l2.4 2.1 1.8-1.6 3.2 2.7"/></svg>查看进程资源</button>
+    </div>
+    <div class="actions danger-zone">
+      <span class="zone-label">危险操作 · 会改变目标进程状态</span>
+      <button class="act warn" data-act="unload">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <path d="M8 2v8M5 7.5 8 10.5l3-3M3 13h10"/></svg>卸载注入 DLL</button>
+      <button class="act danger" data-act="terminate">
+        <svg class="ico" width="13" height="13" viewBox="0 0 16 16" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+          <circle cx="8" cy="8" r="5.8"/><path d="M5.6 5.6l4.8 4.8M10.4 5.6l-4.8 4.8"/></svg>终止进程</button>
     </div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head"><h2>进程资源</h2>
+  <section class="panel" id="panel-res">
+    <div class="panel-head">
+      <h2>进程资源</h2>
       <span id="res-summary" class="muted">尚未提取</span>
       <span class="grow"></span>
       <button id="btn-reveal-all" class="ghost">打开导出目录</button>
@@ -91,8 +132,9 @@
     <div id="res-grid" class="res-grid"></div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head"><h2>内存调试</h2></div>
+  <section class="panel" id="panel-mem">
+    <div class="panel-head"><h2>内存调试</h2>
+      <span class="hint">在进程表里选中目标后使用</span></div>
     <div class="mem-bar">
       <input id="mem-pattern" placeholder="十六进制模式，支持 ?? 通配，例如 4D 5A ?? ??" />
       <input id="mem-max" type="number" value="128" min="1" max="2000" title="最大结果数" />
@@ -106,14 +148,14 @@
         <button id="btn-read" class="ghost">读取</button>
       </div>
       <textarea id="ed-data" spellcheck="false" placeholder="十六进制数据，如 00 10 20 30"></textarea>
-      <div class="row">
-        <button id="btn-write" class="danger">写入选中进程</button>
+      <div class="row end">
         <span id="ed-msg" class="muted"></span>
+        <button id="btn-write" class="danger">写入选中进程</button>
       </div>
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="panel-log">
     <div class="panel-head"><h2>日志 / 结果</h2>
       <span class="grow"></span>
       <button id="btn-clear" class="ghost">清空</button>
