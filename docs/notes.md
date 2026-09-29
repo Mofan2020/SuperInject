@@ -208,3 +208,48 @@ NameError。**改完 import 行务必跑一次 ruff**，这类误伤不会自己
 
 另外新增两个 CI 守卫：冻结产物 `--help` 必须退出 0（覆盖无控制台 print 路径）、
 `integration` / `exe-self-test` 加 `timeout-minutes`（卡死必须是失败，不能一直转圈）。
+
+## 十、v1.0.3：删掉 ubuntu 上的 MinGW 交叉编译 job
+
+起因是一个很合理的质问：「windows runner 能编译过、功能自动化测试也没问题，
+为什么还要在 ubuntu 上交叉编译一遍？」查完发现**原设计是反的**：
+
+| | MinGW（ubuntu 交叉编译） | MSVC（windows runner） |
+|---|---|---|
+| 当时谁在用 | **发布件**（package 取 `dll-mingw`） | 只有集成测试用 |
+| 导入表 | ADVAPI32 / KERNEL32 / WS2_32 / msvcrt.dll | ADVAPI32 / KERNEL32 / WS2_32（**无 CRT 依赖**） |
+| 体积 | 382,821 字节 | **194,560 字节** |
+
+也就是说：**功能测试跑的那份不发布，发布的那份只做过编译检查**；而且发布的是更重、
+多一层 CRT 依赖的交叉编译产物。改成单一产线：
+
+* 删掉 `native-mingw` job；`native-msvc` 成为唯一 DLL 构建方式；
+* `integration` 与 `package` 都取 `dll-msvc` —— 发布件就是被测物；
+* `build/build_native.py` 保留 MinGW 路径，但**明确只用于本机开发**（macOS 跑不了
+  `cl.exe`），并且现在优先用 MSVC（有的话），贴近发布件。
+
+### 用「导入表守卫」替代原来 mingw job 的隐性价值
+
+原来那个 job 间接盯的是「DLL 别依赖用户没装的运行库」（MinGW 默认只链 msvcrt.dll）。
+但真正该断言的是结果，于是新增 `build/check_dll_imports.py`（纯 Python 解析 PE 导入表，
+CI 在 windows runner 上跑）：
+
+* 拦：`VCRUNTIME140.dll` / `MSVCP140.dll` / `MSVCR120.dll`（带版本号的 CRT）/ `python*`
+  —— 这些要求用户机器额外安装，DLL 一旦导入它们，注入时 `LoadLibrary` 直接失败，
+  症状是「注入失败」但原因极难看出来；
+* 放行：`KERNEL32/ADVAPI32/WS2_32/SHELL32/USER32/msvcrt.dll`，以及 `api-ms-win-*`
+  这组 Windows API Set（含 UCRT）—— Win10+ 系统自带，本项目最低支持 Win10 x64。
+
+已用真实产物验证过正反两个方向：
+
+```
+本机 mingw 产物（UCRT 版）      → OK
+CI 的 MSVC 产物                 → OK（导入表最干净）
+CI 的 mingw 产物                → OK（只链 msvcrt.dll）
+把导入名改成 VCRUNTIME140.dll   → FAIL + exit 1（守卫真的会拦）
+```
+
+> 踩到的坑：第一版把 `msvcr` 当禁用前缀，结果把系统自带的 `msvcrt.dll` 也拦了；
+> 只有**带版本号**的 `msvcrNNN.dll` 才需要额外安装。另外本机 Homebrew 的 mingw-w64
+> 默认用 UCRT（`api-ms-win-crt-*`），而 CI ubuntu 上的 mingw 默认用 msvcrt.dll ——
+> 同一个脚本编译出两种依赖，这也是「看导入表」比「看编译器」更靠谱的例证。

@@ -12,7 +12,7 @@ GITHUB_RELEASES_API = f"https://api.github.com/repos/{REPO}/releases"
 GITHUB_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 GITHUB_RELEASES = f"https://github.com/{REPO}/releases"
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # 控制通道：注入端（DLL）主动反向连接到控制器的回环 TCP 端口。
 # 控制器把「端口 + 一次性令牌」写到这里，注入端按自己的 PID 取用：

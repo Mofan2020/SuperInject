@@ -115,7 +115,7 @@ git clone https://github.com/Mofan2020/SuperInject.git
 cd SuperInject
 python -m pip install -r requirements.txt
 
-# 1) 编译注入端 DLL（需要 MinGW-w64 或 MSVC）
+# 1) 编译注入端 DLL（macOS/Linux 用 MinGW-w64 交叉编译，Windows 上优先用 MSVC）
 python build/build_native.py
 # 2) 把 DLL 内嵌进程序
 python build/make_payload.py
@@ -209,7 +209,8 @@ SuperInject/
 python -m pip install -r requirements-dev.txt
 python -m pytest tests -q --ignore=tests/test_integration_windows.py   # 跨平台单元测试
 python -m ruff check superinject build tests run_superinject.py
-python build/build_native.py       # 交叉编译 DLL（Ubuntu 上装 mingw-w64 即可）
+python build/build_native.py       # 本机编译 DLL 自测（macOS/Linux 走 MinGW-w64 交叉编译；
+                                   # 发布件由 CI 用 MSVC 构建，见 ci.yml 的 native-msvc）
 
 # 前端布局检查（无头 Chromium，装一次浏览器即可）
 python -m pip install playwright && python -m playwright install chromium
@@ -225,9 +226,10 @@ python -m pytest tests/test_integration_windows.py -v
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在每次 push / PR 上：
 
-1. 用 **MinGW-w64** 交叉编译 `SuperInjectAgent.dll`（`-Wall -Wextra -Werror`），并校验产物是 64 位 PE DLL；
-2. 用 **MSVC**（`/W4 /WX`）在 windows runner 上再编译一次，保证两套工具链都能过；
-3. 在 **Ubuntu + Windows** 上跑单元测试、`compileall` 与 `ruff`
+1. 在 windows runner 上用 **MSVC**（`/W4 /WX`）编译 `SuperInjectAgent.dll` —— 这是**唯一的构建产线**，
+   校验产物是 64 位 PE DLL，并守卫**导入表只允许系统 DLL**（不许依赖 VCRUNTIME140/msvcp 这类
+   用户得额外安装的运行库，否则注入会失败）；
+2. 在 **Ubuntu + Windows** 上跑单元测试、`compileall` 与 `ruff`
    （Windows 上还会跑 `tests/test_system_token_windows.py`：真复制 SYSTEM 令牌、
    以 SYSTEM 创建进程并核对子进程身份）；
 3b. 用 **Playwright + Chromium** 把前端渲染三档窗口尺寸 + 深浅两套外观，

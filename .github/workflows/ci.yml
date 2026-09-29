@@ -22,60 +22,15 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------
-  # 1) MinGW-w64 交叉编译：-Wall -Wextra -Werror 零警告
-  # ---------------------------------------------------------------
-  native-mingw:
-    name: 编译 DLL (MinGW-w64 / Ubuntu)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 安装 MinGW-w64
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
-
-      - name: 编译 agent.dll
-        run: python build/build_native.py
-
-      - name: JSON 层自测（宿主编译器真编译真运行）
-        run: |
-          # 钉死回归：si_json_array_push 与 obj_set 曾无限互递归 —— 数组里只要
-          # 真的塞过元素（info/mem_regions/mem_search）就会永久卡死。
-          cc -std=c99 -Wall -Wextra -Werror -I native \
-            tests/native/test_si_json.c native/superinject_json.c -o /tmp/test_si_json
-          /tmp/test_si_json
-
-      - name: 零警告静态检查 (-Werror)
-        run: |
-          x86_64-w64-mingw32-gcc -shared -O2 -Wall -Wextra -Werror \
-            -DUNICODE -D_UNICODE native/agent.c native/superinject_json.c \
-            -o /tmp/si_warncheck.dll -lws2_32 -ladvapi32 -lshell32 -luser32
-
-      - name: 校验产物为 64 位 PE DLL
-        run: |
-          python - <<'PY'
-          import pathlib, struct
-          data = pathlib.Path("native/build/SuperInjectAgent.dll").read_bytes()
-          assert data[:2] == b"MZ", "不是有效的 PE 文件"
-          pe = struct.unpack_from("<I", data, 0x3C)[0]
-          assert data[pe:pe + 4] == b"PE\0\0", "缺少 PE 签名"
-          machine = struct.unpack_from("<H", data, pe + 4)[0]
-          assert machine == 0x8664, f"期望 x86-64，实际 0x{machine:04x}"
-          characteristics = struct.unpack_from("<H", data, pe + 22)[0]
-          assert characteristics & 0x2000, "缺少 IMAGE_FILE_DLL 标志"
-          print(f"OK: PE32+ DLL, {len(data)} bytes")
-          PY
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dll-mingw
-          path: native/build/SuperInjectAgent.dll
-
-  # ---------------------------------------------------------------
-  # 2) MSVC 编译：使用 GitHub 自带的 windows runner（Visual Studio）
+  # 1) 编译注入端 DLL —— **只在这一条产线上构建**
+  #
+  #     过去用 ubuntu + mingw-w64 交叉编译，再把那份 DLL 打进发布件；而集成测试
+  #     用的是 MSVC 那份。结果是「发布件用的 DLL 从没被功能测试直接跑过，跑过的
+  #     那份反而不发布」。现在统一：windows runner + MSVC，一份 DLL 既被集成测试
+  #     跑、也进发布件，产物唯一、覆盖唯一。
+  #
+  #     mingw 仍保留在本机开发路径（build/build_native.py）—— macOS 上编译不了
+  #     MSVC，本地只能靠它自测 C 代码。
   # ---------------------------------------------------------------
   native-msvc:
     name: 编译 DLL (MSVC / Windows runner)
@@ -124,13 +79,19 @@ jobs:
           print("MSVC OK:", len(data), "bytes")
           PY
 
+      - name: 导入表守卫：只允许依赖系统 DLL
+        # 这个 DLL 要被 LoadLibrary 进**别人的进程**。用户机器没装 VC++ 运行库是
+        # 常态，一旦导入 VCRUNTIME140/msvcp 之类，注入会直接失败且原因极难看出。
+        shell: bash
+        run: python build/check_dll_imports.py native/build/SuperInjectAgent.dll
+
       - uses: actions/upload-artifact@v4
         with:
           name: dll-msvc
           path: native/build/SuperInjectAgent.dll
 
   # ---------------------------------------------------------------
-  # 3) 纯逻辑单元测试 + 静态检查：双平台
+  # 2) 纯逻辑单元测试 + 静态检查：双平台
   #    （含本地预览服务、资源转换、自检报告等跨平台可跑的用例）
   # ---------------------------------------------------------------
   unit-tests:
@@ -169,7 +130,7 @@ jobs:
           path: pytest-results/unit-${{ matrix.os }}.xml
 
   # ---------------------------------------------------------------
-  # 3b) 前端布局的无头渲染检查（Playwright + Chromium）
+  # 3) 前端布局的无头渲染检查（Playwright + Chromium）
   #     界面在 pywebview 里，CI 上没有桌面，过去只能人肉看 —— 这一 job 用假后端
   #     把真实页面渲染出来，断言「整页可滚动 / 无横向溢出 / 各功能区都看得全」，
   #     并把「最小窗口」这种以前会看不全的场景固化下来。
@@ -205,7 +166,7 @@ jobs:
   integration:
     name: 注入集成测试 (Windows)
     timeout-minutes: 30
-    needs: [native-mingw, native-msvc]
+    needs: [native-msvc]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -266,7 +227,7 @@ jobs:
   # ---------------------------------------------------------------
   package:
     name: 打包 SuperInject.exe
-    needs: [unit-tests, integration, native-mingw]
+    needs: [unit-tests, integration, native-msvc]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -280,10 +241,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: 取回 MinGW 交叉编译的 DLL
+      - name: 取回 MSVC 编译的 DLL（与集成测试跑的是同一份）
         uses: actions/download-artifact@v4
         with:
-          name: dll-mingw
+          name: dll-msvc
           path: native/build
 
       - name: 内嵌 DLL 到程序
@@ -469,9 +430,12 @@ jobs:
 
             ## 本版验证情况
 
+            注入端 DLL 由 MSVC 在本仓库的 windows runner 上构建，与集成测试跑的是**同一份**。
+
             CI 在 windows-latest 上完成了两层真实验证：
             1. `pytest tests/test_integration_windows.py` —— 真实注入 `ping.exe`，
                覆盖注入检查 / 内存搜索与读写（含只读页改写）/ 冻结与解除（核实线程挂起状态）/
                资源提取 / 卸载 / 重新注入 / 自我终止；
             2. `SuperInject.exe --self-test` —— 直接跑**本页下载的打包产物**，
                用内嵌 DLL 走一遍完整链路，报告见该次 CI 运行的 `self-test-report` 工件。
+

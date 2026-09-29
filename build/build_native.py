@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""编译 native/agent.c -> native/build/SuperInjectAgent.dll
+"""编译 native/agent.c -> native/build/SuperInjectAgent.dll（本机开发用）
 
-优先使用 MinGW-w64（GitHub Actions ubuntu 预装），找不到时回退 MSVC cl.exe。
+**发布件不由这里构建**：CI 在 windows runner 上用 MSVC 编译（见 ci.yml 的
+native-msvc，那是唯一的产线），集成测试与打包用的都是那一份。这个脚本是给
+本地开发用的 —— macOS 上跑不了 cl.exe，只能靠 MinGW-w64 交叉编译出 DLL 来
+自测 C 代码与注入链路。
+
+顺序：有 MSVC cl.exe 就用它（尽量贴近发布件），否则用 MinGW-w64。
+强制 MinGW 时设置 SUPERINJECT_FORCE_MINGW=1。
 用法：
     python build/build_native.py
 
@@ -112,7 +118,9 @@ def main() -> int:
     if os.environ.get("SUPERINJECT_FORCE_MINGW"):
         ok = build_mingw()
     else:
-        ok = build_mingw() or build_msvc()
+        # 优先 MSVC：它是发布件实际使用的编译器，本地尽量贴近发布件；
+        # macOS / Linux 上没有 cl.exe，自动落到 MinGW-w64。
+        ok = build_msvc() or build_mingw()
     if not ok:
         print("未找到可用的 C 编译器（x86_64-w64-mingw32-gcc 或 MSVC cl.exe）")
         return 2
