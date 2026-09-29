@@ -101,6 +101,9 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 
 > 依赖：Windows 10/11 x64 + [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Win11 自带）。
 >
+> 发布包（`SuperInject-win-x64.zip`）里**只有 `SuperInject.exe` 一个文件**，
+> 解压出来就是单文件，没有 `_internal` 目录、也不需要安装。
+>
 > 首次运行会在 exe 同目录释放内置的 `SuperInjectAgent.dll`（自检2 会实时校验它的
 > SHA256）；若 exe 放在不可写的位置（如 `Program Files`），DLL 会自动改释放到
 > `%LOCALAPPDATA%\SuperInject\`。

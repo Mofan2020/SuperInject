@@ -149,3 +149,62 @@ dist\SuperInject\SuperInject.exe --self-test               # 打包产物全链�
 - **没有把前端换成框架**：还是原生 JS + 一个 CSS 文件，避免为一次视觉重做引入构建链。
 - **没有做 UI 的像素级视觉回归**（截图对比）：只断言布局不变量，截图仅作 CI 工件留档；
   像素对比在不同 runner 字体/渲染下抖动太大，收益不成正比。
+
+## 八、v1.0.2 发布前 CI 抓出的两个真问题（都已修，本机复现验证）
+
+### 1) 单文件打包后「自检卡死」：子进程复用了父进程的解包目录
+
+现象：CI 的「打包产物自检」步骤 10 分钟不返回（v1.0.1 的 onedir 只要 2~3 分钟）。
+
+根因（本机用最小 onefile 程序复现，非推测）：
+
+```
+PARENT _MEIPASS=/tmp/_MEIEmM8NY
+[照抄环境] CHILD _MEIPASS=/tmp/_MEIEmM8NY   ← 与父进程完全相同
+[清掉变量] CHILD _MEIPASS=/tmp/_MEInQLg53   ← 自己解包了一份
+```
+
+PyInstaller onefile 会把 `_PYI_APPLICATION_HOME_DIR` / `_PYI_ARCHIVE_FILE` /
+`_PYI_PARENT_PROCESS_LEVEL` 塞进**当前进程的环境**，指向它解包出来的 `_MEIxxxx`
+目录。拉起「自己」时照抄环境，子进程就直接用父进程那份解包结果：子进程退出的清理
+会动到父进程正在使用的目录，于是卡死 / 随机失败。
+
+修复：`system_token.child_environment()` 清掉这组私有变量（`_PYI_PRIVATE_ENV`）。
+在真实 onefile 产物里验证过：子进程拿到自己的 `_MEIPASS`，且
+`is_launched_child()` 为 True（说明跑的确实是我们的代码）。
+
+> 教训：**任何「打包产物拉起自己」的路径都要清掉这组变量**，不只是提权重启。
+
+### 2) `--windowed` 产物里的裸 `print` 会导致「双击没反应」
+
+GUI 子系统的 exe 在 Windows 上没有控制台，`sys.stdout` 可能是 `None`，此时
+`print()` 抛 `AttributeError`。而启动自检的一串 `print("[自检1] …")` 发生在 GUI
+**之前** —— 抛异常就是窗口都没起来、进程已死，用户完全看不出原因。
+
+修复：新增 `superinject/console.py::safe_print`（无控制台时静默失败、绝不抛），
+`__main__.py` 全部输出改走它，`selftest._safe_print` 收敛到同一实现。
+
+### 3) 本轮 CI 还抓出一个补丁误伤
+
+补丁把 `selftest.py` 的 `from . import dll_manager, elevate, winapi` 误改成
+`ipc`（模糊匹配匹配到了相邻行），ruff 的 F821 当场拦下 —— 否则自检第一步就
+NameError。**改完 import 行务必跑一次 ruff**，这类误伤不会自己暴露。
+
+## 九、v1.0.2 的验证证据（可复核）
+
+发布件 `SuperInject-win-x64.zip`（13,292,297 字节，sha256
+`2e1769f5cb4455946a3b56de1970c07c45fb94253522b0fde5945ec5803acf56`）里**只有
+`SuperInject.exe` 一个文件**，解压后 13,509,566 字节。
+
+在 windows-latest 上对**这个发布产物**跑 `--self-test`，21/21 步通过，其中提权相关：
+
+| 步骤 | 实测结果 |
+|---|---|
+| SYSTEM 令牌复制（SeDebugPrivilege + DuplicateTokenEx） | 来源 `winlogon.exe` pid=7292 sid=`S-1-5-18` |
+| SYSTEM 提权链路（真实创建 SYSTEM 进程） | `CreateProcessWithTokenW` 创建 pid=7532，权限 **system**，sid **S-1-5-18**，session=2 |
+
+注意实测走的是**回退路径** `CreateProcessWithTokenW`（GitHub runner 默认不持有
+`SeAssignPrimaryTokenPrivilege`）—— 这正说明双路径回退不是摆设，而是必要的。
+
+另外新增两个 CI 守卫：冻结产物 `--help` 必须退出 0（覆盖无控制台 print 路径）、
+`integration` / `exe-self-test` 加 `timeout-minutes`（卡死必须是失败，不能一直转圈）。
