@@ -118,18 +118,32 @@ def child_environment(extra: Optional[dict] = None) -> dict:
     ``%TEMP%\\SuperInject\\port-<PID>.txt`` 会合，TEMP 变了就连不上）。"""
     env = dict(os.environ)
     env[LAUNCH_MARKER_ENV] = "1"
+    if not getattr(sys, "frozen", False):
+        # 源码运行：子进程的 cwd 未必在仓库里，靠 PYTHONPATH 才能
+        # `python -m superinject`。
+        root = str(Path(__file__).resolve().parent.parent)
+        cur = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = root + (os.pathsep + cur if cur else "")
     if extra:
         env.update({k: str(v) for k, v in extra.items()})
     return env
 
 
 def relaunch_argv(extra: Optional[list] = None) -> tuple[str, str]:
-    """返回 ``(exe, 命令行)``：把当前程序（或脚本）原样重新拉起。"""
+    """返回 ``(exe, 命令行)``：把当前程序原样重新拉起。
+
+    * 打包后（frozen）：就是 exe 自己；
+    * 源码运行：``python -m superinject``，**不要**用 ``sys.argv[0]`` ——
+      从 pytest / ``python -c`` 里被拉起时它是别人的入口，照抄会把参数喂给
+      错误的程序（CI 上真的踩过：重启出来的其实是 pytest 进程，于是探针
+      参数被当成未知选项，什么都没写）。
+    """
     exe = sys.executable
+    extra = list(extra or [])
     if getattr(sys, "frozen", False):
-        parts = [exe] + list(extra or [])
+        parts = [exe] + extra
     else:
-        parts = [exe, os.path.abspath(sys.argv[0])] + list(extra or [])
+        parts = [exe, "-m", "superinject"] + extra
     # CreateProcess 的命令行是单个字符串，含空格的路径要自己加引号
     return exe, " ".join(_quote(p) for p in parts)
 
@@ -204,6 +218,8 @@ def _kernel32():
         # 64 位下句柄会被截断 —— 这类错误在 Windows 上表现为随机失败。
         k.WaitForSingleObject.restype = DWORD32
         k.WaitForSingleObject.argtypes = [HANDLE_T, DWORD32]
+        k.GetExitCodeProcess.restype = ctypes.c_int
+        k.GetExitCodeProcess.argtypes = [HANDLE_T, ctypes.POINTER(DWORD32)]
         k.ProcessIdToSessionId.restype = ctypes.c_int
         k.ProcessIdToSessionId.argtypes = [DWORD32,
                                           ctypes.POINTER(DWORD32)]
@@ -414,6 +430,7 @@ class LaunchResult:
     sid: str = ""
     source_pid: int = 0
     source_name: str = ""
+    exit_code: Optional[int] = None
 
 
 def _spawn_with_token(token, exe: str, cmdline: str, env: dict,
@@ -445,14 +462,18 @@ def _spawn_with_token(token, exe: str, cmdline: str, env: dict,
                 ctypes.byref(si), ctypes.byref(pi))
         if ok:
             pid = int(pi.dwProcessId)
+            code = None
             if wait and pi.hProcess:
                 k.WaitForSingleObject(pi.hProcess, int(timeout * 1000))
+                tmp = DWORD32()
+                if k.GetExitCodeProcess(pi.hProcess, ctypes.byref(tmp)):
+                    code = int(tmp.value)
             for h in (pi.hThread, pi.hProcess):
                 if h:
                     k.CloseHandle(h)
-            return True, method, pid, ""
+            return True, method, pid, "", code
         errors.append(f"{method}: {winapi.format_error()}")
-    return False, "", 0, "；".join(errors)
+    return False, "", 0, "；".join(errors), None
 
 
 def launch_as_system(extra_args: Optional[list] = None,
@@ -473,19 +494,21 @@ def launch_as_system(extra_args: Optional[list] = None,
     exe, cmdline = relaunch_argv(extra_args)
     env = child_environment(env_extra)
     if not cwd:
-        cwd = str(Path(exe).resolve().parent)
+        cwd = (str(Path(exe).resolve().parent)
+               if getattr(sys, "frozen", False) else os.getcwd())
 
     try:
         # lpDesktop 先留空 = 继承父进程的窗口站/桌面（同会话下最稳），
         # 万一失败再显式指定交互桌面 winsta0\default 重试一次。
         for desktop in (None, "winsta0\\default"):
-            ok, method, pid, err = _spawn_with_token(
+            ok, method, pid, err, code = _spawn_with_token(
                 token, exe, cmdline, env, desktop, cwd, wait, timeout)
             if ok:
                 log.info("已用 %s 以 SYSTEM 拉起自身, pid=%s（桌面=%s）",
                          method, pid, desktop or "继承")
                 return LaunchResult(True, f"{method} 成功", method, pid,
-                                    search.sid, search.pid, search.name)
+                                    search.sid, search.pid, search.name,
+                                    exit_code=code)
             if desktop is not None:
                 return LaunchResult(False, err, "", 0, search.sid,
                                     search.pid, search.name)

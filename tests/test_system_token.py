@@ -127,12 +127,49 @@ def test_relaunch_argv_frozen(monkeypatch):
     assert cmd == r"C:\Tools\SuperInject.exe --as-admin"
 
 
-def test_relaunch_argv_script_quotes_spaces(monkeypatch):
+def test_relaunch_argv_source_uses_module_entry(monkeypatch):
+    """源码运行必须用 `python -m superinject`，而不是 sys.argv[0]。
+
+    从 pytest / `python -c` 里被拉起时 sys.argv[0] 是**别人的**入口：
+    CI 上真的重启出了一个 pytest 进程，探针参数成了未知选项，
+    于是「提权成功了但什么都没发生」。这条测试锁死该回归。
+    """
     monkeypatch.setattr(st.sys, "executable", "/usr/bin/python3")
     monkeypatch.setattr(st.sys, "frozen", False, raising=False)
-    monkeypatch.setattr(st.sys, "argv", ["/home/dev/my tools/run.py"])
-    _exe, cmd = st.relaunch_argv([])
-    assert cmd == '/usr/bin/python3 "/home/dev/my tools/run.py"'
+    monkeypatch.setattr(st.sys, "argv", ["/repo/tests/pytest_main.py"])
+    exe, cmd = st.relaunch_argv(["--system-probe", "/tmp/p.json"])
+    assert exe == "/usr/bin/python3"
+    assert cmd == "/usr/bin/python3 -m superinject --system-probe /tmp/p.json"
+    assert "pytest" not in cmd
+
+
+def test_relaunch_argv_quotes_paths_with_spaces(monkeypatch):
+    monkeypatch.setattr(st.sys, "executable",
+                        r"C:\Program Files\Python\python.exe")
+    monkeypatch.setattr(st.sys, "frozen", False, raising=False)
+    _exe, cmd = st.relaunch_argv(["--system-probe", r"C:\tmp dir\p.json"])
+    assert cmd.startswith(r'"C:\Program Files\Python\python.exe" -m superinject')
+    assert cmd.endswith(r'"C:\tmp dir\p.json"')
+
+
+def test_child_environment_sets_pythonpath_for_source_runs(monkeypatch):
+    """源码运行时子进程要靠 PYTHONPATH 才能 import superinject。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(st.sys, "frozen", False, raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    root = str(Path(st.__file__).resolve().parent.parent)
+    env = st.child_environment()
+    assert env["PYTHONPATH"] == root
+    monkeypatch.setenv("PYTHONPATH", "/existing")
+    env2 = st.child_environment()
+    assert env2["PYTHONPATH"] == root + os.pathsep + "/existing"
+
+
+def test_child_environment_skips_pythonpath_when_frozen(monkeypatch):
+    monkeypatch.setattr(st.sys, "frozen", True, raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    assert "PYTHONPATH" not in st.child_environment()
 
 
 # ---------------------------------------------------------------- 决策表

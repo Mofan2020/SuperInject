@@ -74,12 +74,13 @@ def test_launch_as_system_creates_real_system_process(admin_required, tmp_path):
     if not st.acquire_system_token().ok:
         pytest.skip("本机拿不到 SYSTEM 令牌，跳过端到端断言")
 
-    res = st.launch_as_system(["--system-probe", str(probe)])
+    res = st.launch_as_system(["--system-probe", str(probe)], wait=True)
     if not res.ok:
         pytest.skip(f"本机不允许以 SYSTEM 创建进程: {res.message}")
 
     data = _wait_json(probe)
-    assert data, f"子进程（pid={res.pid}）没有写出身份文件 {probe}"
+    assert data, (f"子进程（pid={res.pid}, exit={res.exit_code}）没有写出身份文件 "
+                  f"{probe}；命令行应为 `python -m superinject --system-probe`")
     assert data["privilege"] == "system", data
     assert data["sid"] == winapi.LOCAL_SYSTEM_SID, data
     assert data["marker"] is True, data      # 环境变量标记要传到子进程

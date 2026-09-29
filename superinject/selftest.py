@@ -307,8 +307,10 @@ def _system_steps(rec: "Recorder") -> None:
         probe.unlink()
     except OSError:
         pass
+    # wait=True：等子进程真的退出，好把退出码写进报告（提权成功但子进程没跑
+    # 起来时，退出码是唯一能说明问题的证据）。
     res = system_token.launch_as_system(
-        ["--system-probe", str(probe)], wait=False, timeout=30.0)
+        ["--system-probe", str(probe)], wait=True, timeout=30.0)
     if not res.ok:
         rec.soft("SYSTEM 提权链路（真实创建 SYSTEM 进程）", None,
                  f"环境不允许：{res.message}")
@@ -317,7 +319,9 @@ def _system_steps(rec: "Recorder") -> None:
     data = _wait_for_json(probe, timeout=30.0)
     if not data:
         rec.step("SYSTEM 提权链路（真实创建 SYSTEM 进程）", False,
-                 f"已创建 pid={res.pid} 但没等到身份文件 {probe}")
+                 f"已创建 pid={res.pid}（退出码 {res.exit_code}，"
+                 f"来源 {res.source_name}#{res.source_pid}）"
+                 f"但没等到身份文件 {probe}")
         return
     ok = data.get("privilege") == "system" and data.get("sid") == "S-1-5-18"
     rec.step("SYSTEM 提权链路（真实创建 SYSTEM 进程）", ok,
