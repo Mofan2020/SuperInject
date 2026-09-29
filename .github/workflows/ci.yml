@@ -204,6 +204,7 @@ jobs:
   # ---------------------------------------------------------------
   integration:
     name: 注入集成测试 (Windows)
+    timeout-minutes: 30
     needs: [native-mingw, native-msvc]
     runs-on: windows-latest
     steps:
@@ -352,6 +353,9 @@ jobs:
     name: 打包产物自检 (SuperInject.exe --self-test)
     needs: [package]
     runs-on: windows-latest
+    # 自检正常 2~3 分钟。曾经因为子进程复用解包目录卡死过，耗到上限才发现；
+    # 卡死必须是「失败」，不能是「一直转圈」。
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -370,6 +374,7 @@ jobs:
           if (-not $admin) { exit 1 }
 
       - name: 运行打包产物的无界面自检
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $p = Start-Process -FilePath "dist/SuperInject.exe" `
@@ -379,6 +384,20 @@ jobs:
           if (-not (Test-Path $report)) { Write-Error "自检报告未生成"; exit 1 }
           Get-Content $report -Raw
           if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: 冻结产物在「无控制台」下走 print 路径不得崩
+        # GUI 子系统（--windowed）的 exe 没有控制台，sys.stdout 可能是 None；
+        # 而启动自检的一串输出发生在 GUI 之前 —— 一旦裸 print 就会「双击没反应」。
+        # --help 正是最短的那条 print 路径，用它证明这条路在真产物上是安全的。
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/SuperInject.exe" -ArgumentList "--help" `
+            -Wait -PassThru -NoNewWindow
+          Write-Host "exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+            Write-Error "冻结产物 --help 退出码 $($p.ExitCode)（print 路径崩了）"
+            exit 1
+          }
 
       - name: 断言自检报告全部通过
         shell: bash

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import dll_manager, elevate, winapi
+from .console import safe_print
 from .version import APP_NAME, __version__
 
 log = logging.getLogger("supinject.selftest")
@@ -375,10 +376,4 @@ def _write_report(path: Path, data: dict) -> bool:
 
 def _safe_print(text: str, stream: str = "stdout") -> None:
     """--windowed 打包后 sys.stdout 是 None，直接 print 会抛异常。"""
-    target = getattr(sys, stream, None)
-    if target is None:
-        return
-    try:
-        print(text, file=target)
-    except Exception:  # pragma: no cover
-        pass
+    safe_print(text, stream)

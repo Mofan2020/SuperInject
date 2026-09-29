@@ -166,6 +166,33 @@ def test_child_environment_sets_pythonpath_for_source_runs(monkeypatch):
     assert env2["PYTHONPATH"] == root + os.pathsep + "/existing"
 
 
+def test_child_environment_strips_pyinstaller_private_vars(monkeypatch):
+    """打包产物拉起自己时必须清掉 PyInstaller 的私有环境变量。
+
+    本地用最小 onefile 程序实测：照抄环境时子进程的 ``sys._MEIPASS`` 与父进程
+    **完全相同**（子进程直接复用父进程的解包目录），于是子进程退出时的清理会动到
+    父进程正在用的目录 —— 表现就是打包产物的自检卡死。清掉后子进程会自己解包一份。
+    """
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "/tmp/_MEIparent")
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/tmp/app.exe")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("_MEIPASS2", "/tmp/_MEIparent")
+    env = st.child_environment()
+    for var in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
+                "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS2"):
+        assert var not in env, f"{var} 必须清掉，否则子进程会复用父进程的解包目录"
+    # 但不能误伤正常环境变量
+    assert env[st.LAUNCH_MARKER_ENV] == "1"
+    assert "TEMP" in env or "TMPDIR" in env
+
+
+def test_pyinstaller_var_list_covers_meipass2():
+    """名字写错就等于这条防护静默失效 —— 至少锁住这对已知的名字。"""
+    assert "_MEIPASS2" in st._PYI_PRIVATE_ENV
+    assert "_PYI_APPLICATION_HOME_DIR" in st._PYI_PRIVATE_ENV
+    assert "_PYI_PARENT_PROCESS_LEVEL" in st._PYI_PRIVATE_ENV
+
+
 def test_child_environment_skips_pythonpath_when_frozen(monkeypatch):
     monkeypatch.setattr(st.sys, "frozen", True, raising=False)
     monkeypatch.delenv("PYTHONPATH", raising=False)

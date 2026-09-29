@@ -82,6 +82,18 @@ MAX_FALLBACK_TRIES = 60
 # 不再重复提权，避免自我启动的死循环。
 LAUNCH_MARKER_ENV = "SUPERINJECT_SYSTEM_LAUNCH"
 
+# PyInstaller onefile 运行时塞进环境的私有变量（见 child_environment 的说明）。
+# 名字取自 pyinstaller 自己的 bootloader；将来它改名的话这里会「静默失效」，
+# 所以 tests/test_system_token.py 里锁了「父进程环境里有它们时子进程必须没有」。
+_PYI_PRIVATE_ENV = (
+    "_MEIPASS2",
+    "_MEIPASS",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_SPLASH_IPC",
+)
+
 
 # ---------------------------------------------------------------- 纯逻辑
 
@@ -118,6 +130,13 @@ def child_environment(extra: Optional[dict] = None) -> dict:
     ``%TEMP%\\SuperInject\\port-<PID>.txt`` 会合，TEMP 变了就连不上）。"""
     env = dict(os.environ)
     env[LAUNCH_MARKER_ENV] = "1"
+    # 必须清掉 PyInstaller onefile 的私有环境变量：宿主进程里它们指向**父进程**
+    # 解包出来的 _MEIxxxx 目录，子进程照抄就会去用父进程那份解包结果（本地实测：
+    # 子进程 sys._MEIPASS 与父进程完全相同），于是子进程退出时清理动作会动到父
+    # 进程正在用的目录 —— 表现就是打包产物的自检卡死不返回。清掉后子进程会自己
+    # 解包一份（本机验证：两边 _MEIPASS 不同）。
+    for var in _PYI_PRIVATE_ENV:
+        env.pop(var, None)
     if not getattr(sys, "frozen", False):
         # 源码运行：子进程的 cwd 未必在仓库里，靠 PYTHONPATH 才能
         # `python -m superinject`。

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from . import dll_manager, elevate
+from .console import safe_print
 from .version import APP_NAME, __version__
 
 log = logging.getLogger("supinject")
@@ -102,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("%s %s 启动, pid=%s, argv=%s", APP_NAME, __version__, os.getpid(), argv)
 
     if "-h" in argv or "--help" in argv:
-        print(USAGE)
+        safe_print(USAGE)
         return 0
 
     # ---- 身份探针：任何权限下都要能跑，且必须在提权逻辑之前
@@ -118,19 +119,19 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 自检1：权限（普通用户 → UAC；管理员 → SYSTEM）
     elev = elevate.ensure_privilege(argv, auto_relaunch=True)
     if elev.relaunched:
-        print(f"[自检1] {elev.message}")
+        safe_print(f"[自检1] {elev.message}")
         log.info("已重新启动（%s），退出当前进程", elev.message)
         return 0
     if not elev.ok:
-        print("[自检1] " + elev.message)
+        safe_print("[自检1] " + elev.message)
         log.error("权限自检失败: %s", elev.message)
         return 1
     if elev.degraded:
-        print(f"[自检1] {elev.message}")
-        print(f"        {elev.reason}")
+        safe_print(f"[自检1] {elev.message}")
+        safe_print(f"        {elev.reason}")
         log.warning("SYSTEM 提权降级: %s / %s", elev.message, elev.reason)
     else:
-        print(f"[自检1] 权限自检通过（{elev.identity}）")
+        safe_print(f"[自检1] 权限自检通过（{elev.identity}）")
 
     # ---- 自检2：DLL 校验（SHA256 全部运行时自动计算）
     report = dll_manager.verify_and_sync()
@@ -145,15 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         "embedded_sha": report.embedded_sha, "disk_sha": report.disk_sha,
         "message": report.message,
     }
-    print(f"[自检2] {report.message}")
+    safe_print(f"[自检2] {report.message}")
     if not report.ok:
-        print("        " + report.message)
+        safe_print("        " + report.message)
 
     # ---- 拉起 GUI
     try:
         import webview  # noqa: F401
     except ImportError:
-        print("缺少依赖 pywebview，请先执行: pip install pywebview pywin32")
+        safe_print("缺少依赖 pywebview，请先执行: pip install pywebview pywin32")
         return 2
 
     _set_app_user_model_id()
@@ -163,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 后台检查更新
     update_checker(api).start(delay=1.5)
 
-    print(f"[启动] GUI 已启动  版本 {__version__}")
+    safe_print(f"[启动] GUI 已启动  版本 {__version__}")
     run_gui(api, window, debug=_console())
     return 0
 
