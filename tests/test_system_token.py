@@ -181,9 +181,10 @@ def test_child_environment_strips_pyinstaller_private_vars(monkeypatch):
     for var in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
                 "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS2"):
         assert var not in env, f"{var} 必须清掉，否则子进程会复用父进程的解包目录"
-    # 但不能误伤正常环境变量
+    # 但不能误伤正常环境变量：只该清掉 PyInstaller 那两个私有前缀的变量
     assert env[st.LAUNCH_MARKER_ENV] == "1"
-    assert "TEMP" in env or "TMPDIR" in env
+    assert env["PATH"] == os.environ["PATH"]
+    assert any(k in env for k in ("HOME", "USERPROFILE"))
 
 
 def test_pyinstaller_var_list_covers_meipass2():
