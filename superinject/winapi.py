@@ -766,18 +766,24 @@ def read_process_memory(pid: int, address: int, size: int) -> bytes:
     而 False（Function/Program）。``NtReadVirtualMemory`` 是 ntdll 的原生入口，
     不走 LPCVOID 自动转换这一层，更稳；这里就把它当 fallback 用。
     """
+    import logging
+    log = logging.getLogger("supinject.winapi")
     k = kernel32()
     k.ReadProcessMemory.restype = wt.BOOL
     k.ReadProcessMemory.argtypes = [wt.HANDLE, wt.LPCVOID, wt.LPVOID,
                                     ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
     h = open_process(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
     if not h:
+        log.warning("read_process_memory(%d, %#x, %d) OpenProcess 失败: %s",
+                    pid, address, size, format_error())
         raise OSError(format_error(), "OpenProcess 读取内存失败")
     try:
         buf = (ctypes.c_ubyte * size)()
         got = ctypes.c_size_t(0)
-        if k.ReadProcessMemory(h, wt.LPVOID(address), buf, size, ctypes.byref(got)) \
-                and got.value == size:
+        ok = k.ReadProcessMemory(h, wt.LPVOID(address), buf, size, ctypes.byref(got))
+        log.debug("ReadProcessMemory(%d, %#x, %d) ok=%s got=%d",
+                  pid, address, size, ok, got.value)
+        if ok and got.value == size:
             return bytes(bytearray(buf[: got.value]))
     finally:
         k.CloseHandle(h)
@@ -795,6 +801,8 @@ def read_process_memory(pid: int, address: int, size: int) -> bytes:
         buf = (ctypes.c_ubyte * size)()
         got = ctypes.c_size_t(0)
         status = n.NtReadVirtualMemory(h2, wt.LPVOID(address), buf, size, ctypes.byref(got))
+        log.debug("NtReadVirtualMemory(%d, %#x, %d) status=%#x got=%d",
+                  pid, address, size, status & 0xFFFFFFFF, got.value)
         if status == 0 and got.value == size:
             return bytes(bytearray(buf[: got.value]))
         return b""
