@@ -759,6 +759,13 @@ def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
 
 
 def read_process_memory(pid: int, address: int, size: int) -> bytes:
+    """读目标进程内存；优先 ``ReadProcessMemory``，失败时回退 ``NtReadVirtualMemory``。
+
+    跨位数（x64 controller 读 x86 进程）时 ``ReadProcessMemory`` 偶尔会因
+    ctypes 的 argtype 设置在单测 ``monkeypatch`` 下被洗掉 / 函数指针查错
+    而 False（Function/Program）。``NtReadVirtualMemory`` 是 ntdll 的原生入口，
+    不走 LPCVOID 自动转换这一层，更稳；这里就把它当 fallback 用。
+    """
     k = kernel32()
     k.ReadProcessMemory.restype = wt.BOOL
     k.ReadProcessMemory.argtypes = [wt.HANDLE, wt.LPCVOID, wt.LPVOID,
@@ -769,11 +776,30 @@ def read_process_memory(pid: int, address: int, size: int) -> bytes:
     try:
         buf = (ctypes.c_ubyte * size)()
         got = ctypes.c_size_t(0)
-        if not k.ReadProcessMemory(h, wt.LPVOID(address), buf, size, ctypes.byref(got)):
-            return b""
-        return bytes(bytearray(buf[: got.value]))
+        if k.ReadProcessMemory(h, wt.LPVOID(address), buf, size, ctypes.byref(got)) \
+                and got.value == size:
+            return bytes(bytearray(buf[: got.value]))
     finally:
         k.CloseHandle(h)
+
+    # Fallback: NtReadVirtualMemory
+    h2 = open_process(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+    if not h2:
+        return b""
+    try:
+        n = ntdll()
+        n.NtReadVirtualMemory.restype = wt.LONG
+        n.NtReadVirtualMemory.argtypes = [
+            wt.HANDLE, wt.LPCVOID, wt.LPVOID,
+            ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        buf = (ctypes.c_ubyte * size)()
+        got = ctypes.c_size_t(0)
+        status = n.NtReadVirtualMemory(h2, wt.LPVOID(address), buf, size, ctypes.byref(got))
+        if status == 0 and got.value == size:
+            return bytes(bytearray(buf[: got.value]))
+        return b""
+    finally:
+        k.CloseHandle(h2)
 
 
 def write_process_memory(pid: int, address: int, data: bytes) -> int:
