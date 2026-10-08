@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import struct
 import sys
 from typing import Optional
 
@@ -597,15 +598,75 @@ def process_suspend_state(pid: int) -> Optional[bool]:
 # ---------------------------------------------------------------- 注入
 
 
-def _loadlibrary_address() -> int:
-    """取得 kernel32!LoadLibraryW 地址。
+def _loadlibrary_address(pid: int) -> int:
+    """取得**目标进程内**的 ``kernel32!LoadLibraryW`` 地址。
 
-    kernel32 在同一登录会话的所有进程中加载于相同基址，
-    因此控制器内的函数地址对目标进程同样有效（CreateRemoteThread 的标准做法）。
+    跨位数注入的关键：kernel32 在同登录会话的同位数进程中加载于相同基址，
+    但 x86/x64 两套 kernel32 的基址不同 —— 直接用本进程 (controller) 的
+    kernel32 地址给 32 位目标用，会跳到错误的代码（LoadLibraryW 看似返回 0，
+    实际上根本没有执行到目标进程的代码里）。
+
+    取地址的标准做法：枚举目标进程已加载模块，找到 ``kernel32.dll``，
+    再根据其导出表解析 ``LoadLibraryW``。失败时返回 0（让 caller 报「位数不匹配」）。
     """
     k = kernel32()
-    addr = ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value
-    return int(addr or 0)
+    k.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+    k.GetModuleHandleW.restype = wt.HMODULE
+    k.GetProcAddress.argtypes = [wt.HMODULE, wt.LPCSTR]
+    k.GetProcAddress.restype = ctypes.c_void_p
+
+    # 1) 目标进程里的 kernel32.dll 基址
+    mods = enum_remote_modules(pid)
+    base = 0
+    for m in mods:
+        if m["name"].lower() in ("kernel32.dll", "kernelbase.dll"):
+            base = m["base"]
+            break
+    if not base:
+        # fallback：本进程（同位数时是正确的）
+        return int(ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value or 0)
+
+    # 2) 用 ReadProcessMemory 解析 PE 导出表，拿 LoadLibraryW 的 RVA。
+    # 关键：导出表地址字段在可选头里，PE32 (x86) 偏移 0x60，PE32+ (x64) 偏移 0x78，
+    # 通用做法是从 ``IMAGE_OPTIONAL_HEADER.Magic`` 判断（PE32=0x10b / PE32+=0x20b）。
+    try:
+        pe_offset = int(_read_remote_u32(pid, base + 0x3C))
+        opt_magic = int(_read_remote_u16(pid, base + pe_offset + 0x18))
+        export_table_offset = 0x78 if opt_magic == 0x20b else 0x60
+        export_rva = int(_read_remote_u32(pid, base + pe_offset + export_table_offset))
+        number_of_names = int(_read_remote_u32(pid, base + export_rva + 0x18))
+        names_rva = int(_read_remote_u32(pid, base + export_rva + 0x20))
+        ordinals_rva = int(_read_remote_u32(pid, base + export_rva + 0x24))
+        functions_rva = int(_read_remote_u32(pid, base + export_rva + 0x1C))
+        for i in range(number_of_names):
+            name_rva = int(_read_remote_u32(pid, base + names_rva + i * 4))
+            name_buf = _read_remote_bytes(pid, base + name_rva, 32)
+            if not name_buf:
+                continue
+            try:
+                end = name_buf.index(0)
+            except ValueError:
+                end = name_buf.index(b"\x00\x00\x00\x00") if b"\x00\x00\x00\x00" in name_buf else len(name_buf)
+            name = bytes(name_buf[:end]).decode("ascii", errors="replace")
+            if name == "LoadLibraryW":
+                ordinal = int(_read_remote_u16(pid, base + ordinals_rva + i * 2))
+                func_rva = int(_read_remote_u32(pid, base + functions_rva + ordinal * 4))
+                return base + func_rva
+    except Exception:  # pragma: no cover - 任何解析失败都退回到本进程地址
+        pass
+    return int(ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value or 0)
+
+
+def _read_remote_u32(pid: int, addr: int) -> int:
+    return struct.unpack_from("<I", read_process_memory(pid, addr, 4), 0)[0]
+
+
+def _read_remote_u16(pid: int, addr: int) -> int:
+    return struct.unpack_from("<H", read_process_memory(pid, addr, 2), 0)[0]
+
+
+def _read_remote_bytes(pid: int, addr: int, n: int) -> bytes:
+    return read_process_memory(pid, addr, n)
 
 
 def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
@@ -643,6 +704,12 @@ def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
     if not h:
         raise OSError(format_error(), f"OpenProcess({pid}) 失败，请确认已提权")
 
+    # 关键：用目标进程内的 LoadLibraryW 地址（跨位数时本进程地址无效）
+    target_loadlibrary = _loadlibrary_address(pid)
+    if not target_loadlibrary:
+        k.CloseHandle(h)
+        raise OSError("无法解析目标进程内 kernel32!LoadLibraryW 的地址")
+
     remote = k.VirtualAllocEx(h, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
     if not remote:
         err = last_error()
@@ -658,7 +725,8 @@ def inject_dll(pid: int, dll_path: str, timeout: float = 15.0) -> int:
             raise OSError("WriteProcessMemory 写入长度不符")
 
         tid = wt.DWORD(0)
-        t = k.CreateRemoteThread(h, None, 0, ctypes.c_void_p(_loadlibrary_address()),
+        t = k.CreateRemoteThread(h, None, 0,
+                                 ctypes.c_void_p(target_loadlibrary),
                                  remote, 0, ctypes.byref(tid))
         if not t:
             err = last_error()
