@@ -609,6 +609,7 @@ def _loadlibrary_address(pid: int) -> int:
     取地址的标准做法：枚举目标进程已加载模块，找到 ``kernel32.dll``，
     再根据其导出表解析 ``LoadLibraryW``。失败时返回 0（让 caller 报「位数不匹配」）。
     """
+    import logging
     k = kernel32()
     k.GetModuleHandleW.argtypes = [wt.LPCWSTR]
     k.GetModuleHandleW.restype = wt.HMODULE
@@ -616,7 +617,15 @@ def _loadlibrary_address(pid: int) -> int:
     k.GetProcAddress.restype = ctypes.c_void_p
 
     # 1) 目标进程里的 kernel32.dll 基址
-    mods = enum_remote_modules(pid)
+    try:
+        mods = enum_remote_modules(pid)
+    except Exception as exc:  # pragma: no cover
+        logging.getLogger("supinject.winapi").warning(
+            "枚举目标 %d 模块失败: %s", pid, exc)
+        mods = []
+    logging.getLogger("supinject.winapi").debug(
+        "目标 %d 模块枚举: %d 条 (含 %s)",
+        pid, len(mods), [m["name"] for m in mods[:5]])
     base = 0
     for m in mods:
         if m["name"].lower() in ("kernel32.dll", "kernelbase.dll"):
@@ -629,11 +638,14 @@ def _loadlibrary_address(pid: int) -> int:
     # 2) 用 ReadProcessMemory 解析 PE 导出表，拿 LoadLibraryW 的 RVA。
     # 关键：导出表地址字段在可选头里，PE32 (x86) 偏移 0x60，PE32+ (x64) 偏移 0x78，
     # 通用做法是从 ``IMAGE_OPTIONAL_HEADER.Magic`` 判断（PE32=0x10b / PE32+=0x20b）。
+    log = logging.getLogger("supinject.winapi")
     try:
         pe_offset = int(_read_remote_u32(pid, base + 0x3C))
         opt_magic = int(_read_remote_u16(pid, base + pe_offset + 0x18))
         export_table_offset = 0x78 if opt_magic == 0x20b else 0x60
         export_rva = int(_read_remote_u32(pid, base + pe_offset + export_table_offset))
+        log.debug("目标 %d kernel32 base=%#x pe=%#x magic=0x%x export_rva=%#x",
+                  pid, base, pe_offset, opt_magic, export_rva)
         number_of_names = int(_read_remote_u32(pid, base + export_rva + 0x18))
         names_rva = int(_read_remote_u32(pid, base + export_rva + 0x20))
         ordinals_rva = int(_read_remote_u32(pid, base + export_rva + 0x24))
@@ -651,9 +663,13 @@ def _loadlibrary_address(pid: int) -> int:
             if name == "LoadLibraryW":
                 ordinal = int(_read_remote_u16(pid, base + ordinals_rva + i * 2))
                 func_rva = int(_read_remote_u32(pid, base + functions_rva + ordinal * 4))
-                return base + func_rva
-    except Exception:  # pragma: no cover - 任何解析失败都退回到本进程地址
-        pass
+                addr = base + func_rva
+                log.debug("目标 %d LoadLibraryW = %#x", pid, addr)
+                return addr
+        log.warning("目标 %d kernel32 导出表未找到 LoadLibraryW（共 %d 个名字）",
+                    pid, number_of_names)
+    except Exception as exc:  # pragma: no cover - 任何解析失败都退回到本进程地址
+        log.warning("目标 %d 解析 LoadLibraryW 失败: %s", pid, exc)
     return int(ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value or 0)
 
 
