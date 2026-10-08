@@ -243,6 +243,7 @@ class Controller:
         base = {"pid": pid, "injected": False, "attached": False, "reinjected": False}
 
         # 没指定 path：按目标位数自动选 DLL（multi-arch 混选场景）。
+        # 指定 path 时：填一个 arch 字段用于报错展示。
         chosen_path = path
         if chosen_path is None:
             target_arch = "x86" if winapi.is_wow64(pid) else "x64"
@@ -252,8 +253,8 @@ class Controller:
                         "error": f"目标进程为 {target_arch}，但 {target_arch} DLL"
                                  " 未内嵌也未编译。请用 --arch x64 改用 64 位工具"}
             base["arch"] = target_arch
-        elif arch:
-            base["arch"] = arch
+        else:
+            base["arch"] = arch or ("x86" if winapi.is_wow64(pid) else "x64")
 
         if check and check.get("blocked"):
             return {**base, "ok": False, "blocked": True, "error": check["reason"]}

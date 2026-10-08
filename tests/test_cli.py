@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -154,7 +155,6 @@ def test_inject_groups_by_arch(monkeypatch, capsys):
     from superinject import dll_manager
     # Windows 上 ``Path("/tmp/fake-x64.dll")`` 会被解析成 ``\\tmp\\fake-x64.dll``，
     # 用 tempfile.mkdtemp 拿一个跨平台都正常的目录。
-    import tempfile
     td = Path(tempfile.mkdtemp())
     monkeypatch.setattr(dll_manager, "dll_for_arch",
                         lambda arch: td / f"fake-{arch}.dll")
@@ -190,7 +190,6 @@ def test_inject_groups_by_arch(monkeypatch, capsys):
 def test_inject_arch_override(monkeypatch, capsys):
     """显式 ``--arch x86`` 时所有目标走同一 DLL。"""
     from superinject import dll_manager
-    import tempfile
     td = Path(tempfile.mkdtemp())
     monkeypatch.setattr(dll_manager, "dll_for_arch",
                         lambda arch: td / f"fake-{arch}.dll")
