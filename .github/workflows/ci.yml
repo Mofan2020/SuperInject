@@ -31,10 +31,17 @@ jobs:
   #
   #     mingw 仍保留在本机开发路径（build/build_native.py）—— macOS 上编译不了
   #     MSVC，本地只能靠它自测 C 代码。
+  #
+  #     同时编两份：x64 (主) + x86 (注入 x86 应用时需要)，都是 MSVC、与集成
+  #     测试对齐。
   # ---------------------------------------------------------------
   native-msvc:
     name: 编译 DLL (MSVC / Windows runner)
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,15 +52,16 @@ jobs:
       - name: 初始化 MSVC 开发环境
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.arch }}
 
       - name: 用 MSVC 编译（/W4 /WX 视为错误）
         shell: pwsh
         run: |
+          $suffix = if (${{ matrix.arch }} -eq 'x86') { '_x86' } else { '' }
           New-Item -ItemType Directory -Force native\build | Out-Null
-          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
+          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent${suffix}.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Get-Item native\build\SuperInjectAgent.dll
+          Get-Item native\build\SuperInjectAgent${suffix}.dll
 
       - name: JSON 层自测（MSVC 真编译真运行）
         shell: pwsh
@@ -68,27 +76,33 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import pathlib, struct
-          p = pathlib.Path("native/build/SuperInjectAgent.dll")
+          import pathlib, struct, os
+          suffix = "_x86" if os.environ.get("MATRIX_ARCH") == "x86" else ""
+          p = pathlib.Path(f"native/build/SuperInjectAgent{suffix}.dll")
           data = p.read_bytes()
           assert data[:2] == b"MZ"
           pe = struct.unpack_from("<I", data, 0x3C)[0]
           machine = struct.unpack_from("<H", data, pe + 4)[0]
-          assert machine == 0x8664
+          expected = 0x014C if suffix else 0x8664
+          assert machine == expected, f"机器码不符：{machine:#x} vs {expected:#x}"
           assert struct.unpack_from("<H", data, pe + 22)[0] & 0x2000
-          print("MSVC OK:", len(data), "bytes")
+          print(f"MSVC {suffix or 'x64'} OK:", len(data), "bytes, machine=0x%04x" % machine)
           PY
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
 
       - name: 导入表守卫：只允许依赖系统 DLL
         # 这个 DLL 要被 LoadLibrary 进**别人的进程**。用户机器没装 VC++ 运行库是
         # 常态，一旦导入 VCRUNTIME140/msvcp 之类，注入会直接失败且原因极难看出。
         shell: bash
-        run: python build/check_dll_imports.py native/build/SuperInjectAgent.dll
+        run: |
+          suffix="${{ matrix.arch == 'x86' && '_x86' || '' }}"
+          python build/check_dll_imports.py "native/build/SuperInjectAgent${suffix}.dll"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dll-msvc
-          path: native/build/SuperInjectAgent.dll
+          name: dll-msvc-${{ matrix.arch }}
+          path: native/build/SuperInjectAgent${{ matrix.dimensions.arch == 'x86' && '_x86' || '' }}.dll
 
   # ---------------------------------------------------------------
   # 2) 纯逻辑单元测试 + 静态检查：双平台
@@ -180,10 +194,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: 取回 MSVC 编译的 DLL
+      - name: 取回 MSVC 编译的 DLL（x64）
         uses: actions/download-artifact@v4
         with:
-          name: dll-msvc
+          name: dll-msvc-x64
+          path: native/build
+
+      - name: 取回 MSVC 编译的 DLL（x86）
+        uses: actions/download-artifact@v4
+        with:
+          name: dll-msvc-x86
           path: native/build
 
       - name: 确认当前进程具备提权能力（注入前提）
@@ -195,6 +215,7 @@ jobs:
         shell: bash
         env:
           SUPERINJECT_DLL_PATH: native/build/SuperInjectAgent.dll
+          SUPERINJECT_DLL_PATH_X86: native/build/SuperInjectAgent_x86.dll
           SUPERINJECT_DEBUG: "1"
         run: python -m pytest tests/test_integration_windows.py -v --timeout=300
         timeout-minutes: 20
@@ -241,10 +262,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: 取回 MSVC 编译的 DLL（与集成测试跑的是同一份）
+      - name: 取回 MSVC 编译的 DLL（与集成测试跑的是同一份；x64 + x86）
         uses: actions/download-artifact@v4
         with:
-          name: dll-msvc
+          name: dll-msvc-x64
+          path: native/build
+      - uses: actions/download-artifact@v4
+        with:
+          name: dll-msvc-x86
           path: native/build
 
       - name: 内嵌 DLL 到程序
@@ -257,10 +282,14 @@ jobs:
           import hashlib, sys
           sys.path.insert(0, ".")
           from superinject import dll_manager as dm
-          emb = dm.embedded_bytes()
-          disk = open("native/build/SuperInjectAgent.dll", "rb").read()
-          assert emb == disk, "内嵌字节与编译产物不一致"
-          print("embedded sha256:", hashlib.sha256(emb).hexdigest())
+          for arch, fname in (("x64", "SuperInjectAgent.dll"),
+                              ("x86", "SuperInjectAgent_x86.dll")):
+              emb = dm.embedded_bytes(arch)
+              assert emb is not None, f"{arch} 内嵌字节缺失"
+              disk = open(f"native/build/{fname}", "rb").read()
+              assert emb == disk, f"{arch} 内嵌字节与编译产物不一致"
+              print(f"embedded {arch} sha256:", hashlib.sha256(emb).hexdigest(),
+                    f"({len(emb)} bytes)")
           PY
 
       - name: PyInstaller 打包（单文件，无 _internal 目录）

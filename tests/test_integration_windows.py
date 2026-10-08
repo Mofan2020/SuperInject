@@ -271,6 +271,62 @@ def test_pid_alive_false_for_exited_process_with_open_handle():
             proc.wait(timeout=10)
 
 
+def test_x86_dll_path_is_valid_pe():
+    """x86 DLL 产物必须存在且机器码为 0x014C（IMAGE_FILE_MACHINE_I386）。"""
+    x86 = os.environ.get("SUPERINJECT_DLL_PATH_X86", "")
+    if not x86:
+        pytest.skip("SUPERINJECT_DLL_PATH_X86 未设置，跳过 x86 DLL 校验")
+    p = Path(x86)
+    if not p.exists():
+        pytest.skip(f"未找到 x86 DLL：{p}")
+    data = p.read_bytes()
+    assert data[:2] == b"MZ"
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    assert data[pe:pe + 4] == b"PE\0\0"
+    machine = struct.unpack_from("<H", data, pe + 4)[0]
+    assert machine == 0x014C, f"x86 DLL 机器码不符：0x{machine:04x}"
+    assert struct.unpack_from("<H", data, pe + 22)[0] & 0x2000
+
+
+@pytest.mark.parametrize("arch_label", ["x86"])
+def test_x86_injection_on_syswow64_ping(arch_label):
+    """真在 windows runner 上用 x86 DLL 注入 SysWOW64\\ping.exe（32 位）。
+
+    路径：``C:\\Windows\\SysWOW64\\ping.exe`` 在 64 位 Windows 上是 32 位程序，
+    注入端 DLL 也是 32 位时才能正常注入。
+    """
+    x86 = os.environ.get("SUPERINJECT_DLL_PATH_X86", "")
+    if not x86:
+        pytest.skip("SUPERINJECT_DLL_PATH_X86 未设置，跳过 x86 注入集成测试")
+    x86_path = Path(x86)
+    if not x86_path.exists():
+        pytest.skip(f"未找到 x86 DLL：{x86_path}")
+
+    syswow = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64" / "ping.exe"
+    if not syswow.exists():
+        pytest.skip(f"未找到 SysWOW64 ping.exe：{syswow}")
+
+    from superinject.controller import Controller
+
+    ctrl = Controller(dll_path=x86_path)
+    pid = spawn([str(syswow), "-t", "127.0.0.1"])
+    try:
+        res = ctrl.inject([pid])[0]
+        assert res["ok"], f"x86 注入失败: {res.get('error')}"
+        assert res["arch"] == "x86"
+        assert res["attached"]
+        pong = ctrl.server.request(pid, {"type": "ping"}, timeout=10)
+        assert pong.get("ok"), pong
+        info = ctrl.server.request(pid, {"type": "info"}, timeout=15)
+        assert info.get("ok") and info.get("modules")
+    finally:
+        try:
+            ctrl.unload([pid])
+        except Exception:  # pragma: no cover
+            pass
+        kill(pid)
+
+
 # ------------------------------------------------------------------ 冻结
 
 def test_freeze_really_suspends_and_resumes(ctrl):

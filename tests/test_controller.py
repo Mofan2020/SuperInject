@@ -71,9 +71,29 @@ def test_preflight_blocks_arch_mismatch(stub_winapi, monkeypatch):
     monkeypatch.setattr(ctl_mod.winapi, "is_wow64", lambda pid: True)   # 目标 32 位
     if native_arch() != "x64":
         pytest.skip("仅在 64 位 Python 下有意义")
+    # 模拟「x86 DLL 不可用」：本机开发通常有 native/build/SuperInjectAgent_x86.dll，
+    # 这里强行把 dll_for_arch x86 路径退掉，断言老逻辑仍能拦下。
+    from superinject import dll_manager
+    monkeypatch.setattr(dll_manager, "dll_for_arch",
+                        lambda arch: None if arch == "x86" else dll_manager.dll_for_arch(arch))
     c = Controller()
     check = c.preflight([100])[0]
     assert check["blocked"] and "位数不匹配" in check["reason"]
+
+
+def test_preflight_allows_arch_mismatch_when_dll_available(stub_winapi, monkeypatch):
+    """x86 DLL 内嵌 / 已编目标下，跨位数应该被放行（带警告），而不是直接 blocked。"""
+    monkeypatch.setattr(ctl_mod.winapi, "is_wow64", lambda pid: True)   # 目标 32 位
+    if native_arch() != "x64":
+        pytest.skip("仅在 64 位 Python 下有意义")
+    from superinject import dll_manager
+    monkeypatch.setattr(dll_manager, "dll_for_arch",
+                        lambda arch: __import__("pathlib").Path("/dev/null"))
+    c = Controller()
+    check = c.preflight([100])[0]
+    assert check["blocked"] is False
+    assert check["ok"] is True
+    assert any("x86" in w for w in check["warnings"])
 
 
 def test_preflight_reports_inaccessible(stub_winapi, monkeypatch):

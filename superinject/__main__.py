@@ -102,9 +102,16 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
     log.info("%s %s 启动, pid=%s, argv=%s", APP_NAME, __version__, os.getpid(), argv)
 
+    # ---- 帮助：-h / --help 直接给文字退出，不进入任何业务路径
     if "-h" in argv or "--help" in argv:
-        safe_print(USAGE)
+        from . import cli
+        safe_print(cli.HELP_TEXT)
         return 0
+
+    # ---- CLI 模式：-c 单独走 cli.run()，不再拉 GUI；提升权等均交给 CLI 自己处理
+    if "-c" in argv or "--cli" in argv:
+        from . import cli
+        return cli.run(argv)
 
     # ---- 身份探针：任何权限下都要能跑，且必须在提权逻辑之前
     if "--system-probe" in argv:

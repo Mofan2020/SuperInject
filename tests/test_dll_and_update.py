@@ -22,7 +22,7 @@ def test_sha256_helpers(tmp_path):
 
 
 def test_verify_reports_missing_payload(tmp_path, monkeypatch):
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: None)
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: None)
     monkeypatch.setattr(dll_manager, "_dev_build_dll", lambda: None)
     rep = dll_manager.verify_and_sync(tmp_path / "missing.dll")
     assert rep.ok is False
@@ -31,7 +31,7 @@ def test_verify_reports_missing_payload(tmp_path, monkeypatch):
 
 def test_verify_creates_when_absent(tmp_path, monkeypatch):
     payload = b"MZ-fake-dll-bytes"
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: payload)
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: payload)
     target = tmp_path / "SuperInjectAgent.dll"
     rep = dll_manager.verify_and_sync(target)
     assert rep.ok and rep.action == "created"
@@ -41,7 +41,7 @@ def test_verify_creates_when_absent(tmp_path, monkeypatch):
 
 def test_verify_detects_mismatch_and_replaces(tmp_path, monkeypatch):
     payload = b"MZ-good-dll"
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: payload)
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: payload)
     target = tmp_path / "SuperInjectAgent.dll"
     target.write_bytes(b"MZ-tampered")
     rep = dll_manager.verify_and_sync(target)
@@ -52,7 +52,7 @@ def test_verify_detects_mismatch_and_replaces(tmp_path, monkeypatch):
 
 
 def test_verify_is_idempotent(tmp_path, monkeypatch):
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: b"same")
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: b"same")
     target = tmp_path / "SuperInjectAgent.dll"
     dll_manager.verify_and_sync(target)
     rep = dll_manager.verify_and_sync(target)
@@ -60,7 +60,7 @@ def test_verify_is_idempotent(tmp_path, monkeypatch):
 
 
 def test_verify_force_rewrites(tmp_path, monkeypatch):
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: b"v2")
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: b"v2")
     target = tmp_path / "SuperInjectAgent.dll"
     target.write_bytes(b"v1")
     rep = dll_manager.verify_and_sync(target, force=True)
@@ -70,7 +70,7 @@ def test_verify_force_rewrites(tmp_path, monkeypatch):
 
 def test_locked_file_falls_back_to_rename(tmp_path, monkeypatch):
     """模拟目标文件被占用无法直接覆盖的情况。"""
-    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda: b"fresh")
+    monkeypatch.setattr(dll_manager, "embedded_bytes", lambda *a, **kw: b"fresh")
     target = tmp_path / "SuperInjectAgent.dll"
     target.write_bytes(b"stale")
 

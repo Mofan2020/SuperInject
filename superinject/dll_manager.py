@@ -3,6 +3,7 @@
 设计要点（对应需求「自检2」）：
 
 * 打包进 exe 的 DLL 以字节形式内嵌在 ``superinject.embedded.dll_payload`` 中；
+  同时内嵌两份：``x64`` 与 ``x86``，分别放在 ``DATA_B64`` 与 ``DATA_B64_X86``；
 * SHA256 **完全由程序运行时计算**，源码与配置里都不出现任何手写哈希；
 * 启动时计算「内嵌 DLL 的 SHA」与「磁盘上 DLL 的 SHA」并比较，
   不一致（或文件缺失）时自动用内嵌副本覆盖。
@@ -21,6 +22,10 @@ from pathlib import Path
 from typing import Optional
 
 DLL_FILENAME = "SuperInjectAgent.dll"
+DLL_FILENAME_X86 = "SuperInjectAgent_x86.dll"
+
+# 哪个 arch 对应哪个磁盘文件名（不存在则视为「该位数未内嵌」）。
+DLL_FILENAMES = {"x64": DLL_FILENAME, "x86": DLL_FILENAME_X86}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -73,20 +78,46 @@ def _writable_dir(base: Path) -> Path:
         return fallback
 
 
-def target_dll_path() -> Path:
+def target_dll_path(arch: str = "x64") -> Path:
     env = os.environ.get("SUPERINJECT_DLL_PATH")
-    if env:
+    if env and arch.lower() == "x64":
         return Path(env)
-    return _writable_dir(_base_dir()) / DLL_FILENAME
+    env_x86 = os.environ.get("SUPERINJECT_DLL_PATH_X86")
+    if env_x86 and arch.lower() == "x86":
+        return Path(env_x86)
+    return _writable_dir(_base_dir()) / DLL_FILENAMES.get(arch.lower(), DLL_FILENAME)
 
 
-def embedded_bytes() -> Optional[bytes]:
-    """取出内嵌的 DLL 字节；未打包的开发环境下返回 None。"""
+def dll_for_arch(arch: str) -> Optional[Path]:
+    """返回对应 arch 的 DLL 路径（含环境变量/开发构建回退）。
+
+    None 表示该位数 DLL 不可用（既未内嵌，也没有本地构建产物）。
+    """
+    arch = arch.lower()
+    if arch not in DLL_FILENAMES:
+        return None
+    target = target_dll_path(arch)
+    if target.exists():
+        return target
+    if arch == "x86":
+        dev = _dev_build_dll_x86()
+        if dev and dev.exists():
+            return dev
+    return None
+
+
+def embedded_bytes(arch: str = "x64") -> Optional[bytes]:
+    """取出内嵌的 DLL 字节；未打包的开发环境下返回 None。
+
+    ``arch`` 取 ``"x64"`` / ``"x86"``。``x86`` 未内嵌时返回 None（不抛），
+    调用方按「该位数暂不可用」处理。
+    """
     try:
         from .embedded import dll_payload  # type: ignore
     except Exception:
         return None
-    data = getattr(dll_payload, "DATA_B64", "")
+    key = "DATA_B64_X86" if arch.lower() == "x86" else "DATA_B64"
+    data = getattr(dll_payload, key, "") or ""
     if not data:
         return None
     try:
@@ -95,9 +126,23 @@ def embedded_bytes() -> Optional[bytes]:
         return None
 
 
+def available_arches() -> list[str]:
+    """运行时可用的内嵌 DLL 位数列表。"""
+    out = []
+    for a in ("x64", "x86"):
+        if embedded_bytes(a):
+            out.append(a)
+    return out
+
+
 def _dev_build_dll() -> Optional[Path]:
     """开发模式下的 fallback：native/build/SuperInjectAgent.dll"""
     p = Path(__file__).resolve().parent.parent / "native" / "build" / DLL_FILENAME
+    return p if p.exists() else None
+
+
+def _dev_build_dll_x86() -> Optional[Path]:
+    p = Path(__file__).resolve().parent.parent / "native" / "build" / DLL_FILENAME_X86
     return p if p.exists() else None
 
 
@@ -140,18 +185,28 @@ def _atomic_write(target: Path, data: bytes) -> Optional[str]:
 
 
 def verify_and_sync(path: Optional[os.PathLike | str] = None,
-                    force: bool = False) -> VerifyResult:
-    """自检2：校验磁盘上的 DLL 与内嵌副本是否一致，必要时自动替换。"""
-    target = Path(path) if path else target_dll_path()
-    emb = embedded_bytes()
+                    force: bool = False,
+                    arch: str = "x64") -> VerifyResult:
+    """自检2：校验磁盘上的 DLL 与内嵌副本是否一致，必要时自动替换。
+
+    ``arch`` 默认 ``"x64"``；x86 调用方单独跑这个函数。
+    """
+    arch = arch.lower()
+    target = Path(path) if path else target_dll_path(arch)
+    emb = embedded_bytes(arch)
     source_desc = "内置副本"
 
     if emb is None:
-        dev = _dev_build_dll()
+        if arch == "x64":
+            dev = _dev_build_dll()
+        elif arch == "x86":
+            dev = _dev_build_dll_x86()
+        else:
+            dev = None
         if dev is None:
             return VerifyResult(
                 ok=False, action="failed", path=target,
-                message="未找到内嵌 DLL，且尚未编译 native/agent.c。"
+                message=f"未找到 {arch} 内嵌 DLL，且尚未编译 native/agent.c。"
                         "请运行 python build/build_native.py 或使用 Release 版。",
             )
         emb = dev.read_bytes()

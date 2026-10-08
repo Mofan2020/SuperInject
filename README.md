@@ -20,8 +20,10 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | --- | --- |
 | 启动自检 1 | 识别当前权限（SYSTEM / 管理员 / 普通用户）：普通用户先走 UAC 提到管理员，管理员再**自我提权到 SYSTEM**（复制 SYSTEM 进程令牌 + `CreateProcessAsUserW`），以便调试高权限进程；失败会明确降级为管理员并说明原因 |
 | 启动自检 2 | DLL 完整性校验：运行时计算 SHA256 与内嵌副本比对，不一致（或缺失）**自动替换** |
-| 进程选择 | 全量进程列表，支持按名称 / PID 搜索，支持多选批量，也支持手工粘贴 PID |
-| 注入检查 | 注入前逐个 PID 预检：进程是否还在、位数是否匹配、能否打开、是否系统关键进程、是否已注入 |
+| 进程选择 | 全量进程列表，支持按名称 / PID / **进程路径** 搜索，支持多选批量，也支持手工粘贴 PID |
+| CLI 模式 | `-c -y <command>`：进程列表 / 注入 / 冻结 / 内存读写 / 卸载 / 终止 / DLL 自校验；默认 plain text，加 `--json` 切 JSON |
+| x86 应用注入 | 同时内嵌 x64 + x86 两份 DLL；按目标进程位数自动选择，无需手动指定 |
+| 注入检查 | 注入前逐个 PID 预检：进程是否还在、位数是否匹配（含「x86 DLL 可用时自动放行跨位数」）、能否打开、是否系统关键进程、是否已注入 |
 | 注入 | `CreateRemoteThread + LoadLibraryW`，批量注入，**并确认控制通道真的建立**才算成功 |
 | 热更新重注入 | 对已注入的进程再次注入时，自动「先卸载旧 DLL → 等通道断开 → 注入新 DLL」 |
 | 批量控制 | 注入端 DLL 通过**回环 TCP 反向连接**控制器（带一次性令牌），控制器可同时控制任意多个已注入进程 |
@@ -141,7 +143,28 @@ SuperInject.exe                  启动自检 → 提权到 SYSTEM → 图形界
 SuperInject.exe --as-admin       只提到管理员（不提 SYSTEM），调试普通进程时用
 SuperInject.exe --self-test      无界面全链路自检
 SuperInject.exe --help           帮助
+
+# CLI 模式（v1.1.0 新增）：不带 GUI，方便脚本与 Agent 调用
+SuperInject.exe -c -y list                 # 列进程
+SuperInject.exe -c -y list --path "C:\Program Files\..."   # 按路径过滤
+SuperInject.exe -c -y list --name chrome   # 按名过滤
+SuperInject.exe -c -y inject 1234          # 注入（自动按目标位数选 DLL）
+SuperInject.exe -c -y inject --pid 100 --pid 200 --arch x86
+SuperInject.exe -c -y freeze 1234
+SuperInject.exe -c -y mem-read 1234 0x401000 64
+SuperInject.exe -c -y mem-search 1234 '4D 5A ?? ??'
+SuperInject.exe -c -y unload 1234
+SuperInject.exe -c -y terminate 1234
+SuperInject.exe -c -y status
+SuperInject.exe -c -y dll                  # DLL 自校验
 ```
+
+CLI 模式：
+
+* 默认输出 plain text（Agent 友好）；加 `--json` 切 JSON。
+* `-c` 启动 CLI（必需）；`-y` 一律同意免责（必需，否则拒绝执行）。
+* 同时编两份 DLL：x64 + x86。注入 x86 进程时会自动选 x86 DLL，无需手动指定 `--arch`。
+* 完整子命令与帮助：`-h` / `--help`。
 
 ### 关于 SYSTEM 权限
 

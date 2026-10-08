@@ -171,10 +171,17 @@ class Controller:
                     wow = winapi.is_wow64(pid)
                     item["arch"] = {True: "x86", False: "x64"}.get(wow, "")
                     if item["arch"] and item["arch"] != self_arch:
-                        item.update(
-                            ok=False, blocked=True,
-                            reason=f"位数不匹配：目标进程 {item['arch']}，"
-                                   f"本工具与 DLL 为 {self_arch}")
+                        # 跨位数：只有「目标位数 DLL 可用」才能注入，否则照旧拦下
+                        if item["arch"] in dll_manager.DLL_FILENAMES \
+                                and dll_manager.dll_for_arch(item["arch"]):
+                            item["warnings"].append(
+                                f"目标进程 {item['arch']}；将使用 {item['arch']} DLL")
+                        else:
+                            item.update(
+                                ok=False, blocked=True,
+                                reason=f"位数不匹配：目标进程 {item['arch']}，"
+                                       f"本工具与 DLL 为 {self_arch}（{item['arch']}"
+                                       " DLL 未内嵌也未编译）")
                     else:
                         h = winapi.open_process(pid, INJECT_ACCESS)
                         if h:
@@ -199,23 +206,55 @@ class Controller:
     # ---------------------------------------------------------- 注入
 
     def inject(self, pids: List[int], dll_path: Optional[str] = None,
-               reinject: bool = True, check: bool = True) -> List[dict]:
-        """批量注入：先做注入检查，再注入，最后确认控制通道已建立。"""
+               reinject: bool = True, check: bool = True,
+               arch: str = "") -> List[dict]:
+        """批量注入：先做注入检查，再注入，最后确认控制通道已建立。
+
+        ``arch`` 取 ``"x64"`` / ``"x86"`` / 空串：
+
+        * 空串：对每个 PID 自动检测（WOW64 → x86，否则 x64），按目标位数各自选 DLL；
+        * 显式给出：所有目标都用该位数的 DLL（混选时返回错误）。
+        """
         path = Path(dll_path) if dll_path else self.dll_path
         pids = [int(p) for p in pids]
-        if not path or not path.exists():
+        if path and not path.exists():
             return [{"pid": p, "ok": False, "injected": False,
                      "error": f"DLL 不存在: {path}"} for p in pids]
+        if arch:
+            arch = arch.lower()
+            if arch not in dll_manager.DLL_FILENAMES:
+                return [{"pid": p, "ok": False, "injected": False,
+                         "error": f"不支持的位数: {arch}"} for p in pids]
+            path = dll_manager.dll_for_arch(arch)
+            if not path:
+                return [{"pid": p, "ok": False, "injected": False,
+                         "error": f"未找到 {arch} 位 DLL（未内嵌或未编译）"}
+                        for p in pids]
 
         checks = {c["pid"]: c for c in self.preflight(pids)} if check else {}
         results = self._run_parallel(
-            pids, lambda pid: self._inject_one(pid, path, checks.get(pid), reinject))
+            pids, lambda pid: self._inject_one(pid, path, checks.get(pid),
+                                               reinject, arch))
         self._fire()
         return results
 
-    def _inject_one(self, pid: int, path: Path, check: Optional[dict],
-                    reinject: bool) -> dict:
+    def _inject_one(self, pid: int, path: Optional[Path], check: Optional[dict],
+                    reinject: bool, arch: str = "") -> dict:
         base = {"pid": pid, "injected": False, "attached": False, "reinjected": False}
+
+        # 没指定 path：按目标位数自动选 DLL（multi-arch 混选场景）。
+        chosen_path = path
+        if chosen_path is None:
+            target_arch = "x86" if winapi.is_wow64(pid) else "x64"
+            chosen_path = dll_manager.dll_for_arch(target_arch)
+            if chosen_path is None:
+                return {**base, "ok": False,
+                        "error": f"目标进程为 {target_arch}，但 {target_arch} DLL"
+                                 " 未内嵌也未编译。请用 --arch x64 改用 64 位工具"}
+            base["arch"] = target_arch
+        elif arch:
+            base["arch"] = arch
+
         if check and check.get("blocked"):
             return {**base, "ok": False, "blocked": True, "error": check["reason"]}
         try:
@@ -248,11 +287,12 @@ class Controller:
                                      "请重启目标进程后再注入。"}
 
             self.server.register(pid)
-            module = winapi.inject_dll(pid, str(path))
+            module = winapi.inject_dll(pid, str(chosen_path))
             if not module:
                 return {**base, "ok": False,
-                        "error": "LoadLibraryW 返回 0（位数不匹配 / 被安全软件拦截 /"
-                                 " 目标进程已加载同名 DLL）"}
+                        "error": f"LoadLibraryW 返回 0（位数不匹配 / "
+                                 f"被安全软件拦截 / 目标进程已加载同名 DLL，"
+                                 f"已用 {base['arch']} DLL）"}
 
             attached = self.server.wait_attach(pid, ATTACH_TIMEOUT)
             result = {

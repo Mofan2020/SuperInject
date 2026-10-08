@@ -253,3 +253,87 @@ CI 的 mingw 产物                → OK（只链 msvcrt.dll）
 > 只有**带版本号**的 `msvcrNNN.dll` 才需要额外安装。另外本机 Homebrew 的 mingw-w64
 > 默认用 UCRT（`api-ms-win-crt-*`），而 CI ubuntu 上的 mingw 默认用 msvcrt.dll ——
 > 同一个脚本编译出两种依赖，这也是「看导入表」比「看编译器」更靠谱的例证。
+## 十一、v1.1.0：CLI 模式 / 路径搜索 / x86 支持
+
+需求原文：
+
+* 添加 CLI 模式：``-c -y <command>``，``-h`` 帮助无需 ``-c``。
+* 进程搜索支持按路径过滤。
+* 支持注入 x86 应用（两个 DLL，自动选）。
+
+### CLI 入口
+
+``superinject/cli.py`` 提供 ``-c`` / ``-y`` / ``-h`` 与子命令分派。子命令格式：
+
+* 子命令风格：``si.exe -c -y inject 1234``
+* 单串 DSL：``si.exe -c -y 'inject 1234 --json'``（``parse()`` 内部 shlex 再切一次）
+
+输出默认 plain text，``--json`` 切 JSON；``--report PATH`` 把结果同时落盘。CLI 也
+走 ``elevate.ensure_privilege``，自动 UAC/SYSTEM 提权后退出原进程；``-y`` 没给时
+直接拒绝执行（防误操作）。
+
+子命令集：
+
+```
+list            # --name / --path / --pid / --injected-only
+preflight       # 注入前预检
+inject          # 自动按目标位数选 DLL；--arch 强制
+freeze / unfreeze / info / ping / unload / terminate
+mem-search / mem-read / mem-write
+open / status / dll
+```
+
+### 路径搜索
+
+``controller.list_processes()`` 已带 ``path`` 字段（``winapi.process_path(pid)``），
+``cli._filter_processes`` 与 GUI 搜索都按子串匹配 ``path`` / ``name``。
+
+### x86 DLL
+
+CI 的 ``native-msvc`` 现在跑 ``strategy.matrix.arch: [x64, x86]``，分别走
+``ilammy/msvc-dev-cmd@v1`` 的 ``arch: x64`` / ``arch: x86``，产物为
+``SuperInjectAgent.dll`` (x64) + ``SuperInjectAgent_x86.dll`` (x86)。两条都过
+``check_dll_imports.py``（导入表守卫复用）。
+
+``dll_manager``：
+
+* ``embedded_bytes(arch="x64"|"x86")`` 拿对应内嵌字节；``x86`` 未内嵌返回 None
+  而不是抛异常，方便「暂时没编 x86」的本地开发场景。
+* ``dll_for_arch(arch)`` 优先返回已释放的 DLL，其次回退到 ``native/build/``。
+* ``verify_and_sync(arch=...)`` 两份 DLL 各自跑自检与释放。
+* ``build/make_payload.py`` 同时嵌入 ``DATA_B64`` 与 ``DATA_B64_X86``，x86 缺失
+  时 ``DATA_B64_X86`` 留空串 + 打 warning（仍能继续编 x64）。
+
+``Controller.inject(arch="")``：
+
+* ``arch=""``：对每个 PID 跑 ``is_wow64(pid)`` 探测位数，各自选 DLL —— 混批
+  x86 + x64 时按 DLL 分组并发注入。
+* ``arch="x64"|"x86"``：所有目标统一用该位数。
+
+注入检查（``preflight``）同步：位数不匹配时若该位数 DLL 可用，只加 warning
+不再 blocked。
+
+集成测试 ``tests/test_integration_windows.py::test_x86_injection_on_syswow64_ping``
+在 windows runner 上真跑：拉起 ``C:\Windows\SysWOW64\ping.exe``（32 位），
+用 ``SUPERINJECT_DLL_PATH_X86`` 注入并 ping 验证。
+
+### 已知约束（没做的部分与原因）
+
+- **未做 CLI 的交互式 REPL**：CLI 是给 Agent 用的、单次调用即退出；带 REPL 就要
+  解决 stdout 缓冲 + 中断信号 + 多命令上下文，越界。
+- **CLI 输出没做颜色 / 进度条**：plain text 优先，颜色让管道与日志更乱。
+- **没把 ``--json`` 改成自动检测 TTY**：脚本场景下用户希望明确控制输出格式。
+- **x86 注入检查仍走 ``IsWow64Process``**：这是 Windows 提供的标准 API，没有更
+  好的办法；CI 上必须用 SysWOW64\ping.exe 才能拿到真 32 位目标。
+
+### 验证证据
+
+* macOS 本地 MinGW 交叉编译：``x86_64-w64-mingw32-gcc -Werror`` 与
+  ``i686-w64-mingw32-gcc -Werror`` 两条都过；产物字节数 x64=156,902 / x86=148,063，
+  机器码分别为 0x8664 与 0x014C。
+* ``tests/test_cli.py`` 21 例全过（跨平台；Win32 调用打桩）。
+* ``tests/test_controller.py`` 中位数相关的两条用例更新：
+  ``test_preflight_blocks_arch_mismatch``（x86 DLL 不可用时拦下）
+  + ``test_preflight_allows_arch_mismatch_when_dll_available``（可用时放行）。
+* ``tests/test_dll_and_update.py`` 全部更新为 ``lambda *a, **kw: ...`` 兼容
+  ``embedded_bytes(arch)`` 的新签名。
