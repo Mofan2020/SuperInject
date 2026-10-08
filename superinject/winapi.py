@@ -636,14 +636,22 @@ def _loadlibrary_address(pid: int) -> int:
         return int(ctypes.cast(k.LoadLibraryW, ctypes.c_void_p).value or 0)
 
     # 2) 用 ReadProcessMemory 解析 PE 导出表，拿 LoadLibraryW 的 RVA。
-    # 关键：导出表地址字段在可选头里，PE32 (x86) 偏移 0x60，PE32+ (x64) 偏移 0x78，
-    # 通用做法是从 ``IMAGE_OPTIONAL_HEADER.Magic`` 判断（PE32=0x10b / PE32+=0x20b）。
+    # 关键：导出目录地址在 IMAGE_OPTIONAL_HEADER 末尾的 DataDirectories 区域；
+    #   PE32  ：OptionalHeader 偏移 0x60
+    #   PE32+ ：OptionalHeader 偏移 0x88
+    # 而 OptionalHeader 本身在 NT headers（"PE\0\0" 起点）后 0x18，
+    # 所以导出目录在 NT headers 后的偏移是 0x78（PE32）和 0xA0（PE32+）。
+    # 之前一版写反了：把 PE32 当成 PE32+，PE32+ 当成 PE32，结果跨位数
+    # 注入读到的 export_rva 完全错位 —— 第一个 ReadProcessMemory 还能返回
+    # 4 字节（落在无关字段），进入 names 遍历后必然读到未映射地址，得到
+    # 0 字节，从而整条 LoadLibraryW 解析路径失败。
     log = logging.getLogger("supinject.winapi")
     try:
         pe_offset = int(_read_remote_u32(pid, base + 0x3C))
         opt_magic = int(_read_remote_u16(pid, base + pe_offset + 0x18))
-        export_table_offset = 0x78 if opt_magic == 0x20b else 0x60
-        export_rva = int(_read_remote_u32(pid, base + pe_offset + export_table_offset))
+        # NT headers 起点 + OptionalHeader 起点 + DataDirectories 起点
+        export_table_offset_from_pe = 0xA0 if opt_magic == 0x20b else 0x78
+        export_rva = int(_read_remote_u32(pid, base + pe_offset + export_table_offset_from_pe))
         log.debug("目标 %d kernel32 base=%#x pe=%#x magic=0x%x export_rva=%#x",
                   pid, base, pe_offset, opt_magic, export_rva)
         number_of_names = int(_read_remote_u32(pid, base + export_rva + 0x18))
