@@ -57,7 +57,8 @@ jobs:
       - name: 用 MSVC 编译（/W4 /WX 视为错误）
         shell: pwsh
         run: |
-          $suffix = if (${{ matrix.arch }} -eq 'x86') { '_x86' } else { '' }
+          $arch = '${{ matrix.arch }}'
+          $suffix = if ($arch -eq 'x86') { '_x86' } else { '' }
           New-Item -ItemType Directory -Force native\build | Out-Null
           cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent${suffix}.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -102,7 +103,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dll-msvc-${{ matrix.arch }}
-          path: native/build/SuperInjectAgent${{ matrix.dimensions.arch == 'x86' && '_x86' || '' }}.dll
+          path: native/build/SuperInjectAgent${{ matrix.arch == 'x86' && '_x86' || '' }}.dll
 
   # ---------------------------------------------------------------
   # 2) 纯逻辑单元测试 + 静态检查：双平台

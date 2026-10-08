@@ -152,8 +152,12 @@ def test_inject_groups_by_arch(monkeypatch, capsys):
     """多进程混位数：按目标位数分组批量注入。"""
     monkeypatch.setattr(ctl_mod.winapi, "is_wow64", lambda pid: pid == 100)
     from superinject import dll_manager
+    # Windows 上 ``Path("/tmp/fake-x64.dll")`` 会被解析成 ``\\tmp\\fake-x64.dll``，
+    # 用 tempfile.mkdtemp 拿一个跨平台都正常的目录。
+    import tempfile
+    td = Path(tempfile.mkdtemp())
     monkeypatch.setattr(dll_manager, "dll_for_arch",
-                        lambda arch: Path(f"/tmp/fake-{arch}.dll"))
+                        lambda arch: td / f"fake-{arch}.dll")
 
     calls = []
 
@@ -179,14 +183,17 @@ def test_inject_groups_by_arch(monkeypatch, capsys):
                   "--pid", "100", "--pid", "200"])
     assert rc == 0
     paths = sorted(str(p) for p, _ in calls)
-    assert "/tmp/fake-x64.dll" in paths and "/tmp/fake-x86.dll" in paths
+    assert str(td / "fake-x64.dll") in paths
+    assert str(td / "fake-x86.dll") in paths
 
 
 def test_inject_arch_override(monkeypatch, capsys):
     """显式 ``--arch x86`` 时所有目标走同一 DLL。"""
     from superinject import dll_manager
+    import tempfile
+    td = Path(tempfile.mkdtemp())
     monkeypatch.setattr(dll_manager, "dll_for_arch",
-                        lambda arch: Path(f"/tmp/fake-{arch}.dll"))
+                        lambda arch: td / f"fake-{arch}.dll")
 
     calls = []
 
@@ -205,7 +212,7 @@ def test_inject_arch_override(monkeypatch, capsys):
                   "--pid", "100", "--pid", "200", "--arch", "x86"])
     assert rc == 0
     assert len(calls) == 1
-    assert calls[0][0] == "/tmp/fake-x86.dll"
+    assert calls[0][0] == str(td / "fake-x86.dll")
     assert calls[0][1] == [100, 200]
 
 
