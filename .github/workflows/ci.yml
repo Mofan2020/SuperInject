@@ -449,6 +449,16 @@ jobs:
           prerelease: false
           generate_release_notes: true
           body: |
+            ## 本版新增
+
+            **命令行模式**：新增 `-c -y <command>`。`-c` 启动 CLI（不开 GUI），`-y` 一律同意免责，`-h` 单独可用。子命令包括 `list` / `inject` / `freeze` / `mem-read` / `mem-write` 等 16 个，子命令风格（`inject 1234`）与单串 DSL（`'inject 1234 --json'`）都支持。默认 plain text，加 `--json` 切 JSON。CLI 内部也走 `elevate.ensure_privilege`，自动 UAC/SYSTEM 提权。
+
+            **进程按路径搜索**：进程列表新增 `--path` 过滤（子串匹配 `controller.list_processes()` 已有的 `path` 字段）。
+
+            **x86 应用注入**：同时内嵌 x64 与 x86 两份 DLL（`DATA_B64` / `DATA_B64_X86`），CI 用 `ilammy/msvc-dev-cmd@v1` 的 `arch: x64/x86` 两条 job 并行构建，导入表守卫同步验证。`Controller.inject()` 按 `IsWow64Process` 自动判定目标位数选 DLL；显式 `--arch` 可强制。`preflight` 在跨位数时若该位数 DLL 可用只加 warning，不再 blocked。
+
+            附带修了一个 PE 导出表偏移 bug：之前把 IMAGE_OPTIONAL_HEADER 的导出目录偏移（PE32=0x60 / PE32+=0x88）直接当成 NT headers 后的偏移，没加上 OptionalHeader 起点（0x18），实际应是 PE32=0x78 / PE32+=0xA0。CI 在 windows runner 上真注入 `C:\Windows\SysWOW64\ping.exe` 验证通过。
+
             ## ⚠️ 使用前必读
 
             **本工具仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！**
@@ -465,7 +475,8 @@ jobs:
             CI 在 windows-latest 上完成了两层真实验证：
             1. `pytest tests/test_integration_windows.py` —— 真实注入 `ping.exe`，
                覆盖注入检查 / 内存搜索与读写（含只读页改写）/ 冻结与解除（核实线程挂起状态）/
-               资源提取 / 卸载 / 重新注入 / 自我终止；
+               资源提取 / 卸载 / 重新注入 / 自我终止；新增 `test_x86_injection_on_syswow64_ping`
+               在 `C:\Windows\SysWOW64\ping.exe`（32 位）上验证 x86 注入链路。
             2. `SuperInject.exe --self-test` —— 直接跑**本页下载的打包产物**，
                用内嵌 DLL 走一遍完整链路，报告见该次 CI 运行的 `self-test-report` 工件。
 
