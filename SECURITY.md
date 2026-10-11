@@ -50,10 +50,27 @@ SuperInject 是**调试工具**，不是攻击工具。
 
 ### 其他边界
 
-- **只做 stdio 传输**：不监听端口、不做远程。Agent 必须与 SuperInject 同机同用户。
+- **只做本机传输**：Agent 面向的仍是 stdio —— 不监听任何网络端口、不做远程；
+  GUI 与 launcher 之间另走本机命名管道（见下）。Agent 必须与 SuperInject 同机同用户。
 - **stdout 纪律**：stdio 传输下 stdout 只允许出现 JSON-RPC 帧，所有日志走 stderr。
 - **不绕过任何保护**：MCP 不新增绕过能力；注入检查、系统关键进程拦截等护栏
   对 MCP 调用同样生效。
+
+### 命名管道的权限边界（v1.3.0 P6，无 UAC launcher）
+
+为了免去每次启动都要点 UAC，GUI 主进程（已提权）会在本机监听命名管道
+`\\.\pipe\SuperInjectMCP`，无权限的 `SuperInject.exe mcp-launcher` 把 MCP 请求
+经它转交给主进程执行。权限边界：
+
+- **同一 Windows 用户**：管道用创建者（主进程）用户的安全描述符，默认 ACL 只
+  允许**同一用户**连接；跨用户的 launcher 连不上（被拒），不会因此获得主进程的
+  权限。需要跨用户时改回直连版 `SuperInject.exe mcp`（会走 UAC）。
+- **不对外网**：命名管道是本机内核对象，不监听任何网络端口，外部主机无法访问。
+- **权限模型不变**：管道只把请求从 launcher 转给主进程，**授权（consent）校验
+  仍在主进程里按会话执行**——能力分档、目标 PID / 进程名白名单、过期判定一个不少。
+- **stdout 纪律仍适用**：launcher 的 stdout 只出 JSON-RPC 帧，诊断日志走 stderr。
+
+这条通路**不新增绕过能力**，也不会把主进程的权限授予 launcher。
 
 ## 报告漏洞
 

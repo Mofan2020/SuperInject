@@ -90,11 +90,17 @@ HELP_TEXT = """\
   dll [--force]
 
 MCP server（给 AI Agent 用，stdio JSON-RPC）:
-  SuperInject.exe mcp [--consent-stdin] [--no-gui-consent] [--print-config]
+  SuperInject.exe mcp [--consent-stdin] [--no-gui-consent] [--print-config] [--direct]
   --consent-stdin    从 stdin 一次性读授权配置（首行必须为大写 YES；
                      pids= / names= / capabilities= 三行）
   --no-gui-consent   跳过 GUI 授权弹窗（需配合 --consent-stdin）
   --print-config     打印 Claude Desktop / Cursor 的 mcpServers 配置片段后退出
+                     （默认 mcp-launcher 无 UAC 版；加 --direct 输出直连版）
+  --direct           配合 --print-config：输出 SuperInject.exe mcp 直连版（会走 UAC）
+
+MCP launcher（无 UAC，把请求经命名管道转交给已运行的 GUI 主进程）:
+  SuperInject.exe mcp-launcher
+  （不要求管理员；需先在 GUI 里「启用 MCP 服务」）
 
 示例:
   SuperInject -c -y list --path "C:\\Program Files\\Google\\Chrome\\Application"
@@ -103,6 +109,7 @@ MCP server（给 AI Agent 用，stdio JSON-RPC）:
   SuperInject -c -y mem-read --pid 1234 --address 0x401000 --size 64
   SuperInject -c -y 'inject 1234 --json'
   SuperInject mcp --print-config
+  SuperInject mcp --print-config --direct
   SuperInject mcp --consent-stdin --no-gui-consent < consent.txt
 
 ⚠️ 本工具仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！
@@ -641,21 +648,84 @@ def _ensure_elevation(argv: List[str], want_system: bool):
 # ---------------------------------------------------------------- MCP server
 
 
-def mcp_config_snippet(launcher_path: Optional[str] = None) -> str:
+def mcp_config_snippet(launcher_path: Optional[str] = None, *,
+                       mode: str = "launcher") -> str:
     """生成 Claude Desktop / Cursor 的 ``mcpServers`` 配置片段（JSON 文本）。
 
-    打包产物：``command`` 指向 exe，``args`` 为 ``["mcp"]``；
-    源码运行：``command`` 指向当前解释器，``args`` 为 ``["-m", "superinject", "mcp"]``。
+    默认产出 **mcp-launcher** 版（``mode="launcher"``）—— launcher 不要求管理员/
+    SYSTEM，把请求经命名管道转交给已运行的 GUI 主进程执行，体验上无 UAC。想要
+    「直连」版（自己提权，会触发 UAC）时传 ``mode="direct"``。
+
+    打包产物：``command`` 指向 exe，``args`` 为 ``["mcp-launcher"]`` / ``["mcp"]``；
+    源码运行：``command`` 指向当前解释器，``args`` 为
+    ``["-m", "superinject", "mcp-launcher"]`` / ``[..., "mcp"]``。
     """
+    sub = "mcp" if mode == "direct" else "mcp-launcher"
     if launcher_path:
-        command, args = str(launcher_path), ["mcp"]
+        command, args = str(launcher_path), [sub]
     elif getattr(sys, "frozen", False):
-        command, args = sys.executable, ["mcp"]
+        command, args = sys.executable, [sub]
     else:
-        command, args = sys.executable, ["-m", "superinject", "mcp"]
+        command, args = sys.executable, ["-m", "superinject", sub]
     cfg = {"mcpServers": {"superinject": {"command": command, "args": args,
                                           "env": {}}}}
     return json.dumps(cfg, ensure_ascii=False, indent=2)
+
+
+def _print_stream(text: str, stream: Any = None, name: str = "stdout") -> None:
+    """往指定流打印；没给流就退回 ``safe_print``（窗口化打包下流可能是 None）。"""
+    if stream is None:
+        safe_print(text, name)
+        return
+    try:
+        print(text, file=stream)
+        stream.flush()
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
+def run_mcp_launcher(argv: Optional[List[str]] = None, *, stdin: Any = None,
+                     stdout: Any = None, stderr: Any = None,
+                     backend: Any = None) -> int:
+    """``SuperInject.exe mcp-launcher`` —— 无 UAC 的 MCP 入口。
+
+    不要求管理员/SYSTEM（**不调** ``_ensure_elevation``）。逻辑：连 ``PIPE_NAME``
+    命名管道 → 成功则把 stdin 转成帧发给主进程、把主进程回的帧解码写回 stdout；
+    连不上就在 stderr 报「主进程未运行」并返回非 0。
+
+    **stdout 只能出 JSON-RPC 帧**，所有诊断走 stderr。测试可传 ``backend`` /
+    流参数注入 :class:`~superinject.mcp_pipe.SocketPipeBackend`。
+    """
+    from . import mcp_pipe
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 允许调用方把子命令名一起带进来（与 run_mcp 对称）
+    if argv and argv[0] in ("mcp-launcher", "mcp_launcher"):
+        argv = argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        _print_stream("用法: SuperInject.exe mcp-launcher\n"
+                      "  无 UAC 的 MCP 入口：把 stdio JSON-RPC 经命名管道 "
+                      f"({mcp_pipe.PIPE_NAME})\n"
+                      "  转交给已运行的 GUI 主进程执行。请先在 GUI 里"
+                      "「启用 MCP 服务」。", stdout, "stdout")
+        return 0
+
+    backend = backend if backend is not None else mcp_pipe.default_backend()
+    try:
+        handle = mcp_pipe.connect_pipe(mcp_pipe.PIPE_NAME, backend)
+    except Exception as exc:  # noqa: BLE001 - 连不上统一报错
+        log.debug("launcher 连接命名管道失败: %s", exc)
+        _print_stream("SuperInject 主进程未运行"
+                      "（请先打开 GUI 并启用 MCP 服务）", stderr or sys.stderr,
+                      "stderr")
+        return 69
+
+    log.debug("launcher 已连接命名管道 %s，开始 stdio 转发", mcp_pipe.PIPE_NAME)
+    try:
+        return mcp_pipe.pump_stdio(backend, handle, stdin=stdin, stdout=stdout)
+    except KeyboardInterrupt:  # pragma: no cover - 交互中断
+        _print_stream("launcher 被中断", stderr or sys.stderr, "stderr")
+        return 130
 
 
 def _resolve_mcp_consent(ns: argparse.Namespace) -> Optional[Any]:
@@ -712,14 +782,18 @@ def run_mcp(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-gui-consent", action="store_true",
                         help="跳过 GUI 授权弹窗（需配合 --consent-stdin）")
     parser.add_argument("--print-config", action="store_true",
-                        help="打印 Claude Desktop / Cursor 的 mcpServers 配置后退出")
+                        help="打印 Claude Desktop / Cursor 的 mcpServers 配置后退出"
+                             "（默认 mcp-launcher 无 UAC 版）")
+    parser.add_argument("--direct", action="store_true",
+                        help="配合 --print-config：输出直连版（SuperInject.exe mcp，"
+                             "会触发 UAC）而不是默认的 mcp-launcher 版")
     try:
         ns = parser.parse_args(argv)
     except SystemExit as exc:  # argparse 解析失败自己 exit 2
         return int(exc.code) if exc.code else 0
 
     if ns.print_config:
-        safe_print(mcp_config_snippet())
+        safe_print(mcp_config_snippet(mode="direct" if ns.direct else "launcher"))
         return 0
 
     if ns.no_gui_consent and not ns.consent_stdin:

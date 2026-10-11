@@ -901,3 +901,82 @@ GUI 顶部状态栏与 `MCP` 分区都从后端 `Api.mcp_status()` 取状态，�
 * **未做授权到期的实时倒计时**：状态只在 `boot()` / 点「MCP」导航 / 提交 / 撤销时刷新，
   没有后台定时器轮询；过期中的会话在下次刷新时才显示为「已过期」。
 * **未做多窗口授权同步**：单窗口场景；多窗口并发下的状态同步未设计。
+
+## 十九、v1.3.0 P6：无 UAC launcher（命名管道桥接主进程）
+
+Agent（Claude Desktop / Cursor）以 `SuperInject.exe mcp` 拉起 server 时，因为要注入
+目标进程需要管理员/SYSTEM，每次都会弹 UAC。P6 让一个**不要求权限**的 launcher
+（`SuperInject.exe mcp-launcher`）把 MCP 请求经**命名管道**转交给已经提权的 GUI 主进程
+执行 —— Agent 侧只看到普通的 stdio server，全程无 UAC。
+
+### 19.1 设计与分工
+
+* **launcher 不做注入**：它只连命名管道、转发请求，自己不调 `_ensure_elevation`，
+  因此任何权限下都能跑，不弹 UAC。
+* **主进程负责执行**：GUI（已提权）监听 `\\.\pipe\SuperInjectMCP`，把每条连接上的帧
+  交给 `mcp_server.handle_message()`，授权（consent）校验仍在主进程里按会话执行。
+* **传输**：命名管道（字节模式，一连接一实例）；每条消息是一帧（4 字节长度 + JSON），
+  直接复用 `ipc.encode_frame` / `ipc.decode_frames`（与 DLL↔控制器同一套帧协议）。
+* **线程模型**：接受连接、每条连接的服务循环都在后台线程，绝不阻塞 GUI 主线程。
+
+### 19.2 可测性（硬约束：Win32 调用全包在抽象里）
+
+所有 Win32 管道调用都封在 `mcp_pipe.PipeBackend` 抽象后：
+
+* `Win32PipeBackend`：ctypes 直调 `CreateNamedPipeW / ConnectNamedPipe / ReadFile /
+  WriteFile / DisconnectNamedPipe / CreateFileW / WaitNamedPipeW`（沿用项目既有 ctypes
+  风格，**不引 pywin32**）；
+* `SocketPipeBackend`：POSIX 上用 AF_UNIX stream socket 模拟 —— 同一套 `PipeBridgeServer`
+  与 launcher 转发逻辑在 macOS/Linux 上**真跑**，pytest 与 render_check 因此跨平台。
+
+`connect_pipe(name, backend=None)` 是客户端连接的可测入口；`run_mcp_launcher(...)`
+与 `pump_stdio(...)` 都接受注入的 backend / 流参数。
+
+### 19.3 改动文件
+
+* `superinject/mcp_pipe.py`（新）：`PIPE_NAME` 常量、`PipeBackend` 抽象、
+  `Win32PipeBackend`、`SocketPipeBackend`、`PipeBridgeServer`、`connect_pipe`、
+  `pump_stdio`、`default_backend`。
+* `superinject/cli.py`：新增 `run_mcp_launcher(argv)`（不调 `_ensure_elevation`，stdout
+  只出 JSON-RPC 帧，连不上报「主进程未运行」并返回非 0）；`mcp_config_snippet` 加
+  `mode` 参数，**默认产出 mcp-launcher 版**；`mcp --print-config` 加 `--direct` 出直连版。
+* `superinject/__main__.py`：分派 `argv[0] == "mcp-launcher"`；USAGE 补一行。
+* `superinject/gui.py`：`Api` 新增 `start_mcp_service(backend=None)` / `stop_mcp_service()`；
+  `mcp_status()` 的 `server.running` 改为查 `PipeBridgeServer.running`（不再是恒 False），
+  `transport` 改为 `"pipe"`；进程收尾时顺带停内嵌服务。
+* `superinject/web/index.html` / `app.js` / `style.css`：MCP 面板加「启用 MCP 服务」/
+  「停止」按钮 + 命名管道状态显示；文案写明 launcher 无 UAC、直连走 UAC、需同一用户。
+* `tests/test_mcp_pipe.py`（新，8 例）、`tests/test_mcp_gui.py`（+4 例）、
+  `tests/ui/mock_bridge.js`（补 `start_mcp_service` / `stop_mcp_service` + 可切换状态）、
+  `tests/ui/render_check.py`（补 6 项断言）。
+* `README.md` / `SECURITY.md` / `docs/notes.md`：launcher 用法、为何无 UAC、命名管道权限边界、本章。
+
+### 19.4 验证证据
+
+* `tests/test_mcp_pipe.py`（8 例，跨平台 / macOS 可跑，全用 SocketPipeBackend 真跑）：
+  - SocketPipeBackend 起 server + client 连上，发 `initialize` 收到合法 JSON-RPC 响应；
+  - 同一长连接连续多帧（initialize / tools/list / tools/call / 通知不应答 / 再请求）；
+  - 未授权会话（session=None）→ `tools/call` 回 `consent_denied` 且**不落到控制器**；
+  - `stop()` 后 `running` 为 False 且名字释放（同 name 能重新起 server 并连上）；
+  - launcher 连不上 → stderr 报「主进程未运行」且 stdout 为空、返回非 0；
+  - `connect_pipe` 有 server 返回句柄 / 无 server 抛 ConnectionError；
+  - launcher 端到端：stdin → 管道 → 主进程 → stdout，响应为合法 JSON-RPC 帧。
+* `tests/test_mcp_gui.py`（17 例，+4）：无授权 `start_mcp_service` → `{ok: False}`；
+  有授权 + SocketPipeBackend → `{ok: True, running: True}` 且 `mcp_status` 反映运行中；
+  `stop_mcp_service` 后回 False；`mcp_config_snippet` 默认 launcher、`mode=direct` 为直连。
+* `python3 tests/ui/render_check.py` → 全绿。新增 6 项断言依赖 mock 的
+  `start_mcp_service` / `stop_mcp_service` 与可切换 `mcp_status`：初始「未启用」→
+  点启用变「运行中」→ 点停止回「未启用」。
+  **负向测试**：把 mock 的 `start_mcp_service` 改名 → render_check 在
+  「启用后管道状态显示运行中」处 `wait_for_function` 超时并以 **exit=1** 结束；恢复后全绿。
+* `pytest tests -q --ignore=tests/test_integration_windows.py` → **305 passed / 5 skipped**
+  （P5 后 293 + 新增 12）；`ruff check superinject build tests run_superinject.py` → clean。
+
+### 19.5 未做的部分 / 只能 Windows 真机验证
+
+* **只能 Windows 真机验证**：`Win32PipeBackend` 的 ctypes 管道调用（`CreateNamedPipeW`
+  系列）在 macOS 上跑不了，只能在 Windows 上真机验；本阶段仅保证代码路径与抽象一致。
+  跨用户 ACL 行为、UAC 免弹窗效果、launcher↔主进程的会话交互同样只能 Windows 实测。
+* **不做自动写 Agent 端配置文件**（P7）：仍靠「复制 Agent 配置」贴进
+  `claude_desktop_config.json` / `mcp.json`。
+* **不做会话实时续期**：桥接服务在 `start` 时快照一次会话；会话过期后需重新授权并重启服务。

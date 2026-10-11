@@ -283,6 +283,35 @@ def run_interactions(page, shots_dir: Path | None) -> None:
         timeout=5000)
     check("复制" in page.inner_text("#log"), "复制 Agent 配置走到了 mcp_config_snippet")
 
+    # v1.3.0 P6：无 UAC 命名管道服务开关（启用 / 停止 + 管道状态）。
+    # 依赖 mock 的 start_mcp_service / stop_mcp_service 与可切换的 mcp_status：
+    # 若任一 mock 缺失或状态没跟着变，下面几条会立刻变红。
+    page.click('button.nav-seg[data-target="panel-mcp"]')
+    page.wait_for_timeout(200)
+    check(page.inner_text("#mcp-pipe-state") == "未启用",
+          "初始命名管道服务为未启用")
+    check(page.evaluate(
+        "() => document.getElementById('btn-mcp-start').disabled") is False,
+        "有有效授权时「启用 MCP 服务」可点")
+
+    page.click("#btn-mcp-start")
+    page.wait_for_function(
+        "() => document.getElementById('mcp-pipe-state').textContent === '运行中'",
+        timeout=5000)
+    check(page.inner_text("#mcp-pipe-state") == "运行中",
+          "启用后管道状态显示运行中（start_mcp_service 被调用）")
+    check("已启用" in page.inner_text("#log"), "启用服务后日志有输出")
+    check(page.evaluate(
+        "() => document.getElementById('btn-mcp-stop').disabled") is False,
+        "运行中时「停止」可点")
+
+    page.click("#btn-mcp-stop")
+    page.wait_for_function(
+        "() => document.getElementById('mcp-pipe-state').textContent === '未启用'",
+        timeout=5000)
+    check(page.inner_text("#mcp-pipe-state") == "未启用",
+          "停止后管道状态回到未启用（stop_mcp_service 被调用）")
+
     # 撤销授权 → confirmBox → 确定 → revoke_consent
     page.click("#btn-mcp-revoke")
     page.wait_for_selector("#modal:not(.hidden)", timeout=5000)

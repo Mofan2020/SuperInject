@@ -364,6 +364,10 @@ td.path { color: var(--label-2); font-size: 11.5px; word-break: break-all; }
 .mcp-dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
 .mcp-dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .mcp-state-text { font-size: 13px; font-weight: 600; }
+.mcp-pipe { margin-left: auto; font-size: 12px; }
+.mcp-pipe code { font-size: 11.5px; }
+.mcp-pipe b { font-weight: 600; }
+.mcp-pipe b.ok { color: var(--ok); }
 .mcp-detail { font-size: 12.5px; color: var(--label-2); line-height: 1.6; }
 .mcp-detail b { color: var(--label); font-weight: 600; }
 .mcp-note { margin-top: 2px; line-height: 1.6; }

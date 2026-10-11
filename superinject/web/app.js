@@ -938,6 +938,50 @@
     }
     const revoke = $("#btn-mcp-revoke");
     if (revoke) revoke.disabled = c.state !== "valid";
+
+    // v1.3.0 P6：命名管道服务状态（真实反映后端 PipeBridgeServer.running）
+    const srv = (state.mcp && state.mcp.server) || {};
+    const running = !!srv.running;
+    const pipeName = $("#mcp-pipe-name");
+    if (pipeName) pipeName.textContent = srv.pipe || "\\\\.\\pipe\\SuperInjectMCP";
+    const pipeState = $("#mcp-pipe-state");
+    if (pipeState) {
+      pipeState.textContent = running ? "运行中" : "未启用";
+      pipeState.className = running ? "ok" : "";
+    }
+    const startBtn = $("#btn-mcp-start");
+    if (startBtn) startBtn.disabled = !c.valid || running;
+    const stopBtn = $("#btn-mcp-stop");
+    if (stopBtn) stopBtn.disabled = !running;
+  }
+
+  async function startMcpService() {
+    const startBtn = $("#btn-mcp-start");
+    if (startBtn) startBtn.disabled = true;
+    let res;
+    try {
+      res = await call("start_mcp_service");
+    } catch (e) {
+      log("启用 MCP 服务失败：" + e, "err");
+      return refreshMcpStatus();
+    }
+    if (res && res.ok) {
+      log("MCP 服务已启用（命名管道 " + (res.pipe || "") +
+          "）；Agent 可用 SuperInject.exe mcp-launcher 无 UAC 连接", "ok");
+    } else {
+      log("启用 MCP 服务失败：" + ((res && res.error) || "未知错误"), "err");
+    }
+    await refreshMcpStatus();
+  }
+
+  async function stopMcpService() {
+    const res = await call("stop_mcp_service");
+    if (res && res.ok) {
+      log("MCP 服务已停止", "ok");
+    } else {
+      log("停止 MCP 服务失败：" + ((res && res.error) || "未知错误"), "err");
+    }
+    await refreshMcpStatus();
   }
 
   function collectConsentForm() {
@@ -1042,6 +1086,10 @@
     if (open) open.addEventListener("click", openConsentModal);
     const revoke = $("#btn-mcp-revoke");
     if (revoke) revoke.addEventListener("click", revokeConsent);
+    const startBtn = $("#btn-mcp-start");
+    if (startBtn) startBtn.addEventListener("click", startMcpService);
+    const stopBtn = $("#btn-mcp-stop");
+    if (stopBtn) stopBtn.addEventListener("click", stopMcpService);
     const copy = $("#btn-mcp-copy");
     if (copy) copy.addEventListener("click", copyMcpConfig);
     const cancel = $("#consent-cancel");

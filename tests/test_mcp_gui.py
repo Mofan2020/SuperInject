@@ -111,7 +111,7 @@ def test_mcp_status_none_when_no_file(api, tmp_path):
     assert st["consent"]["state"] == "none"
     assert st["consent"]["valid"] is False
     assert st["server"]["running"] is False
-    assert st["server"]["transport"] == "stdio"
+    assert st["server"]["transport"] == "pipe"
 
 
 def test_mcp_status_valid_after_submit(api, tmp_path):
@@ -168,3 +168,55 @@ def test_mcp_config_snippet_is_valid_json(api):
     entry = data["mcpServers"]["superinject"]
     assert entry["command"]
     assert isinstance(entry["args"], list)
+
+
+# --------------------------------------------------------------------------- MCP 命名管道服务（v1.3.0 P6）
+
+
+def test_start_mcp_service_requires_valid_consent(api):
+    """无有效授权时不允许起命名管道服务。"""
+    res = api.start_mcp_service()
+    assert res["ok"] is False, res
+    assert "授权" in res["error"]
+    assert api.mcp_status()["server"]["running"] is False
+
+
+def test_start_and_stop_mcp_service_socket_backend(api):
+    """有授权 → 用 SocketPipeBackend 起服务，running 变 True；停止后回 False。
+
+    用 socket 后端注入，避免在非 Windows 上真起 Win32 命名管道。
+    """
+    from superinject.mcp_pipe import SocketPipeBackend
+
+    api.submit_consent({"pids": "1234", "capabilities": ["read"]})
+    res = api.start_mcp_service(backend=SocketPipeBackend())
+    assert res["ok"] is True, res
+    assert res["running"] is True
+    assert res["pipe"]
+    try:
+        st = api.mcp_status()
+        assert st["server"]["running"] is True, "mcp_status 必须反映真实运行状态"
+        assert st["server"]["transport"] == "pipe"
+        assert st["server"]["pipe"] == res["pipe"]
+    finally:
+        stop = api.stop_mcp_service()
+    assert stop["ok"] is True
+    assert stop["stopped"] is True
+    assert api.mcp_status()["server"]["running"] is False
+
+
+def test_stop_mcp_service_when_not_running_is_ok(api):
+    res = api.stop_mcp_service()
+    assert res["ok"] is True
+    assert res["stopped"] is False
+    assert res["running"] is False
+
+
+def test_mcp_config_snippet_defaults_to_launcher(api):
+    """默认输出无 UAC 的 mcp-launcher 配置；mode=direct 才是直连版。"""
+    launcher = json.loads(api.mcp_config_snippet())["mcpServers"]["superinject"]
+    assert any("mcp-launcher" in str(a) for a in launcher["args"]), launcher
+    direct = json.loads(
+        api.mcp_config_snippet(mode="direct"))["mcpServers"]["superinject"]
+    assert any(str(a) == "mcp" for a in direct["args"]), direct
+    assert not any("mcp-launcher" in str(a) for a in direct["args"])

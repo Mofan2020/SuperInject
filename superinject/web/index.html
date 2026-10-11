@@ -246,12 +246,14 @@
     </details>
   </section>
 
-  <!-- v1.3.0 P5：MCP 授权面板（授权 + 复制 Agent 配置；不在此进程内起 server） -->
+  <!-- v1.3.0 P5/P6：MCP 授权面板（授权 + 无 UAC 命名管道服务 + 复制 Agent 配置） -->
   <section class="panel" id="panel-mcp">
     <div class="panel-head"><h2>MCP 授权</h2>
-      <span class="hint">核发一份本地授权会话，供外部 Agent 以 <code>SuperInject.exe mcp</code> 复用；本进程不起内嵌 server</span>
+      <span class="hint">授权后启用命名管道服务，Agent 以 <code>SuperInject.exe mcp-launcher</code> 无 UAC 连接本进程</span>
       <span class="grow"></span>
       <button id="btn-mcp-consent" class="primary">授权…</button>
+      <button id="btn-mcp-start" class="ghost" disabled>启用 MCP 服务</button>
+      <button id="btn-mcp-stop" class="warn" disabled>停止</button>
       <button id="btn-mcp-revoke" class="warn" disabled>撤销授权</button>
       <button id="btn-mcp-copy" class="ghost">复制 Agent 配置</button>
     </div>
@@ -259,12 +261,15 @@
       <div class="mcp-state">
         <span id="mcp-state-dot" class="mcp-dot off"></span>
         <span id="mcp-state-text" class="mcp-state-text">未授权</span>
+        <span class="mcp-pipe muted">命名管道：<code id="mcp-pipe-name">–</code> · 服务：<b id="mcp-pipe-state">未启用</b></span>
       </div>
       <div id="mcp-detail" class="mcp-detail">尚未授权任何目标。点「授权…」勾选 PID 白名单 / 进程名通配与能力分档。</div>
       <div class="mcp-note muted">
-        说明：真正的 MCP server 由外部 Agent 进程按
-        <code>SuperInject.exe mcp</code> 拉起（stdio 传输），它读取这份授权文件来复用会话；
-        GUI 进程内没有 stdio，所以这里只负责<strong>授权</strong>与<strong>复制配置</strong>。
+        说明：授权后点「启用 MCP 服务」，本进程（已提权）会监听命名管道
+        <code>\\.\pipe\SuperInjectMCP</code>。Agent 端配置用
+        <code>SuperInject.exe mcp-launcher</code>（<strong>无 UAC</strong>）：launcher 不要求权限，
+        把请求经管道转交本进程执行。直接跑 <code>SuperInject.exe mcp</code> 则由 Agent 自己提权，<strong>会走 UAC</strong>。
+        launcher 与主进程必须是<strong>同一个 Windows 用户</strong>。
       </div>
     </div>
   </section>

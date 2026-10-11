@@ -69,6 +69,8 @@ class Api:
         self.dll_report: dict = {}
         self.update: dict = {}
         self.elevation: dict = {}
+        # v1.3.0 P6：GUI 进程内的命名管道桥（给无 UAC 的 mcp-launcher 用）。
+        self._mcp_server = None
         self.controller.on_change(self._broadcast_state)
 
     # -------------------------------------------------- 内部
@@ -349,13 +351,17 @@ class Api:
         }
 
     def mcp_status(self) -> dict:
-        """MCP 授权 + server 的当前状态（前端状态栏用）。
+        """MCP 授权 + 内嵌命名管道服务的当前状态（前端状态栏用）。
 
         consent 三态：``none``（无授权文件）/ ``valid``（有效）/ ``expired``
-        （文件在但已过期或签名对不上）。``server`` 恒为 ``running=False``：
-        GUI 进程里没有 stdio 给 MCP 用，真正的 Agent 是从外部拉起
-        ``SuperInject.exe mcp``，靠这份 consent 文件复用授权。
+        （文件在但已过期或签名对不上）。
+
+        ``server.running`` 反映 **真实的** :class:`~superinject.mcp_pipe.PipeBridgeServer`
+        状态（v1.3.0 P6）：启用后 Agent 可用 ``SuperInject.exe mcp-launcher`` 无 UAC
+        连接本进程；未启用时为 ``False``。
         """
+        from .mcp_pipe import PIPE_NAME
+
         session = mcp_consent.load_consent()
         valid = session is not None and mcp_consent.is_valid(session)
         if session is None:
@@ -374,17 +380,72 @@ class Api:
             "pid_allowlist": sorted(session.pid_allowlist) if session else [],
             "name_glob": list(session.name_glob) if session else [],
         }
+        server_obj = self._mcp_server
+        running = bool(server_obj is not None and server_obj.running)
         return {
             "consent": consent,
-            "server": {"running": False, "transport": "stdio",
-                       "note": "Agent 从外部以 `SuperInject.exe mcp` 拉起，复用本授权"},
+            "server": {
+                "running": running,
+                "transport": "pipe",
+                "pipe": PIPE_NAME,
+                "launcher": "SuperInject.exe mcp-launcher",
+                "note": "启用后 Agent 可用 `SuperInject.exe mcp-launcher` 无 UAC "
+                        "连接本进程；直接跑 `SuperInject.exe mcp` 会走 UAC",
+            },
         }
 
-    def mcp_config_snippet(self) -> str:
-        """复用 ``cli.mcp_config_snippet()``：Agent 端 ``mcpServers`` 配置片段。"""
+    def start_mcp_service(self, backend=None) -> dict:
+        """启用内嵌命名管道服务：Agent 可用 ``SuperInject.exe mcp-launcher`` 无 UAC 连接。
+
+        要求已有**有效**的 MCP 授权（consent）；无授权返回 ``{ok: False, error}``。
+        连接受连接与每条连接的服务都在后台线程，**不阻塞 GUI 主线程**。
+
+        ``backend`` 仅供测试注入（如 :class:`~superinject.mcp_pipe.SocketPipeBackend`）；
+        前端调用时留空 → 按平台取默认后端（Windows 走 Win32 命名管道）。
+        """
+        from .mcp_pipe import PIPE_NAME, PipeBridgeServer
+
+        session = mcp_consent.load_consent()
+        if session is None or not mcp_consent.is_valid(session):
+            return {"ok": False,
+                    "error": "无有效 MCP 授权：请先点「授权…」再启用服务"}
+        if self._mcp_server is not None and self._mcp_server.running:
+            return {"ok": True, "running": True, "pipe": PIPE_NAME,
+                    "note": "MCP 命名管道服务已在运行"}
+        server = PipeBridgeServer(session, self.controller, backend=backend)
+        try:
+            server.start()
+        except Exception as exc:  # 起监听失败（权限 / 名字被占等）
+            return {"ok": False, "error": f"启动命名管道失败: {exc}"}
+        self._mcp_server = server
+        self._emit("mcp-server", {"running": True, "pipe": PIPE_NAME})
+        return {
+            "ok": True, "running": True, "pipe": PIPE_NAME,
+            "launcher": "SuperInject.exe mcp-launcher",
+            "note": "已启用：Agent 可用 `SuperInject.exe mcp-launcher` 无 UAC 连接本进程",
+        }
+
+    def stop_mcp_service(self) -> dict:
+        """停止内嵌命名管道服务（幂等）。"""
+        server = self._mcp_server
+        self._mcp_server = None
+        if server is None:
+            return {"ok": True, "running": False, "stopped": False}
+        try:
+            server.stop()
+        except Exception as exc:
+            return {"ok": False, "error": f"停止命名管道服务失败: {exc}"}
+        self._emit("mcp-server", {"running": False})
+        return {"ok": True, "running": False, "stopped": True}
+
+    def mcp_config_snippet(self, mode: str = "launcher") -> str:
+        """复用 ``cli.mcp_config_snippet()``：Agent 端 ``mcpServers`` 配置片段。
+
+        默认 ``mode="launcher"``（无 UAC）；传 ``mode="direct"`` 得到直连版。
+        """
         from .cli import mcp_config_snippet as _snippet
 
-        return _snippet()
+        return _snippet(mode="direct" if mode == "direct" else "launcher")
 
     def revoke_consent(self) -> dict:
         """删除本地 consent 文件（清授权）。文件本就不存在也算成功。"""
@@ -400,6 +461,12 @@ class Api:
     # -------------------------------------------------- 收尾
 
     def shutdown(self) -> None:
+        try:
+            if self._mcp_server is not None:
+                self._mcp_server.stop()
+                self._mcp_server = None
+        except Exception:  # pragma: no cover
+            pass
         try:
             self.preview.stop()
         except Exception:  # pragma: no cover

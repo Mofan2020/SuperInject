@@ -34,7 +34,7 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
 | 内存快照 / diff | 4KB 分页 SHA-256 + 前 64 字节快照，落盘到 `%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json`；二次操作可对比任意两份快照的差异页（先看全局 SHA 找变化页，再展示 `head64` 两栏 hex），既找得到 1 字节改动也不会随进程跑出 MB 级 false positive |
 | 硬件断点（P2/P3 v1.3.0） | DR0-DR3 装线程级硬件断点（4 槽），DR7 控制位含 R/W / LEN / L 启用；槽位耗尽自动降到 VEH 模拟（`INT3 0xCC` patch + 单步重写）—— 命中推 `event:breakpoint` 给控制器，事件 payload 含 `addr / pid / tid / slot / kind / fault_addr / hit_count / regs / stack`。**命中事件含完整寄存器**（x64: RIP/RSP/RBP/RFLAGS/RAX-RDI/R8-R15/CS/SS；x86: EIP/ESP/EBP/EFLAGS/EAX-EDI/CS/SS）**和栈快照前 16 项**（每项 `{i, addr, value}`；RSP/ESP 页不可读时栈为空数组，事件照推） |
-| MCP server（P4/P5 v1.3.0） | `SuperInject.exe mcp` 起 stdio JSON-RPC server，把 31 个调试能力（`read` 16 / `write` 14 / `dangerous` 1）按**会话授权**开关暴露给 AI Agent：启动时弹窗（或 `--consent-stdin` 一次性读配置）确认 PID 白名单 / 进程名通配符 / 能力分档，未授权的工具在 `tools/list` 里就不出现、硬调也只回 `consent_denied` 且**不会落到控制器**；默认走零依赖的裸 stdio 实现，装了官方 `mcp` SDK 则自动优先走 SDK、失败自动降级；`--print-config` 直接打印 Claude Desktop / Cursor 的 `mcpServers` 配置片段。**GUI 内置授权面板**（P5）：顶部 MCP 状态徽标（未授权 / 已授权 / 已过期）+「授权…」模态框（PID 白名单 / 进程名通配 / 三档能力 / 有效期）+「撤销授权」+「复制 Agent 配置」，授权直接落盘供外部 Agent 复用 |
+| MCP server（P4/P5/P6 v1.3.0） | `SuperInject.exe mcp` 起 stdio JSON-RPC server，把 31 个调试能力（`read` 16 / `write` 14 / `dangerous` 1）按**会话授权**开关暴露给 AI Agent：启动时弹窗（或 `--consent-stdin` 一次性读配置）确认 PID 白名单 / 进程名通配符 / 能力分档，未授权的工具在 `tools/list` 里就不出现、硬调也只回 `consent_denied` 且**不会落到控制器**；默认走零依赖的裸 stdio 实现，装了官方 `mcp` SDK 则自动优先走 SDK、失败自动降级；`--print-config` 直接打印 Claude Desktop / Cursor 的 `mcpServers` 配置片段（默认无 UAC 的 launcher 版，加 `--direct` 出直连版）。**GUI 内置授权面板**（P5）：顶部 MCP 状态徽标（未授权 / 已授权 / 已过期）+「授权…」模态框（PID 白名单 / 进程名通配 / 三档能力 / 有效期）+「撤销授权」+「复制 Agent 配置」，授权直接落盘供外部 Agent 复用。**无 UAC launcher**（P6）：GUI 里点「启用 MCP 服务」后，主进程（已提权）监听命名管道 `\\.\pipe\SuperInjectMCP`；Agent 端配置用 `SuperInject.exe mcp-launcher`（**不要求管理员/SYSTEM**）把 stdio JSON-RPC 经管道转交主进程执行，**全程无 UAC 弹窗** |
 | 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
 | 崩溃转储 | DLL 在 `DllMain` 里装 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler`，目标进程 ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE 时自动写 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` 与同名 `.json` 元数据 sidecar；控制器在 `on_detach` 时按"水位线"扫目录，把新文件合成 `event:crash` 推到事件队列，CLI/前端都能消费 |
 | 事件流 | DLL / 控制器都能主动推 `type=event:*` 帧（包括崩溃转储、patch 落地等）—— 不参与 id 匹配，专为「通知但不期望响应」设计；CLI `events` 子命令支持 `--follow` 持续轮询 |
@@ -199,14 +199,21 @@ capabilities=read,write
 - 授权默认 30 分钟过期，之后要重新授权。
 - `--print-config` 输出的片段贴进 Claude Desktop 的 `claude_desktop_config.json`（或 Cursor 的 `mcp.json`）即可让 Agent 发现本 server。
 
-**GUI 授权流程**（v1.3.0 P5，推荐）：
+**GUI 授权流程**（v1.3.0 P5/P6，推荐）：
 
 1. 打开 GUI，顶部状态栏的 `MCP` 徽标显示当前授权状态（未授权 / 已授权 / 已过期）；`MCP` 分区里点「授权…」打开授权模态框。
 2. 在模态框里勾选能力分档（`read` 自动勾选；`write` 改变目标状态；`dangerous` = 终止进程）、填 PID 白名单 / 进程名通配符、选有效期，点「授权」—— 会话**落盘**到 consent 文件（未授权成功不会落盘）。
-3. 点「复制 Agent 配置」把 `mcpServers` 片段复制到剪贴板，贴进 Agent 端配置。
-4. Agent 端配好后再由 Agent 自行以 `SuperInject.exe mcp` 拉起 server，它读取这份授权文件复用会话。
+3. 点「启用 MCP 服务」：主进程（已提权）开始监听命名管道 `\\.\pipe\SuperInjectMCP`，面板与顶部徽标会显示「运行中」。
+4. 点「复制 Agent 配置」把 `mcpServers` 片段复制到剪贴板，贴进 Agent 端配置（默认就是无 UAC 的 `mcp-launcher` 版）。
+5. Agent 自行以 `SuperInject.exe mcp-launcher` 拉起 launcher：它**不要求管理员/SYSTEM**，把 Agent 的 stdio JSON-RPC 经命名管道转交给第 3 步启用的主进程执行，**全程无 UAC 弹窗**。
 
-> GUI 只负责**授权**与**复制配置**，**不会**在自身进程里起内嵌 server —— GUI 进程没有可用的 stdin/stdout 给 stdio 传输。任何时刻点「撤销授权」即可删除授权文件清空授权。
+**为什么用 mcp-launcher 而不是直接 `SuperInject.exe mcp`？** 直接跑 `mcp` 要能注入目标进程，因此需要管理员/SYSTEM，每次都会弹 UAC。`mcp-launcher` 只做「转发」——它把请求交给**已经提权**的 GUI 主进程执行，自己不需要任何权限，所以不弹 UAC。代价是必须先打开 GUI 并启用 MCP 服务；主进程没运行时 launcher 会在 stderr 报「SuperInject 主进程未运行（请先打开 GUI 并启用 MCP 服务）」并返回非 0。
+
+> **launcher 与主进程必须是同一个 Windows 用户。** 命名管道的默认 ACL 只允许创建者所在用户访问，跨用户（例如主进程以管理员身份、launcher 以普通用户）连不上；此时改回直连版 `SuperInject.exe mcp`（会走 UAC）。
+
+> GUI 的 `MCP` 分区负责**授权** + **启用/停止命名管道服务** + **复制配置**；服务本身是**命名管道**（不是内嵌 stdio —— GUI 进程没有可用的 stdin/stdout 给 stdio 传输）。任何时刻点「停止」停服务、点「撤销授权」删除授权文件清空授权。
+
+不想要 launcher、让 Agent 自己提权走 `SuperInject.exe mcp` 时，用 `--print-config --direct` 生成直连版配置片段。
 
 CLI 模式：
 

@@ -82,6 +82,10 @@
     }];
   }
 
+  // ---- v1.3.0 P6：无 UAC 命名管道服务的可切换状态（供 render_check 断言开关） ----
+  let mcpRunning = false;
+  const MCP_PIPE = BS + BS + "." + BS + "pipe" + BS + "SuperInjectMCP";
+
   const api = {
     bootstrap: () => ({
       app: "SuperInject", version: "1.0.2",
@@ -178,8 +182,23 @@
         capabilities: ["read", "write"],
         pid_allowlist: [1234, 5678], name_glob: ["notepad*"],
       },
-      server: { running: false, transport: "stdio" },
+      server: {
+        running: mcpRunning, transport: "pipe", pipe: MCP_PIPE,
+        launcher: "SuperInject.exe mcp-launcher",
+        note: "启用后 Agent 可用 mcp-launcher 无 UAC 连接",
+      },
     }),
+    // ---- v1.3.0 P6：命名管道服务开关（无 UAC launcher 的后端支撑） ----
+    start_mcp_service: () => {
+      mcpRunning = true;
+      return { ok: true, running: true, pipe: MCP_PIPE,
+               launcher: "SuperInject.exe mcp-launcher",
+               note: "已启用：Agent 可用 SuperInject.exe mcp-launcher 无 UAC 连接本进程" };
+    },
+    stop_mcp_service: () => {
+      mcpRunning = false;
+      return { ok: true, running: false, stopped: true };
+    },
     submit_consent: (payload) => ({
       ok: true,
       summary: "pids=" + ((payload && payload.pids) || "-") +
@@ -189,7 +208,7 @@
     }),
     revoke_consent: () => ({ ok: true, removed: true }),
     mcp_config_snippet: () => JSON.stringify({
-      mcpServers: { superinject: { command: "SuperInject.exe", args: ["mcp"], env: {} } },
+      mcpServers: { superinject: { command: "SuperInject.exe", args: ["mcp-launcher"], env: {} } },
     }, null, 2),
   };
 

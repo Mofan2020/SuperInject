@@ -33,7 +33,9 @@ USAGE = """用法: SuperInject [选项]
   --keep-target    自检结束后保留目标进程（默认回收）
   --system-probe F 以当前身份把身份信息写到文件 F 后退出（自检内部使用）
   mcp              起 MCP server（stdio JSON-RPC，给 AI Agent 用）
-                   [--consent-stdin] [--no-gui-consent] [--print-config]
+                   [--consent-stdin] [--no-gui-consent] [--print-config] [--direct]
+  mcp-launcher     无 UAC 的 MCP 入口：把请求经命名管道转交给已运行的 GUI 主进程
+                   （需先在 GUI 里「启用 MCP 服务」；不要求管理员权限）
   -h, --help       显示本帮助
 
 ⚠️ 仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！
@@ -114,6 +116,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "mcp":
         from . import cli
         return cli.run_mcp(argv)
+
+    # ---- MCP launcher：`SuperInject.exe mcp-launcher`（无 UAC，经命名管道转交主进程）
+    if argv and argv[0] in ("mcp-launcher", "mcp_launcher"):
+        from . import cli
+        return cli.run_mcp_launcher(argv)
 
     # ---- CLI 模式：-c 单独走 cli.run()，不再拉 GUI；提升权等均交给 CLI 自己处理
     if "-c" in argv or "--cli" in argv:
