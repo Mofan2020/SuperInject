@@ -589,9 +589,10 @@ def test_dumps_scans_work_dir(monkeypatch, tmp_path, capsys):
     # 两个 PID 各有文件，按 mtime 倒序：先 dump-2 再 dump-1，再 dump-x。
     paths = [it["path"] for it in data["items"]]
     assert len(paths) == 3
-    assert any("1234/dump-1.dmp" in p for p in paths)
-    assert any("1234/dump-2.dmp" in p for p in paths)
-    assert any("9999/dump-x.dmp" in p for p in paths)
+    # 跨平台：Windows 下 tmp_path 用反斜杠，所以按文件 basename 校验，
+    # 而不锁死分隔符。
+    basenames = {Path(p).name for p in paths}
+    assert basenames == {"dump-1.dmp", "dump-2.dmp", "dump-x.dmp"}
 
 
 def _make_fake_ipc(base):

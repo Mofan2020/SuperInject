@@ -1179,7 +1179,6 @@ static int write_dump_with_meta(EXCEPTION_POINTERS *ep)
     DWORD           tick = GetTickCount();
     HANDLE          file = INVALID_HANDLE_VALUE;
     BOOL            ok = FALSE;
-    DWORD           written = 0;
     char            buf[512];
     int             n;
     FILE           *fp = NULL;
@@ -1566,6 +1565,8 @@ typedef struct {
 
 static int pe_parse_image(LPVOID base, pe_image_t *out)
 {
+    IMAGE_OPTIONAL_HEADER32 *o32;
+    IMAGE_OPTIONAL_HEADER64 *o64;
     if (!base || !out) return 0;
     memset(out, 0, sizeof(*out));
     out->ImageBase  = base;
@@ -1575,16 +1576,29 @@ static int pe_parse_image(LPVOID base, pe_image_t *out)
     out->NtHdr = (PIMAGE_NT_HEADERS)((BYTE *)base + out->DosHdr->e_lfanew);
     if (out->NtHdr->Signature != IMAGE_NT_SIGNATURE) return 0;
 
+    /*
+     * PE32 与 PE32+ OptionalHeader 大小不同，但对"导出表目录"这一字段，
+     * 只是 IMAGE_DATA_DIRECTORY 在整个 header 内的偏移；DataDirectory
+     * 内 member 的 VirtualAddress / Size 在 32/64 是同一种类型。
+     * 取一个具体的 header 视图后立刻断言是 32 还是 64，再按那个尺寸
+     * 抓导出表目录的两个 Dword。MSVC 对共用 o 的两个分支会推断成
+     * "o64*"（PE32 不写赋值），所以这里必须显式分清楚：
+     *   - PE32 → 用 OptionalHeader 直接（结构同型）
+     *   - PE32+ → cast 成 IMAGE_OPTIONAL_HEADER64 *
+     * 不再用 if/else 共享 o，避免 cl /W4 + /WX 视为错误。
+     */
     if (out->NtHdr->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR_MAGIC) {
-        /* PE32 (32-bit) */
-        IMAGE_OPTIONAL_HEADER32 *o = &out->NtHdr->OptionalHeader;
-        out->ExportDirRva  = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        out->ExportDirSize = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        o32 = &out->NtHdr->OptionalHeader;
+        out->ExportDirRva  = o32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        out->ExportDirSize = o32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
     } else if (out->NtHdr->OptionalHeader.Magic ==
                IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        IMAGE_OPTIONAL_HEADER64 *o = (PIMAGE_OPTIONAL_HEADER64)&out->NtHdr->OptionalHeader;
-        out->ExportDirRva  = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        out->ExportDirSize = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        o64 = (PIMAGE_OPTIONAL_HEADER64)&out->NtHdr->OptionalHeader;
+        (void)o64;
+        out->ExportDirRva  = ((IMAGE_OPTIONAL_HEADER64 *)o64)->
+            DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        out->ExportDirSize = ((IMAGE_OPTIONAL_HEADER64 *)o64)->
+            DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
     } else {
         return 0;
     }
