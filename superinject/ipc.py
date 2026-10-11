@@ -141,6 +141,9 @@ class AgentServer:
         self.port = 0
         self.on_attach: Optional[Callable[[int, dict], None]] = None
         self.on_detach: Optional[Callable[[int], None]] = None
+        # 目标进程内 DLL 主动推到控制器的事件（例如崩溃转储已落盘）。
+        # 区别于"对请求的响应"：事件不参与 id 匹配，会被原样转发到这里。
+        self.on_event: Optional[Callable[[int, dict], None]] = None
 
     # -------------------------------------------------- 生命周期
 
@@ -287,6 +290,25 @@ class AgentServer:
                   ) -> Dict[int, dict]:
         return {int(pid): self.request(pid, cmd, timeout) for pid in pids}
 
+    def send_event(self, pid: int, payload: dict, timeout: float = SEND_TIMEOUT
+                   ) -> bool:
+        """控制器主动给已连接注入端发事件消息（无 id，不期望响应）。
+
+        当前协议里这一通路是为双向发送保留的，本项目暂未用到；保留调用
+        点便于以后在前端"主动推"消息给 DLL（例如「暂停接受命令」标记）。
+        返回 True 表示帧已成功进入 socket 缓冲。
+        """
+        with self._lock:
+            conn = self._conns.get(int(pid))
+        if not conn or not conn.alive:
+            return False
+        try:
+            conn.send(payload, timeout=timeout)
+            return True
+        except Exception as exc:  # pragma: no cover
+            log.debug("send_event 失败 pid=%s err=%s", pid, exc)
+            return False
+
     # -------------------------------------------------- 内部
 
     def _accept_loop(self) -> None:
@@ -374,7 +396,25 @@ class AgentServer:
                     pass
 
     def _dispatch(self, pid: int, msg: dict) -> None:
+        """收到一帧：响应（带 id）就匹配等待者；事件（顶层 type 以 ``event``
+        开头）直接转发给控制器订阅者。
+
+        区分依据是顶层 ``type`` 字段：协议约定请求/响应都用 ``type``，但
+        服务端主动推送的消息 type 一律以 ``event`` 开头（例如 ``event:crash``
+        表示"目标进程刚生成了一份 minidump"）。这样既不污染 id 匹配，也
+        对老版 DLL 兼容（没有事件时它压根不会发这种帧）。
+        """
         mid = msg.get("id")
+        type_str = str(msg.get("type") or "")
+        if type_str.startswith("event"):
+            log.debug("收到注入端事件 pid=%s type=%s", pid, type_str)
+            cb = self.on_event
+            if cb:
+                try:
+                    cb(pid, msg)
+                except Exception:  # pragma: no cover
+                    log.exception("on_event 回调失败")
+            return
         with self._lock:
             q = self._waiters.get(mid)
         if q is not None:

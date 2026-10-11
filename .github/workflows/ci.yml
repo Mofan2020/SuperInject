@@ -60,7 +60,7 @@ jobs:
           $arch = '${{ matrix.arch }}'
           $suffix = if ($arch -eq 'x86') { '_x86' } else { '' }
           New-Item -ItemType Directory -Force native\build | Out-Null
-          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent${suffix}.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib
+          cl /nologo /LD /O2 /W4 /WX /wd4996 /DUNICODE /D_UNICODE native\agent.c native\superinject_json.c /Fe:native\build\SuperInjectAgent${suffix}.dll /link ws2_32.lib advapi32.lib shell32.lib user32.lib dbghelp.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Get-Item native\build\SuperInjectAgent${suffix}.dll
 

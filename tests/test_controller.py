@@ -341,3 +341,150 @@ def test_resources_converts_dib_dump(stub_winapi, tmp_path, monkeypatch):
     assert Path(item["path"]).name == "res_100_1.bmp"
     assert Path(item["path"]).read_bytes()[:2] == b"BM"
     assert item["dump"] == str(dib)
+
+
+# ----------------------------------------------------------- 事件路由
+
+def test_event_callback_and_list(stub_winapi):
+    """DLL 推上来的事件要进 ``_events`` 列表并触发 ``on_event`` 回调。"""
+    import threading
+
+    from superinject import controller as ctl_mod
+    c = ctl_mod.Controller.__new__(ctl_mod.Controller)
+    c.server = ipc_server_stub()
+    c._lock = threading.Lock()
+    c._injected = {}
+    c._frozen = set()
+    c._change_cb = None
+    c._events = []
+    c._event_seq = 0
+    c._event_cb = None
+    seen: list[dict] = []
+    c.on_event(lambda evt: seen.append(evt))
+    c._on_event(4321, {"type": "event:crash",
+                      "path": "C:/tmp/x.dmp",
+                      "reason": "AV",
+                      "address": "0x00007FF6ABCD"})
+    assert len(seen) == 1
+    assert seen[0]["pid"] == 4321
+    assert seen[0]["type"] == "event:crash"
+    assert seen[0]["reason"] == "AV"
+    # 列表查询：按 pid 过滤 + 按 name 过滤 + clear
+    items = c.list_events(pid=4321)
+    assert len(items) == 1 and items[0]["path"] == "C:/tmp/x.dmp"
+    c._on_event(4322, {"type": "event:patch",
+                       "name": "patched",
+                       "rva": 0x1000})
+    only_patch = c.list_events(name="patch")
+    assert len(only_patch) == 1 and only_patch[0]["pid"] == 4322
+    c.list_events(clear=True)
+    assert c.list_events() == []
+
+
+def ipc_server_stub():
+    """只暴露 ``on_event`` 属性，其他方法假装在场的最小 server 占位。
+
+    cast 到 ``Any`` 是因为 SimpleNamespace 不是 AgentServer 类型 —— 这只是
+    单测里的轻量替身，不需要拉起真 socket。
+    """
+    from types import SimpleNamespace
+    obj = SimpleNamespace(on_attach=None, on_detach=None,
+                          is_attached=lambda pid: False,
+                          attached_pids=lambda: set())
+    return obj  # type: ignore[return-value]
+
+
+# ----------------------------------------------------------- 扫描 dump
+
+def test_detach_synthesizes_crash_events(stub_winapi, tmp_path, monkeypatch):
+    """目标进程断开后，dump 目录里新出现的 .dmp 应被合成 event:crash。
+    attach 时记录的"水位线"过滤掉 attach 之前已经存在的旧 dump。
+    """
+    # 把 ipc.work_dir 指到 tmp_path/SuperInject
+    base = tmp_path / "SuperInject"
+    pid_dir = base / "7777"
+    pid_dir.mkdir(parents=True)
+
+    import threading
+
+    from superinject import controller as ctl_mod
+    from superinject import ipc as ipc_mod
+
+    monkeypatch.setattr(ipc_mod, "work_dir", lambda: base)
+    monkeypatch.setattr(ctl_mod.ipc, "work_dir", lambda: base)
+
+    c = ctl_mod.Controller.__new__(ctl_mod.Controller)
+    c.server = ipc_server_stub()
+    c._lock = threading.Lock()
+    c._injected = {}
+    c._frozen = set()
+    c._change_cb = None
+    c._events = []
+    c._event_seq = 0
+    c._event_cb = None
+    c._seen_dump_mtime = {}
+
+    seen: list[dict] = []
+    c.on_event(lambda e: seen.append(e))
+
+    # attach 前先放一个旧 dump（mtime 较早），应该被过滤掉
+    old = pid_dir / "dump-old.dmp"
+    old.write_bytes(b"\x00" * 128)
+    # 把它 mtime 调到很早
+    import os as _os
+    _os.utime(old, (1_000_000, 1_000_000))
+    # attach 时设水位线 = 最大 mtime = 1_000_000
+    c._on_attach(7777, {"image": "fake.exe"})
+
+    # detach 之前再放两个新 dump：应被合成
+    new1 = pid_dir / "dump-1.dmp"
+    new1.write_bytes(b"X" * 256)
+    new2 = pid_dir / "dump-2.dmp"
+    new2.write_bytes(b"Y" * 512)
+    # 写 sidecar
+    (pid_dir / "dump-1.dmp.json").write_text(
+        '{"pid":7777,"tid":42,"reason":"ACCESS_VIOLATION","code":3221225477,'
+        '"address":"0x00007FF6ABCD","flags":0,"tick":1000,"dump":"<d>"}',
+        encoding="utf-8")
+
+    c._on_detach(7777)
+
+    only_crash = [e for e in c.list_events() if e.get("type") == "event:crash"]
+    assert len(only_crash) == 2, (c.list_events(), only_crash)
+    # 排序不固定；sidecar 只在 dump-1 上有，dump-2 reason 应为空字符串兜底
+    by_path = {e["path"]: e for e in only_crash}
+    assert by_path[str(new1)]["reason"] == "ACCESS_VIOLATION"
+    assert by_path[str(new1)]["address"] == "0x00007FF6ABCD"
+    assert by_path[str(new1)]["tid"] == 42
+    assert by_path[str(new2)]["reason"] == ""   # 兜底
+    # on_event 回调也是两条
+    assert len([e for e in seen if e["type"] == "event:crash"]) == 2
+
+
+def test_detach_no_new_dump_stays_quiet(stub_winapi, tmp_path, monkeypatch):
+    """水位线之后没有新 dump → 不应合成 event。"""
+    import threading
+
+    from superinject import controller as ctl_mod
+    from superinject import ipc as ipc_mod
+    base = tmp_path / "SuperInject"
+    pid_dir = base / "8888"
+    pid_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(ipc_mod, "work_dir", lambda: base)
+    monkeypatch.setattr(ctl_mod.ipc, "work_dir", lambda: base)
+
+    c = ctl_mod.Controller.__new__(ctl_mod.Controller)
+    c.server = ipc_server_stub()
+    c._lock = threading.Lock()
+    c._injected = {}
+    c._frozen = set()
+    c._change_cb = None
+    c._events = []
+    c._event_seq = 0
+    c._event_cb = None
+    c._seen_dump_mtime = {}
+
+    c._on_attach(8888, {"image": "fake.exe"})
+    c._on_detach(8888)
+    assert c.list_events() == []

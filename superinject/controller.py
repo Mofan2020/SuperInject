@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import threading
@@ -52,10 +53,19 @@ class Controller:
             self.dll_path = dll_manager.target_dll_path()
         self.server.on_attach = self._on_attach
         self.server.on_detach = self._on_detach
+        self.server.on_event = self._on_event
         self._lock = threading.Lock()
         self._injected: Dict[int, dict] = {}
         self._frozen: set[int] = set()
         self._change_cb: Optional[Callable[[], None]] = None
+        # 注入端主动推到控制器的事件（例如崩溃转储路径）。
+        # key 是 (pid, seq)，seq 是该 pid 下递增的事件序号（防止重复合并）。
+        self._events: List[dict] = []
+        self._event_seq = 0
+        self._event_cb: Optional[Callable[[dict], None]] = None
+        # 每个已注入 PID 上次看到崩溃转储文件的最大 mtime，用于过滤掉
+        # 之前 attach 期间已经存在但没被消费的旧 dump。pid -> mtime (seconds)。
+        self._seen_dump_mtime: Dict[int, float] = {}
 
     # ---------------------------------------------------------- 事件
 
@@ -63,10 +73,142 @@ class Controller:
         with self._lock:
             self._injected[pid] = dict(info)
         log.info("已连接注入端 pid=%s %s", pid, info.get("image"))
+        # attach 时建一个"水位线"：之后只有在 dump mtime 大于它时才算新崩溃。
+        # 这避免了重连到同一进程后立刻把历史旧 dump 当成新事件往队列灌。
+        try:
+            existing = max(
+                (p.stat().st_mtime
+                 for p in (ipc.work_dir() / str(pid)).glob("dump-*.dmp")),
+                default=0.0,
+            )
+        except OSError:
+            existing = 0.0
+        with self._lock:
+            self._seen_dump_mtime[pid] = existing
 
     def _on_detach(self, pid: int) -> None:
         with self._lock:
             self._injected.pop(pid, None)
+            last_seen = self._seen_dump_mtime.pop(pid, 0.0)
+            cb = self._event_cb
+        log.info("注入端断开 pid=%s", pid)
+        # detach 后扫描目标进程的 dump 目录，把"水位线之后"的新文件转成事件。
+        # DLL 卡死 / 触发 minidump 后控制通道会断；这条通路让用户即使没盯着
+        # UI，下次跑 ``events`` 也照样看得到 dump 在哪里。
+        events: List[dict] = []
+        try:
+            d = ipc.work_dir() / str(pid)
+            if d.is_dir():
+                for dmp in d.glob("dump-*.dmp"):
+                    try:
+                        st = dmp.stat()
+                    except OSError:
+                        continue
+                    if st.st_mtime <= last_seen + 0.0001:
+                        continue
+                    sidecar = dmp.with_suffix(".dmp.json")
+                    meta: dict = {}
+                    if sidecar.exists():
+                        try:
+                            meta = json.loads(
+                                sidecar.read_text(encoding="utf-8",
+                                                  errors="replace"))
+                        except (OSError, ValueError):
+                            meta = {}
+                    events.append({
+                        "type": "event:crash",
+                        "path": str(dmp),
+                        "size": int(st.st_size),
+                        "mtime_ms": int(st.st_mtime * 1000),
+                        "reason": meta.get("reason", ""),
+                        "code": meta.get("code", 0),
+                        "address": meta.get("address", ""),
+                        "tid": meta.get("tid", 0),
+                        "tick": meta.get("tick", 0),
+                        "dump": str(dmp),
+                    })
+        except OSError as exc:
+            log.debug("扫描崩溃转储目录失败 pid=%s err=%s", pid, exc)
+        if events:
+            self._append_synthetic_events(pid, events)
+            for e in events:
+                if cb:
+                    try:
+                        cb(e)
+                    except Exception:  # pragma: no cover
+                        log.exception("crash 事件回调失败")
+
+    def _append_synthetic_events(self, pid: int, items: List[dict]) -> None:
+        """把由控制器侧扫描得到的合成事件塞进 ``_events``。"""
+        with self._lock:
+            for it in items:
+                self._event_seq += 1
+                evt = {
+                    "pid": pid,
+                    "seq": self._event_seq,
+                    "ts_ms": ipc.now_ms(),
+                    "type": it.get("type", ""),
+                }
+                for k, v in it.items():
+                    if k in {"id", "type"}:
+                        continue
+                    evt[k] = v
+                self._events.append(evt)
+        for e in items:
+            log.info("目标进程 %s 崩溃: pid=%s path=%s", e.get("reason", "?"),
+                     pid, e.get("path"))
+
+    def _on_event(self, pid: int, msg: dict) -> None:
+        """DLL 主动推上来的事件（不期望响应）。把它们存进事件流，并
+        触发前端回调。message 顶层 ``type`` 形如 ``event:crash``，展开
+        后存为 ``name=crash`` 便于检索。
+        """
+        with self._lock:
+            self._event_seq += 1
+            seq = self._event_seq
+            evt = {
+                "pid": pid,
+                "seq": seq,
+                "ts_ms": ipc.now_ms(),
+                "type": msg.get("type", ""),
+            }
+            for k, v in msg.items():
+                if k in {"id", "type"}:
+                    continue
+                evt[k] = v
+            self._events.append(evt)
+            cb = self._event_cb
+        log.info("注入端事件 pid=%s type=%s key=%s",
+                 pid, evt["type"], evt.get("path") or evt.get("name"))
+        if cb:
+            try:
+                cb(evt)
+            except Exception:  # pragma: no cover
+                log.exception("事件回调失败")
+
+    def on_event(self, callback: Optional[Callable[[dict], None]]) -> None:
+        """订阅注入端事件（崩溃转储 / patch 落地等）。"""
+        self._event_cb = callback
+
+    def list_events(self, pid: Optional[int] = None, name: Optional[str] = None,
+                    clear: bool = False) -> List[dict]:
+        """读取（可选清除）已收到的事件列表。
+
+        - ``pid`` 不为空时只保留该 PID；
+        - ``name`` 不为空时按事件名子串过滤（事件 ``type`` 形如
+          ``event:crash``，匹配时取 ``:`` 后的部分或整串子串）。
+        """
+        with self._lock:
+            items = list(self._events)
+            if clear:
+                self._events.clear()
+        if pid is not None:
+            items = [e for e in items if e.get("pid") == int(pid)]
+        if name:
+            n = str(name).lower()
+            items = [e for e in items if n in str(e.get("type", "")).lower()
+                     or n in str(e.get("name", "")).lower()]
+        return items
 
     def on_change(self, callback: Optional[Callable[[], None]]) -> None:
         self._change_cb = callback

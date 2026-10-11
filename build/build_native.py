@@ -83,7 +83,7 @@ def build_mingw(*, want_x86: bool) -> bool:
         "-lmingw32", "-static-libgcc",
         *[str(s) for s in SOURCES],
         "-o", str(out),
-        "-lws2_32", "-ladvapi32", "-lshell32", "-luser32",
+        "-lws2_32", "-ladvapi32", "-lshell32", "-luser32", "-ldbghelp",
     ]
     print(f"[build_native] MinGW ({'x86' if want_x86 else 'x64'}):", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -101,7 +101,7 @@ def build_msvc(*, want_x86: bool) -> bool:
         "cl", "/nologo", "/LD", "/O2", "/W3", "/DUNICODE", "/D_UNICODE",
         *[str(s) for s in SOURCES],
         f"/Fe:{out}", "/link", "ws2_32.lib", "advapi32.lib",
-        "shell32.lib", "user32.lib",
+        "shell32.lib", "user32.lib", "dbghelp.lib",
     ]
     print(f"[build_native] MSVC ({'x86' if want_x86 else 'x64'}):", " ".join(cmd))
     subprocess.run(cmd, check=True)

@@ -311,3 +311,107 @@ def test_mem_search(monkeypatch, capsys):
     rc = cli.run(["-c", "-y", "--json",
                   "mem-search", "--pid", "100", "--pattern", "4D 5A ?? ??"])
     assert rc == 0
+
+
+# ----------------------------------------------------------- events / dumps
+
+def test_events_lists_in_memory_queue(monkeypatch, capsys):
+    """``events`` 子命令应读出控制器 ``list_events`` 的结果，--json 可读。"""
+    fake_evts = [
+        {"pid": 100, "type": "event:crash", "path": "x.dmp", "reason": "AV",
+         "seq": 1, "ts_ms": 1700000000000},
+        {"pid": 100, "type": "event:patch", "name": "patched", "seq": 2,
+         "ts_ms": 1700000001000},
+    ]
+
+    class FakeCtrl:
+        def __init__(self):
+            self.calls = []
+
+        def list_events(self, pid=None, name=None, clear=False):
+            self.calls.append((pid, name, clear))
+            return fake_evts
+
+    ctrl = FakeCtrl()
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: ctrl)
+    rc = cli.run(["-c", "-y", "--json", "events",
+                  "--pid", "100", "--name", "crash"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "events"
+    assert data["count"] == 2
+    # pid 与 name 被传到 list_events
+    assert ctrl.calls and ctrl.calls[0][:2] == (100, "crash")
+
+
+def test_dumps_scans_work_dir(monkeypatch, tmp_path, capsys):
+    """``dumps`` 应列出 ``%TEMP%/SuperInject/<pid>/dump-*.dmp``，无 PID 时
+    枚举所有 PID 子目录。"""
+    # 替换 ipc.work_dir 指向 tmp_path/SuperInject
+    base = tmp_path / "SuperInject"
+    (base / "1234").mkdir(parents=True)
+    (base / "1234" / "dump-1.dmp").write_bytes(b"\x4D\x44\x4D\x50" + b"\x00" * 100)
+    (base / "1234" / "dump-2.dmp").write_bytes(b"\x4D\x44\x4D\x50" + b"\x00" * 200)
+    (base / "9999").mkdir(parents=True)
+    (base / "9999" / "dump-x.dmp").write_bytes(b"x" * 50)
+
+    opened_via = []
+
+    class FakeCtrl:
+        def open_path(self, p):
+            opened_via.append(p)
+            return True
+
+    monkeypatch.setattr(cli, "ipc", _make_fake_ipc(base))
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "dumps"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "dumps"
+    # 两个 PID 各有文件，按 mtime 倒序：先 dump-2 再 dump-1，再 dump-x。
+    paths = [it["path"] for it in data["items"]]
+    assert len(paths) == 3
+    assert any("1234/dump-1.dmp" in p for p in paths)
+    assert any("1234/dump-2.dmp" in p for p in paths)
+    assert any("9999/dump-x.dmp" in p for p in paths)
+
+
+def _make_fake_ipc(base):
+    """一个假装是 ``ipc`` 模块的对象。用普通类显式声明 staticmethod，
+    避免 SimpleNamespace 把 lambda 自动转成 bound method 让 ``work_dir()`` 多收一个 self。
+    """
+    class _I:
+        pass
+    _I.work_dir = staticmethod(lambda: base)
+    _I.parse_int = staticmethod(lambda s, d=0: int(str(s), 0))
+    _I.now_ms = staticmethod(lambda: 0)
+    _I.encode_frame = staticmethod(lambda d: b"")
+    _I.decode_frames = staticmethod(lambda b: ([], bytearray()))
+    return _I()
+
+
+def test_dumps_open_picks_first(monkeypatch, tmp_path, capsys):
+    base = tmp_path / "SuperInject"
+    (base / "1234").mkdir(parents=True)
+    (base / "1234" / "dump-1.dmp").write_bytes(b"y" * 10)
+
+    opened_via = []
+
+    class FakeCtrl:
+        def open_path(self, p):
+            opened_via.append(p)
+            return True
+
+    monkeypatch.setattr(cli, "ipc", _make_fake_ipc(base))
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "dumps", "--open"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["opened"].endswith("dump-1.dmp")
+    assert opened_via and opened_via[0].endswith("dump-1.dmp")

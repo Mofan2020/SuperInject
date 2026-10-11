@@ -17,3 +17,4 @@ superinject/embedded/dll_payload.py
 build/SuperInject.spec
 SuperInject.spec
 ui-shots/
+.hermes/

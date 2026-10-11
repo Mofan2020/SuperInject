@@ -35,6 +35,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/*
+ * MiniDumpWriteDump 在 dbghelp.dll。System32 自带，链接 dbghelp.lib 即可。
+ * MSVC 里 ``#pragma comment(lib, ...)`` 由 cl 解释；MinGW 走 -ldbghelp（在
+ * build_native.py + .github/workflows 的 cl 命令里都加了）。
+ */
+#include <dbghelp.h>
 
 #include "superinject_json.h"
 
@@ -1121,6 +1127,200 @@ static int mem_write_bytes(void *target, const unsigned char *bytes, size_t n,
     return 1;
 }
 
+/* ------------------------- 崩溃转储 ------------------------- */
+
+/*
+ * 目标进程崩溃时，自动把堆栈落盘到 %TEMP%\SuperInject\<pid>\dump-<tick>.dmp，
+ * 同时写一份 .json sidecar 记录 reason / code / address / tid / 时间戳，便于
+ * 控制端侧扫到后回放到事件队列：
+ *
+ *   %TEMP%\SuperInject\<pid>\dump-12345.dmp
+ *   %TEMP%\SuperInject\<pid>\dump-12345.dmp.json
+ *
+ * 协议上不需要 DLL 在崩溃后还能回话 —— 控制器会监听 on_detach，主动扫目录
+ * 把新文件转成 ``event:crash`` 推给上层（见 superinject/controller.py）。
+ * 因此这里的捕获要求是：
+ *
+ *   1. 写盘成功率高（DLL 卡死场景，写盘不能在加载器锁里）；
+ *   2. 进程退出时尽量让系统在文件中看到完整 minidump；
+ *   3. 不依赖 socket / 不重新发任何控制消息（已挂进程可能都连不上）。
+ *
+ * 用 VEH + SEH 双层覆盖：VEH 比 SEH 早被通知，能在栈溢出 / 内层已 SEH 被吃
+ * 时也拿到；命中后写完盘 + TerminateProcess 自杀（让 Windows 显示"已停止
+ * 工作"对话框，跳过最终异常 handler，因为我们的 handler 已经代表它把信息留住了）。
+ */
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_seh = NULL;
+static PVOID                       g_veh        = NULL;
+
+static const char *si_exception_name(DWORD code)
+{
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:    return "ACCESS_VIOLATION";
+    case EXCEPTION_STACK_OVERFLOW:      return "STACK_OVERFLOW";
+    case EXCEPTION_ILLEGAL_INSTRUCTION: return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:  return "DIVIDE_BY_ZERO";
+    case EXCEPTION_BREAKPOINT:          return "BREAKPOINT";
+    case EXCEPTION_GUARD_PAGE:          return "GUARD_PAGE";
+    case EXCEPTION_PRIV_INSTRUCTION:    return "PRIV_INSTRUCTION";
+    case EXCEPTION_INVALID_HANDLE:      return "INVALID_HANDLE";
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "NONCONTINUABLE";
+    default:                            return "EXCEPTION";
+    }
+}
+
+/* 写 %TEMP%\SuperInject\<pid>\dump-<tick>.dmp + 同名 .json sidecar。返回 0 失败 1 成功。*/
+static int write_dump_with_meta(EXCEPTION_POINTERS *ep)
+{
+    WCHAR           tmp[MAX_PATH];
+    WCHAR           dir[MAX_PATH];
+    WCHAR           dmp[MAX_PATH];
+    WCHAR           sidecar[MAX_PATH];
+    DWORD           tick = GetTickCount();
+    HANDLE          file = INVALID_HANDLE_VALUE;
+    BOOL            ok = FALSE;
+    DWORD           written = 0;
+    char            buf[512];
+    int             n;
+    FILE           *fp = NULL;
+
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return 0;
+    lstrcpynW(dir, tmp, MAX_PATH);
+    {
+        WCHAR sub[64];
+        swprintf(sub, 64, L"SuperInject\\%lu", (unsigned long)g_pid);
+        lstrcatW(dir, sub);
+    }
+    make_dirs(dir);
+
+    lstrcpynW(dmp, dir, MAX_PATH);
+    swprintf(dmp + lstrlenW(dmp), MAX_PATH - lstrlenW(dmp),
+             L"\\dump-%lu.dmp", (unsigned long)tick);
+    lstrcpynW(sidecar, dmp, MAX_PATH);
+    lstrcatW(sidecar, L".json");
+
+    file = CreateFileW(dmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    /* DbgHelp.dll 已通过链接隐式加载；同时显式 LoadLibrary 一次以保留引用计数，
+     * 否则某些极简进程（如 loadlibrary 测试样例）会在 DllMain 里碰不到 dbghelp。 */
+    {
+        HMODULE h = LoadLibraryW(L"dbghelp.dll");
+        if (h) {
+            typedef BOOL (WINAPI *MiniDumpWriteDump_t)(
+                HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                PMINIDUMP_EXCEPTION_INFORMATION,
+                PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+            MiniDumpWriteDump_t fn = (MiniDumpWriteDump_t)
+                GetProcAddress(h, "MiniDumpWriteDump");
+            if (fn) {
+                MINIDUMP_EXCEPTION_INFORMATION mei;
+                mei.ThreadId          = GetCurrentThreadId();
+                mei.ExceptionPointers = ep;
+                mei.ClientPointers    = FALSE;
+                ok = fn(GetCurrentProcess(), g_pid, file,
+                        MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory
+                                      | MiniDumpWithThreadInfo),
+                        &mei, NULL, NULL) ? TRUE : FALSE;
+            }
+            FreeLibrary(h);
+        }
+    }
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(dmp);
+        return 0;
+    }
+
+    /* sidecar 用 UTF-8 写（与 .dmp 文件名同名加 .json）。 */
+    {
+        char  dmp_utf8[MAX_PATH];
+        char  sidecar_utf8[MAX_PATH * 2];
+        utf8_path(dmp, dmp_utf8, MAX_PATH);
+        snprintf(sidecar_utf8, sizeof(sidecar_utf8), "%s.json", dmp_utf8);
+        fp = fopen(sidecar_utf8, "w");
+    }
+    if (fp) {
+        const char *reason = si_exception_name(ep ? ep->ExceptionRecord->ExceptionCode : 0);
+        DWORD code   = ep ? ep->ExceptionRecord->ExceptionCode : 0;
+        ULONG64 addr = ep ? (ULONG64)ep->ExceptionRecord->ExceptionAddress : 0;
+        DWORD flags  = ep ? ep->ExceptionRecord->ExceptionFlags : 0;
+        DWORD tid    = GetCurrentThreadId();
+        DWORD pid    = g_pid;
+        n = snprintf(buf, sizeof(buf),
+                     "{\"pid\":%lu,\"tid\":%lu,\"reason\":\"%s\","
+                     "\"code\":%lu,\"address\":\"0x%llX\",\"flags\":%lu,"
+                     "\"tick\":%lu,\"dump\":\"%s\"}\n",
+                     (unsigned long)pid, (unsigned long)tid, reason,
+                     (unsigned long)code,
+                     (unsigned long long)addr,
+                     (unsigned long)flags,
+                     (unsigned long)tick,
+                     "<dump>; controller finds this file by basename>");
+        (void)n;  /* sidecar 仅记录元数据，控制器侧以 sidecar 为准 */
+        fputs(buf, fp);
+        fclose(fp);
+    } else {
+        /* 写 sidecar 失败但 dump 写好了 —— 控制器会按文件名兜底补一份元数据。 */
+    }
+
+    log_msg("崩溃已写盘: %ls reason=%s code=0x%lX",
+            dmp, si_exception_name(ep ? ep->ExceptionRecord->ExceptionCode : 0),
+            ep ? (unsigned long)ep->ExceptionRecord->ExceptionCode : 0UL);
+    return 1;
+}
+
+/* 只过滤异常来自我们"内部无害"的几个 code，否则一律视为真崩溃。*/
+static int si_should_capture(EXCEPTION_POINTERS *ep)
+{
+    if (!ep || !ep->ExceptionRecord) return 1;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    /* 调试器主动 INT3（我们自己也没在用，挡住） */
+    if (code == EXCEPTION_BREAKPOINT) return 0;
+    /* RaiseException(EXCEPTION_NONCONTINUABLE) 这类标记位，不是真崩溃。*/
+    if (ep->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return 0;
+    return 1;
+}
+
+static LONG WINAPI agent_seh_filter(EXCEPTION_POINTERS *ep)
+{
+    if (!si_should_capture(ep)) return EXCEPTION_CONTINUE_SEARCH;
+    (void)write_dump_with_meta(ep);
+    /* 让 Windows 继续走默认流程 → 杀进程；dump + sidecar 已留好。 */
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static LONG WINAPI agent_veh_filter(EXCEPTION_POINTERS *ep)
+{
+    if (!si_should_capture(ep)) return EXCEPTION_CONTINUE_SEARCH;
+    (void)write_dump_with_meta(ep);
+    /* VEH 的返回：让 SEH 接手我们的 handler；如果 SEH 没装，Windows 会兜底。
+     * 注意：栈溢出时 VEH 在很有限的栈上跑，不要在这里分配大块内存。 */
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void agent_install_crash_handlers(void)
+{
+    if (g_veh == NULL) {
+        g_veh = AddVectoredExceptionHandler(1, &agent_veh_filter);
+    }
+    if (g_prev_seh == NULL) {
+        g_prev_seh = SetUnhandledExceptionFilter(&agent_seh_filter);
+    }
+}
+
+static void agent_uninstall_crash_handlers(void)
+{
+    if (g_veh) {
+        RemoveVectoredExceptionHandler(g_veh);
+        g_veh = NULL;
+    }
+    if (g_prev_seh) {
+        SetUnhandledExceptionFilter(g_prev_seh);
+        g_prev_seh = NULL;
+    }
+}
+
 /* ------------------------- 指令分发 ------------------------- */
 
 static void agent_handle(const char *text)
@@ -1344,6 +1544,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_module = (HMODULE)inst;
         g_pid    = GetCurrentProcessId();
         DisableThreadLibraryCalls(inst);
+        /* 装崩溃转储 handler —— 这一步不能在加载器锁里做大型分配，
+         * SetUnhandledExceptionFilter / AddVectoredExceptionHandler 自身
+         * 是轻量调用，副作用在目标进程触发异常时才真正发生，所以这里
+         * 直接装没问题。 */
+        agent_install_crash_handlers();
         /*
          * 在线程里建连、收发（不在 DllMain 里做 I/O）：
          * DllMain 持着加载器锁，任何可能触发模块加载的调用都可能卡住。
@@ -1356,6 +1561,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             closesocket(g_sock);
             g_sock = INVALID_SOCKET;
         }
+        agent_uninstall_crash_handlers();
         break;
     default:
         break;

@@ -40,10 +40,11 @@ import json
 import logging
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Any, List, Optional
 
-from . import dll_manager, winapi
+from . import dll_manager, ipc, winapi
 from .console import safe_print
 from .controller import Controller
 from .version import APP_NAME
@@ -229,6 +230,22 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp = sub.add_parser("open", help="资源管理器定位文件")
     sp.add_argument("path")
 
+    sp = sub.add_parser("events", help="读取注入端事件（崩溃转储 / patch 落地）")
+    sp.add_argument("--pid", type=int, action="append", default=[],
+                    help="按 PID 过滤")
+    sp.add_argument("--name", default="",
+                    help="按事件名子串过滤（如 crash / patch）")
+    sp.add_argument("--follow", action="store_true",
+                    help="持续读取新事件直到 Ctrl-C")
+    sp.add_argument("--clear", action="store_true",
+                    help="读取后清空事件队列")
+
+    sp = sub.add_parser("dumps", help="列出已落盘的崩溃转储文件")
+    sp.add_argument("--pid", type=int, action="append", default=[],
+                    help="按 PID 过滤")
+    sp.add_argument("--open", action="store_true",
+                    help="在资源管理器中打开目录")
+
     sp = sub.add_parser("status", help="控制器状态")
     sp = sub.add_parser("dll", help="DLL 自校验")
     sp.add_argument("--force", action="store_true")
@@ -348,6 +365,98 @@ def _ensure_controller(dll_path: Optional[Path] = None) -> Controller:
     if dll_path is not None:
         c.dll_path = dll_path
     return c
+
+
+def _dump_files_for(pid: int) -> List[Path]:
+    """被注入目标 ``%TEMP%\\SuperInject\\<pid>\\dump-*.dmp``。
+
+    跨平台都能列（macOS 上是 ``/tmp/...`` 等），但只在 Windows 上
+    才有真实数据 —— 调用方负责提示「仅 Windows」。
+    """
+    try:
+        d = ipc.work_dir() / str(int(pid))
+    except Exception:
+        return []
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("dump-*.dmp"), key=lambda p: p.stat().st_mtime,
+                  reverse=True)
+
+
+def _dumps_summary(pids: List[int]) -> List[dict]:
+    out: List[dict] = []
+    for pid in pids:
+        for p in _dump_files_for(pid):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append({
+                "pid": pid,
+                "path": str(p),
+                "size": st.st_size,
+                "mtime": int(st.st_mtime * 1000),
+            })
+    return out
+
+
+def _dispatch_events(args) -> Any:
+    """``events`` 子命令：读取控制器事件队列，可选 ``--follow`` 持续轮询。"""
+    pids = _normalize_pids(args) if args.pid else []
+    name = (getattr(args, "name", "") or "").strip()
+
+    def _gather() -> List[dict]:
+        ctrl = _ensure_controller()
+        if pids:
+            all_evts: List[dict] = []
+            for pid in pids:
+                all_evts.extend(
+                    ctrl.list_events(pid=pid, name=name or None))
+            return all_evts
+        return ctrl.list_events(name=name or None)
+
+    follow = bool(getattr(args, "follow", False))
+    if not follow:
+        evts = _gather()
+        if getattr(args, "clear", False):
+            _ensure_controller().list_events(clear=True)
+        return {"ok": True, "kind": "events", "count": len(evts), "items": evts}
+
+    out: List[dict] = []
+    try:
+        while True:
+            evts = _gather()
+            if getattr(args, "clear", False):
+                _ensure_controller().list_events(clear=True)
+            for e in evts:
+                if e not in out:
+                    out.append(e)
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+    return {"ok": True, "kind": "events", "count": len(out),
+            "items": out, "truncated": False}
+
+
+def _dispatch_dumps(args) -> Any:
+    """``dumps`` 子命令：列出落盘的 minidump 文件，可选 ``--open`` 弹目录。"""
+    pids = _normalize_pids(args) if args.pid else []
+    if not pids:
+        # 没指定 PID 时枚举所有存在的 PID 子目录
+        base = ipc.work_dir()
+        pids = []
+        if base.is_dir():
+            for entry in sorted(base.iterdir()):
+                if entry.is_dir() and entry.name.isdigit():
+                    pids.append(int(entry.name))
+    items = _dumps_summary(pids)
+    opened = ""
+    if getattr(args, "open", False) and items:
+        ctrl = _ensure_controller()
+        opened = str(items[0]["path"])
+        ctrl.open_path(opened)
+    return {"ok": True, "kind": "dumps", "count": len(items),
+            "items": items, "opened": opened}
 
 
 def _resolve_dll_for_pid(ctrl: Controller, pid: int, arch: str = "") -> tuple[Optional[Path], str]:
@@ -525,6 +634,11 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
     if sub == "open":
         ok = _ensure_controller().open_path(args.path)
         return {"ok": ok, "kind": "open", "path": args.path}
+
+    if sub == "events":
+        return _dispatch_events(args)
+    if sub == "dumps":
+        return _dispatch_dumps(args)
 
     if sub == "status":
         return _ensure_controller().status()

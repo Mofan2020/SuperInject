@@ -305,3 +305,43 @@ def test_hello_json_is_well_formed(server, work_dir):
     assert agent.hello_sent
     assert json.loads(json.dumps({"type": "hello"}))["type"] == "hello"
     agent.close()
+
+
+def test_event_route_does_not_consume_waiter(server, work_dir):
+    """DLL 主动推的 ``event:*`` 帧必须送到 on_event，而不是挡在 id=0 上
+    把任何等待者清空。这是给崩溃转储 / 内存告警 / patch 落地通知用的通路。
+    """
+    pid = 4200
+    events: list[dict] = []
+
+    def on_event(p: int, msg: dict) -> None:
+        events.append({"pid": p, **msg})
+
+    server.on_event = on_event
+
+    agent = _attach(server, work_dir, pid)
+    # hello 已经发过了；现在直接借 agent 主动推一帧事件。
+    agent.send({"type": "event:crash", "path": "x.dmp", "reason": "AV"})
+    # 等控制器读完 + 分发
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not events:
+        time.sleep(0.02)
+    assert events, "on_event 必须被调一次"
+    assert events[0]["pid"] == pid
+    assert events[0]["type"] == "event:crash"
+    assert events[0]["path"] == "x.dmp"
+
+    # 同时验证事件帧不会污染 id=0 的 waiter 通路：
+    # （当前协议里没有 id=0 的请求，所以只需要一个正常的请求也能往返回。
+    # 真要双验：另起一个 waiter 拿 "id=0" 应不命中。）
+    agent.serve()
+    resp = server.request(pid, {"type": "ping"}, timeout=5.0)
+    assert resp.get("ok") is True
+
+    # 在 _read_loop 之外、事件帧已经处理完之后再核一遍：
+    # 显式断言 waiter map 里没有「id=0」条目（说明事件没有副作用地留痕）。
+    with server._lock:
+        zero_waiters = [k for k in server._waiters if k == 0]
+    assert not zero_waiters, "事件帧不应创建 id=0 的 waiter"
+
+    agent.close()
