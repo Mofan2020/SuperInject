@@ -438,6 +438,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 读 docs/release-notes.md 作为 Release 正文，所以要先签出仓库。
+      # 正文放在文件里而不是写死在 workflow 里 —— 写死的话每次发版都容易忘记更新
+      # （本项目就发生过 v1.3.0 时正文还停在上一版内容）。
+      - uses: actions/checkout@v4
+      - name: 校验 Release 正文文件存在且非空
+        run: test -s docs/release-notes.md
       - uses: actions/download-artifact@v4
         with:
           name: SuperInject-win-x64
@@ -450,29 +456,4 @@ jobs:
           # 验证通过后手动 ``gh release edit vX.Y.Z --prerelease=false`` 升正式版。
           prerelease: true
           generate_release_notes: true
-          body: |
-            ## 本版新增
-
-            - **崩溃转储**：DLL 在 `DllMain` 注册未处理异常过滤器 + 向量化异常处理器，目标进程崩溃时把堆栈写到 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp`，并落同名 `.json` 元数据。控制器在通道断开后扫描目录合成 `event:crash`，CLI 用 `events --follow` 持续监听、`dumps --open` 直接打开目录。
-            - **事件流**：被注入进程可主动推 `type=event:*` 帧（不参与命令响应匹配），崩溃转储等通知都走这条通路。
-            - **模块符号解析**：`info` 命令可附每模块导出表，新增 `exports` 命令按基址或模块名查单个模块，自写 PE 解析不依赖 dbghelp。`superinject.symbols` 提供 `module+0x123` / `module!symbol+0x42` 反查。
-            - **线程级冻结**：`threads` 列目标进程所有线程（含 tid / 状态 / WaitReason / SuspendCount），`thread-suspend` / `thread-resume` 单独挂起一个线程。
-            - **代码 patch (trampoline)**：`patch-inject` 在目标地址写 5 字节跳转到一个 RWX 跳板执行你的 shellcode 然后跳回，`patch-list` / `patch-revert` / `patch-clear` 管理已注入 patch（上限 32 条/进程）。
-            - **CLI 新增 10 个子命令**：`events` / `dumps` / `exports` / `threads` / `thread-suspend` / `thread-resume` / `patch-inject` / `patch-list` / `patch-revert` / `patch-clear`。
-
-            ## ⚠️ 使用前必读
-
-            **本工具仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！**
-
-            - 只能用于你自己拥有、或已获得明确授权的目标进程；
-            - 严禁用于绕过软件的授权 / 保护机制；
-            - 未经授权对第三方进程注入 DLL 可能违反当地法律与服务条款，由此产生的一切后果由使用者自行承担。
-
-            ## 本版验证情况
-
-            本仓库 windows runner 上 MSVC 构建注入端 DLL，与 CI 集成测试是**同一份**。
-
-            - `pytest tests/test_integration_windows.py` 在 windows-latest 真实注入 `ping.exe`，覆盖注入 / 内存读写 / 冻结（含 SuspendCount 验证）/ 资源导出 / 卸载 / 重新注入 / 跨位数注入；
-            - `SuperInject.exe --self-test` 跑本页下载的打包产物；
-            - `info` 命令默认**不**附带导出表（避免对 cold-start 目标做 PE 解析触发保护崩溃），需要时显式传 `--exports-budget N`。
-
+          body_path: docs/release-notes.md

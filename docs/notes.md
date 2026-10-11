@@ -1070,3 +1070,39 @@ P6 之后，Agent 端配置仍要用户自己把 `--print-config` 的片段粘�
 * **只保证「不带 Windows 的 macOS/Linux/CI 上逻辑正确」**：真实的 Windows `%APPDATA%`
   路径解析、以及 Agent 端（Claude Desktop / Cursor）是否真的加载了新配置，仍需用户在
   目标机器上点一遍验证 —— CI 验不到这些。
+
+## 二十、v1.3.0 P8：发版正文改成读文件 + 加守卫
+
+收尾时发现一个会直接影响本次发版的问题：**Release 正文是硬编码在
+`.github/workflows/ci.yml` 里的**，而且内容还停在 v1.2.0。也就是说
+`v1.3.0` 的 tag 推上去，Release 页面挂的会是上一版的说明。
+
+根因不是「忘了改」，而是**机制错了**：正文写在 workflow 里，每次发版都要人
+记得同步，而这件事没有任何东西会提醒你。所以修法不是「这次记得改」，而是
+把正文挪出 workflow：
+
+* 新增 `docs/release-notes.md` 作为正文的**唯一来源**；
+* `release` job 改成 `body_path: docs/release-notes.md`，并在读它之前加
+  `actions/checkout@v4`（原来这个 job 只 download artifact，不签出仓库）；
+* `release` job 里加一道 `test -s docs/release-notes.md`，文件缺失或为空
+  直接让 job 失败，而不是发出一个空正文的 Release。
+
+再补一层本地就能拦住的守卫 —— `tests/test_repo_hygiene.py`（5 例）：
+
+| 用例 | 守什么 |
+| --- | --- |
+| 文件存在且非空 | 发版前提 |
+| 正文含免责声明 | 改写时不会顺手删掉使用边界 |
+| `ci.yml` 用 `body_path` 且**没有** inline `body: \|` | 防止有人把正文改回写死形态，再一次与文件分叉 |
+| `checkout` 出现在读 notes 之前 | 防止有人调整步骤顺序后 job 静默读不到文件 |
+| `prerelease: true` 仍在 | 防止「顺手」改成 false —— 升正式版应当用 `gh release edit` 手动做 |
+
+**负向验证**：把 `body_path` 改回 inline `body: \|`，`test_repo_hygiene.py`
+立刻红 2 条（`reads_body_from_file_not_inline` + `checks_out_before_reading_notes`）；
+恢复后 5 例全过。证明守卫不是摆设。
+
+### 20.1 本版发版正文的写法
+
+按对外文案的既定要求：简明、面向用户、只讲改了什么和怎么用；实现细节、
+commit hash、根因分析留在这个文件里。正文不改写技术内幕，也不放自证式的
+验证表格，只留一句说明哪些部分是机器验证过的、哪些需要用户真机确认。
