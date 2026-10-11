@@ -75,6 +75,10 @@ HELP_TEXT = """\
   mem-search --pid N --pattern HEX [--max N]
   mem-read --pid N --address 0xA --size N
   mem-write --pid N --address 0xA --hex "DE AD BE EF"
+  snapshot --pid N --name NAME [--region 0xA SIZE ...]
+  diff --pid N --a A --b B [--limit N]
+  snapshots --pid N
+  snapshot-delete --pid N --name NAME
   unload --pid N...
   terminate --pid N...
   open PATH
@@ -265,6 +269,27 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp.add_argument("--address", required=True,
                     help="起始地址（支持 0x 前缀与十进制）")
     sp.add_argument("--hex", required=True, help="写入字节的十六进制串")
+
+    sp = sub.add_parser("snapshot", help="拉一份目标进程内存快照（落盘 + 入索引）")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--name", required=True, help="快照名，缺省会报错")
+    sp.add_argument("--region", action="append", nargs=2, default=[],
+                    metavar=("BASE", "SIZE"),
+                    help="限定到某个区域（0xHEX SIZE），可重复；不传则全量")
+
+    sp = sub.add_parser("diff", help="对两个已存快照做 diff（head64 级）")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--a", required=True, dest="name_a", help="快照 A 名")
+    sp.add_argument("--b", required=True, dest="name_b", help="快照 B 名")
+    sp.add_argument("--limit", type=int, default=0,
+                    help="最多喂给 DLL 的前 N 个 page（0 = 全量）")
+
+    sp = sub.add_parser("snapshots", help="列出已落盘的快照")
+    sp.add_argument("--pid", type=int, required=True)
+
+    sp = sub.add_parser("snapshot-delete", help="删除一个已存快照")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--name", required=True)
 
     sp = sub.add_parser("open", help="资源管理器定位文件")
     sp.add_argument("path")
@@ -731,6 +756,26 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
         return _ensure_controller().mem_write(int(args.pid),
                                               parse_int(str(args.address)),
                                               str(args.hex))
+
+    if sub == "snapshot":
+        from .ipc import parse_int
+        regions = []
+        for base, size in (args.region or []):
+            regions.append({"base": parse_int(base), "size": parse_int(size)})
+        return _ensure_controller().snapshot(int(args.pid), str(args.name),
+                                             regions=regions)
+    if sub == "diff":
+        return _ensure_controller().diff(int(args.pid),
+                                         str(args.name_a), str(args.name_b),
+                                         limit=int(getattr(args, "limit", 0)))
+    if sub == "snapshots":
+        return {"ok": True, "kind": "snapshots",
+                "items": _ensure_controller().list_snapshots(int(args.pid))}
+    if sub == "snapshot-delete":
+        ok = _ensure_controller().delete_snapshot(int(args.pid),
+                                                  str(args.name))
+        return {"ok": ok, "kind": "snapshot-delete",
+                "name": str(args.name), "deleted": ok}
 
     if sub == "open":
         ok = _ensure_controller().open_path(args.path)

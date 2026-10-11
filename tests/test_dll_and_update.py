@@ -171,15 +171,18 @@ def test_fetch_latest_prefers_release_list(monkeypatch):
 
 def test_fetch_latest_skips_drafts_and_uses_prerelease(monkeypatch):
     """只有预发布版本时也要能发现更新（/releases/latest 这时会 404）。"""
+    # v1.3.0 已经是当前 __version__ 了 —— 拿一个足够新的未来 tag 才能让
+    # compare_version 返回 > 0；这条用例自 v1.3.0 起就被设计为「下次 bump 时
+    # 把这个数字往上挪一格」以保持相对新意。
     payload = [
         {"tag_name": "v9.9.9", "draft": True, "assets": []},
-        {"tag_name": "v1.3.0", "prerelease": True, "assets": [],
-                     "published_at": "2026-09-27T00:00:00Z"},
+        {"tag_name": "v1.4.0", "prerelease": True, "assets": [],
+         "published_at": "2026-09-27T00:00:00Z"},
     ]
     monkeypatch.setattr(updater.urllib.request, "urlopen",
                         lambda req, timeout=None: FakeResponse(json.dumps(payload).encode()))
     rel = updater.fetch_latest()
-    assert rel.version == "1.3.0" and rel.prerelease is True and rel.has_newer
+    assert rel.version == "1.4.0" and rel.prerelease is True and rel.has_newer
 
 
 def test_fetch_latest_missing_tag_is_skipped(monkeypatch):

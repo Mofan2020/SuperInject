@@ -224,6 +224,72 @@ def test_mem_read_write_roundtrip(injected, ctrl):
     assert ctrl.mem_write(pid, hdr, old).get("ok")
 
 
+def test_snapshot_and_diff(injected, ctrl):
+    """P1 内存快照 / diff 端到端：
+    1. 拿一个可写页 → 拍快照 A；
+    2. mem_write 改 1 字节 → 拍快照 B；
+    3. diff(A, B) 应该正好返回 1 条 changed 页，对应 addr 的旧 / 新 head64 不同。
+    """
+    pid = injected
+
+    # 1) 找一个 RW 页当目标
+    regions = ctrl.server.request(pid, {"type": "mem_regions"}, timeout=30)["regions"]
+    rw = [r for r in regions
+          if r["protect"] == PAGE_READWRITE and r["size"] >= 4096]
+    assert rw, "目标进程内没有 RW 区，无法跑快照端到端测试"
+    rw_region = {"base": int(rw[0]["base"]), "size": int(rw[0]["size"])}
+
+    # 2) 拍 A（限到这一页所在的 region，避免一次跑出几 MB 数据）
+    snap_a = ctrl.snapshot(pid, "before", regions=[rw_region])
+    assert snap_a["ok"] and snap_a["count"] >= 1, snap_a
+    assert Path(snap_a["path"]).exists(), snap_a["path"]
+
+    # 3) 改 1 字节（取 rw region 内 0x100 偏移，避免写到对齐边界上）
+    rw_base = rw_region["base"]
+    addr = rw_base + 0x100
+    original = ctrl.mem_read(pid, addr, 1)
+    assert original.get("ok"), original
+    new_byte = "90" if original["hex"].lower() != "90" else "91"
+    assert ctrl.mem_write(pid, addr, new_byte).get("ok")
+
+    # 4) 拍 B
+    snap_b = ctrl.snapshot(pid, "after", regions=[rw_region])
+    assert snap_b["ok"] and snap_b["count"] >= 1, snap_b
+
+    # 5) diff：预期正好 1 条 changed，那一页的 head64 head[0] 正是我们改的那个字节。
+    out = ctrl.diff(pid, "before", "after")
+    assert out["ok"], out
+    changed = out["changed"]
+    assert len(changed) >= 1, out
+
+    # 在 changed 里找我们改的那一页
+    target_page = next(
+        (c for c in changed if c["addr"] <= addr < c["addr"] + c["size"]),
+        None,
+    )
+    assert target_page is not None, f"未找到含 addr=0x{addr:x} 的 changed 页: {changed}"
+    old_b = bytes.fromhex(target_page["old_bytes"])
+    new_b = bytes.fromhex(target_page["new_bytes"])
+    # offset within page = addr - c["addr"]
+    offset = addr - target_page["addr"]
+    assert old_b[offset] == int(original["hex"], 16), \
+        f"old_bytes[{offset}] 期望 {original['hex']}，实际 {old_b[offset]:02x}"
+    assert new_b[offset] == int(new_byte, 16), \
+        f"new_bytes[{offset}] 期望 {new_byte}，实际 {new_b[offset]:02x}"
+
+    # 6) 同 self diff → unchanged 应占绝大多数，changed 为空
+    same = ctrl.diff(pid, "before", "before")
+    assert same["ok"]
+    assert same["changed"] == [], same
+
+    # 7) list_snapshots 应能看到这两条；清理避免污染
+    items = ctrl.list_snapshots(pid)
+    names = {it["name"] for it in items}
+    assert {"before", "after"} <= names
+    assert ctrl.delete_snapshot(pid, "before")
+    assert ctrl.delete_snapshot(pid, "after")
+
+
 def test_mem_search_max_results_respected(injected, ctrl):
     pid = injected
     found = ctrl.mem_search([pid], "00 00 00 00", 3)

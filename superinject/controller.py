@@ -661,6 +661,99 @@ class Controller:
     def mem_regions(self, pid: int) -> dict:
         return self.server.request(pid, {"type": "mem_regions"}, timeout=30)
 
+    # ---------------------------------------------------------- 内存快照 / diff（P1）
+
+    def snapshot(self, pid: int, name: str, regions: Optional[list] = None
+                 ) -> dict:
+        """拉一份目标进程内存快照并落盘到 ``%LOCALAPPDATA%/SuperInject/snapshots``。
+
+        * ``regions`` 缺省时 DLL 端走 ``mem_regions`` 的当前视图；
+        * 落盘的 ``.json`` 同时是 diff 的数据来源，diff 阶段再喂回 DLL。
+        """
+        if not name:
+            return {"ok": False, "error": "缺少 name 字段"}
+        msg: dict = {"type": "mem_snapshot", "name": name}
+        if regions:
+            msg["regions"] = list(regions)
+        resp = self.server.request(pid, msg, timeout=120)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "mem_snapshot 失败"),
+                    "pid": int(pid), "name": name}
+        try:
+            store = self._snapshot_store()
+            path = store.save(int(pid), resp)
+        except (OSError, ValueError, KeyError) as exc:
+            return {"ok": False, "error": f"落盘失败: {exc}",
+                    "pid": int(pid), "name": name}
+        # 把落盘路径回给调用方，前端按 ``list_snapshots`` 还能再查。
+        return {
+            "ok": True,
+            "pid": int(pid),
+            "name": name,
+            "path": str(path),
+            "count": int(resp.get("count", 0)),
+            "bytes": int(resp.get("bytes", 0)),
+            "sha256": str(resp.get("sha256", "")),
+        }
+
+    def list_snapshots(self, pid: int) -> List[dict]:
+        """返回该 PID 已落盘的快照列表（按 created_at 升序）。"""
+        store = self._snapshot_store()
+        return [e.to_dict() for e in store.list(int(pid))]
+
+    def delete_snapshot(self, pid: int, name: str) -> bool:
+        return self._snapshot_store().delete(int(pid), name)
+
+    def diff(self, pid: int, name1: str, name2: str, limit: int = 0
+             ) -> dict:
+        """对两个已存快照做 diff：
+
+        1. 控制器侧按 SHA 比对；
+        2. 差异页把 ``head64`` 喂给 DLL 的 ``mem_diff`` 让它再做一遍校验并返回 head64 对比。
+        """
+        store = self._snapshot_store()
+        try:
+            pair = store.diff(int(pid), name1, name2)
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc), "pid": int(pid),
+                    "a": name1, "b": name2}
+        a_pages = pair["pages_a"]
+        b_pages = pair["pages_b"]
+        if limit and limit > 0:
+            a_pages = a_pages[:limit]
+            b_pages = b_pages[:limit]
+        # 让 DLL 再校一遍（保证两份快照都在当前目标进程下确实可读），
+        # 同时也作为协议层的端到端冒烟。
+        resp = self.server.request(pid, {
+            "type": "mem_diff",
+            "a_pages": a_pages,
+            "b_pages": b_pages,
+        }, timeout=30)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "mem_diff 失败"),
+                    "pid": int(pid), "a": name1, "b": name2}
+        return {
+            "ok": True,
+            "pid": int(pid),
+            "a": name1,
+            "b": name2,
+            "changed": resp.get("changed", []),
+            "only_in_a": resp.get("only_in_a", []),
+            "unchanged_count": int(resp.get("unchanged_count", 0)),
+        }
+
+    def _snapshot_store(self):  # noqa: F821 — SnapshotStore 由懒加载导入
+        """懒加载 SnapshotStore（避免 controller import 时强依赖新模块）。
+
+        路径约定：``os.environ.get("SUPERINJECT_SNAPSHOT_ROOT", "")`` 存在时
+        优先用作根目录 —— 测试和其它方在不修改代码的前提下可以把快照写到沙箱目录。
+        """
+        from .snapshots import SnapshotStore, snapshot_root
+        override = os.environ.get("SUPERINJECT_SNAPSHOT_ROOT", "").strip()
+        if override:
+            return SnapshotStore(root=Path(override))
+        return SnapshotStore(root=snapshot_root())
+
     # ---------------------------------------------------------- 资源
 
     def resources(self, pids: List[int]) -> List[dict]:

@@ -379,6 +379,191 @@
   });
   $("#btn-clear").addEventListener("click", () => { $("#log").innerHTML = ""; });
 
+  // ---------------------------------------------------------- 内存快照 / diff
+
+  // 模块作用域内：当前 PID + 缓存的快照列表
+  state.snapshots = [];            // [{name, created_at, bytes, sha256, pages}, ...]
+  state.snapSel = new Set();       // 选中的快照名（最多 2 个用于 diff）
+  state.snapPid = null;             // 当前选中的 PID（用于刷新 / 删除）
+
+  function fmtBytesShort(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1048576).toFixed(2) + " MB";
+  }
+
+  function shortSha(s) {
+    s = String(s || "");
+    if (s.length <= 12) return s;
+    return s.slice(0, 6) + "…" + s.slice(-6);
+  }
+
+  function renderSnapshots() {
+    const tb = $("#snap-table tbody");
+    tb.innerHTML = "";
+    if (!state.snapshots.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="6" class="empty">先在进程表选中目标 → 命名 → 新建</td>';
+      tb.appendChild(tr);
+    } else {
+      state.snapshots.forEach((s) => {
+        const tr = document.createElement("tr");
+        if (state.snapSel.has(s.name)) tr.classList.add("sel");
+        tr.innerHTML =
+          `<td class="c-sel"><input type="checkbox" ${state.snapSel.has(s.name) ? "checked" : ""}/></td>` +
+          `<td>${escapeHtml(s.name)}</td>` +
+          `<td>${escapeHtml(s.created_at || "—")}</td>` +
+          `<td>${s.pages || 0}</td>` +
+          `<td>${fmtBytesShort(s.bytes)}</td>` +
+          `<td><span class="sha" title="${escapeHtml(s.sha256 || "")}">${escapeHtml(shortSha(s.sha256))}</span></td>`;
+        tr.querySelector("input").addEventListener("change", (e) => {
+          if (e.target.checked) {
+            if (state.snapSel.size >= 2) {
+              // 切换：取消最早选的那个
+              const first = state.snapSel.values().next().value;
+              state.snapSel.delete(first);
+            }
+            state.snapSel.add(s.name);
+          } else {
+            state.snapSel.delete(s.name);
+          }
+          renderSnapshots();
+          updateSnapActions();
+        });
+        tb.appendChild(tr);
+      });
+    }
+    // A/B 下拉框同步
+    const opts = state.snapshots
+      .map((s) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)} · ${fmtBytesShort(s.bytes)}</option>`)
+      .join("");
+    const prev = { a: $("#snap-a").value, b: $("#snap-b").value };
+    $("#snap-a").innerHTML = opts;
+    $("#snap-b").innerHTML = opts;
+    if (state.snapshots.find((s) => s.name === prev.a)) $("#snap-a").value = prev.a;
+    if (state.snapshots.find((s) => s.name === prev.b)) $("#snap-b").value = prev.b;
+    updateSnapActions();
+  }
+
+  function updateSnapActions() {
+    const n = state.snapSel.size;
+    $("#btn-snap-diff").disabled = n !== 2;
+    $("#btn-snap-del").disabled = n === 0;
+  }
+
+  async function refreshSnapshots() {
+    if (!state.snapPid) {
+      log("请先在进程表里选中一个进程后再刷新快照列表", "warn");
+      return;
+    }
+    const items = await call("list_snapshots", state.snapPid);
+    state.snapshots = Array.isArray(items) ? items : [];
+    state.snapSel = new Set();
+    renderSnapshots();
+  }
+
+  async function takeSnapshot() {
+    if (!state.snapPid) {
+      log("请先在进程表里选中一个目标进程", "warn");
+      return;
+    }
+    const name = ($("#snap-name").value || "").trim();
+    if (!name) {
+      log("请先填写快照名", "warn");
+      return;
+    }
+    log(`拍快照 pid=${state.snapPid} name=${name}…`);
+    const r = await call("snapshot", state.snapPid, name, []);
+    if (r && r.ok) {
+      log(`快照已落盘 ${r.path} (${r.count} 页 / ${fmtBytesShort(r.bytes)})`, "ok");
+      $("#snap-name").value = "";
+      await refreshSnapshots();
+    } else {
+      log("拍快照失败: " + (r && r.error || "未知错误"), "err");
+    }
+  }
+
+  async function diffSnapshots() {
+    if (state.snapSel.size !== 2) return;
+    const [a, b] = Array.from(state.snapSel);
+    if (!state.snapPid) return;
+    log(`diff ${a} vs ${b}…`);
+    const r = await call("diff_snapshot", state.snapPid, a, b, 0);
+    if (!r || !r.ok) {
+      log("diff 失败: " + (r && r.error || "未知错误"), "err");
+      return;
+    }
+    const summary = document.createElement("div");
+    summary.className = "summary";
+    const chg = (r.changed || []).length;
+    const only = (r.only_in_a || []).length;
+    summary.innerHTML =
+      `<b>${escapeHtml(a)}</b> vs <b>${escapeHtml(b)}</b>：` +
+      `changed <b>${chg}</b>，仅 A 有 <b>${only}</b>，` +
+      `未变 <b>${r.unchanged_count || 0}</b>`;
+    const result = $("#snap-diff-result");
+    result.innerHTML = "";
+    result.appendChild(summary);
+    (r.changed || []).forEach((c) => {
+      const row = document.createElement("div");
+      row.className = "snap-page";
+      row.innerHTML =
+        `<div class="addr">0x${Number(c.addr).toString(16).padStart(8, "0")}<br/>${c.size}B</div>` +
+        `<div class="col diff"><div class="head">old  sha <b>${shortSha(c.old_sha)}</b></div>${formatHex(c.old_bytes)}</div>` +
+        `<div class="col diff"><div class="head">new  sha <b>${shortSha(c.new_sha)}</b></div>${formatHex(c.new_bytes)}</div>`;
+      result.appendChild(row);
+    });
+    log(`diff 完成：${chg} changed, ${only} only_in_a, ${r.unchanged_count} unchanged`, "ok");
+  }
+
+  async function deleteSnapshots() {
+    if (state.snapSel.size === 0 || !state.snapPid) return;
+    const names = Array.from(state.snapSel);
+    if (!await confirmBox("删除快照", `即将从 pid=${state.snapPid} 删除 ${names.length} 个快照：${names.join(", ")}`)) return;
+    for (const n of names) {
+      await call("delete_snapshot", state.snapPid, n);
+    }
+    log(`已删除 ${names.length} 个快照`);
+    await refreshSnapshots();
+  }
+
+  // 把 head64 这 128 字符 hex 拆成 16 字节一行做小规模 hexdump。
+  function formatHex(hex) {
+    hex = String(hex || "");
+    const bytes = [];
+    for (let i = 0; i < hex.length; i += 2) {
+      const b = hex.slice(i, i + 2);
+      if (b.length === 2) bytes.push(b);
+    }
+    if (!bytes.length) return '<span class="muted">—</span>';
+    let row = "";
+    for (let i = 0; i < bytes.length; i += 16) {
+      row += bytes.slice(i, i + 16).join(" ") + "\n";
+    }
+    return `<pre style="margin:0;font-family:inherit;white-space:pre-wrap">${escapeHtml(row.trimEnd())}</pre>`;
+  }
+
+  $("#btn-snap-refresh").addEventListener("click", refreshSnapshots);
+  $("#btn-snap-new").addEventListener("click", takeSnapshot);
+  $("#btn-snap-diff").addEventListener("click", diffSnapshots);
+  $("#btn-snap-del").addEventListener("click", deleteSnapshots);
+
+  // 选定进程（注入/已注入）时自动同步 PID
+  let lastRefreshPid = null;
+  setInterval(() => {
+    if (state.snapPid !== lastRefreshPid) {
+      lastRefreshPid = state.snapPid;
+      if (state.snapPid) refreshSnapshots();
+    }
+  }, 500);
+  // 简单桥接：选中第一个进程时把 PID 同步到快照面板
+  const origUpdateCounts = updateCounts;
+  updateCounts = function () {
+    origUpdateCounts();
+    state.snapPid = selected()[0] || null;
+  };
+
   // ---------------------------------------------------------- 分区导航
   // 整页滚动后用一个分段控件在功能区之间跳转；滚动时自动高亮当前区。
   (function initNav() {

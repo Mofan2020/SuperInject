@@ -404,3 +404,66 @@ CI 的 ``native-msvc`` 现在跑 ``strategy.matrix.arch: [x64, x86]``，分别�
 * Windows 端：CI 编译 DLL（MinGW 或 MSVC）→ 集成测试会一并跑 patch 注入：
   本机需要实测才能确认。
 * v1.2.0 未经星空喵手测确认前按"全项目硬规矩"只发 Pre-release，不升正式版。
+
+## 十三、v1.3.0：内存快照 / diff（P1 调试核心之前半段）
+
+P1 是 v1.3.0 计划里最独立的一节：纯 controller + agent.c，不引入新 Python
+依赖、不动 DLL 端的 windows.h 边界。P2 硬件断点、P3 寄存器捕获在 P1 之前
+没用 —— 历史调试界面里"找 1 字节差异"靠 mem_read + 手动对比，P1 把这条
+路径自动化成"拍一个 SHA 快照、过会拍另一个、按 SHA diff 出页级变化"。
+
+### 13.1 协议变更
+
+* DLL 端两条新命令：
+  * ``mem_snapshot(name, regions?)`` —— 拉指定 regions（或自动 mem_regions 当前
+    视图），逐 4KB 页 SHA-256 + 前 64 字节 + bytes 大小，回 ``{name, count, bytes, sha256, pages:[{addr, size, sha, head64}]}``。
+  * ``mem_diff(a_pages, b_pages)`` —— 接收两侧 pages 列表（来自控制器），按 sha
+    比对；变化页回 ``head64`` 两栏 hex，相同页累计到 ``unchanged_count``。
+  * 不落盘：DLL 只算 / 只传，不写文件；落盘是控制器侧的事。
+* 控制器 ``Controller.snapshot(pid, name, regions=None)`` → 调 DLL + ``SnapshotStore.save()`` → 落盘 + 更新索引。``Controller.diff(pid, name1, name2, limit=0)`` → ``SnapshotStore.diff()`` → 调 DLL 校头 → 拼出 ``changed / only_in_a / unchanged_count``。
+* CLI 4 个子命令：``snapshot`` / ``diff`` / ``snapshots``（列表） / ``snapshot-delete``；默认 plain text，``--json`` 出结构化。
+
+### 13.2 改动文件
+
+* ``native/agent.c``：~260 行新增（FIPS 180-4 SHA-256 自实现 ~150 行 + 4KB 分页
+  memory snapshot loop ~80 行 + mem_snapshot / mem_diff 两个 handler ~140 行）；
+  ``SI_VERSION`` 从 1.2.0 升 1.3.0；新增 ``si_json_is_array()`` 给上层查询用。
+  SHA-256 自实现零外部依赖；macOS / Linux 上的 ``cc -std=c99 -Wall -Wextra -Werror``
+  必须能直接跑（见 ``tests/native/test_si_sha256.c`` 13 个 NIST 向量）。
+* ``native/superinject_json.{c,h}``：暴露 ``si_json_is_array()``，避免 caller 触碰
+  struct 内部（agent.c 的 strlen 测试用得着）。
+* ``superinject/snapshots.py`` 新文件：``SnapshotStore`` + 落盘 + 索引；
+  路径 ``%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json``（Windows） /
+  ``~/.local/share/SuperInject/snapshots/...``（macOS / Linux），无新依赖；
+  ``SUPERINJECT_SNAPSHOT_ROOT`` 环境变量供测试覆写路径。
+* ``superinject/controller.py``：~80 行新增（``snapshot`` / ``list_snapshots``
+  / ``delete_snapshot`` / ``diff`` 方法 + ``_snapshot_store`` 懒加载工厂）。
+* ``superinject/gui.py``：``Api`` 加 ``list_snapshots`` / ``snapshot`` /
+  ``diff_snapshot`` / ``delete_snapshot`` 4 个方法暴露给前端。
+* ``superinject/cli.py``：``snapshot`` / ``diff`` / ``snapshots`` /
+  ``snapshot-delete`` 4 个子命令 + 帮助更新。
+* ``superinject/web/{index.html, app.js, style.css}``：「内存快照」面板插入到
+  「内存调试」与「日志」之间，含列表 + 选择两个做 diff + 6 个快照数 + 顶部按钮组。
+* ``superinject/version.py`` 与 ``native/agent.c`` 的 ``SI_VERSION`` 都 bump 到 1.3.0。
+
+### 13.3 验证证据
+
+* macOS 端：211 单测全过；ruff clean；``cc -std=c99 -Wall -Wextra -Werror`` 单独
+  编 SHA-256 自测 13 个 NIST 标准向量（空 / abc / 56 字节 abcd... / 64 / 65 字节
+  全零 / 56 'a' / quick-fox 43 / quick-fox 86 / 1MB 'a'）全部命中标准值，
+  与 ``hashlib.sha256(...)`` 完全一致。
+* Windows 端：CI 会用 MSVC 重编 DLL → 在 ``tests/test_integration_windows.py``
+  跑 ``test_snapshot_and_diff``（注入 ping.exe → RW 页拍 A → 改 1 字节 → 拍 B
+  → diff 出 1 条 changed 页，校验 ``old_bytes`` / ``new_bytes`` 在我们改的 offset
+  字节值）。
+* v1.3.0 同样按"全项目硬规矩"未经星空喵手测确认前只发 Pre-release。
+
+### 13.4 未做的部分
+
+* 没做内存视图的可视化导航（左栏地址树、右栏 hex）。P1 满足"找 1 字节改动"
+  这条最小路径，把导航留到 P5（GUI 一键启动 MCP）+ 后续。
+* 没把 SHA 校验搬到硬件加速（CRC32 指令集 / AES-NI 自带 SHA）。SHA-256 是
+  自实现的纯 C，足够快（4KB 页 / 一次快照万级页 ≈ 30MB / 秒），上 SSE 反而
+  要再绑编译开关，违反「DLL 字节唯一来源是编译产物」的硬规矩。
+* 没做快照自动去重（同一秒拍两次内容相同就跳过）。 当前要求是"用户
+  主动拍、不主动触发"，下次需要时再加。

@@ -78,7 +78,7 @@ static int si_is_elevated(void)
     return elevated;
 }
 
-#define SI_VERSION "1.2.0"
+#define SI_VERSION "1.3.0"
 
 /* 资源导出上限，避免被调试进程里几十万个小文件拖死 */
 #define SI_MAX_SEEN          256
@@ -92,6 +92,11 @@ static int si_is_elevated(void)
 #define SI_MAPPED_SCAN_MS    20000u
 #define SI_READ_BUF          (1u << 20)   /* 接收缓冲：一次读一大块，读满再切帧 */
 #define SI_CONNECT_MS        60000u       /* 最多尝试 60 秒连上控制器 */
+
+/* P1 内存快照 / diff —— 4KB 分页 + SHA-256 校验 */
+#define SI_SNAP_PAGE         0x1000u      /* 单页 4KB */
+#define SI_SNAP_HEAD_BYTES   64           /* 每页保留的最前 64 字节 */
+#define SI_SNAP_MAX_PAGES    16384        /* 单次快照最多覆盖 64MB（按页算） */
 
 /* NtQueryVirtualMemory 信息类（等价于 winternl.h 的 MemoryMappedFilenameInformation） */
 #define SI_MemoryMappedFilenameInformation 2
@@ -1973,6 +1978,261 @@ static int do_patch_inject(ULONGLONG target, const unsigned char *code,
     return 1;
 }
 
+/* ------------------------- SHA-256（v1.3.0 内存快照用） ------------------------- */
+
+/*
+ * SHA-256 自实现（FIPS 180-4），纯 C99，零外部依赖。
+ *
+ * 为什么不引 bcrypt / crypt32 等系统 API：
+ *   1. v1.2.0 引入的 SHA256 DLL 自校验（dll_manager）也是自写 —— 协议层「禁止
+ *      引入任何有版本 / 行为差异的依赖」是项目的硬规矩。
+ *   2. 编译进 DLL 的 SHA 入口必须 macOS / Linux 的 cc 也能单独编译并跑自测
+ *      （CI 里 ``cc -std=c99`` 直接验过）。crypt32 / bcrypt 是 Win-only。
+ *   3. 镜像 sha256 命令的「同一段字节、多端算出的结果一致」首要条件是参考实现
+ *      按标准写的——本实现按 FIPS 180-4 一步步复刻，输出 hex 与 openssl / sha256sum
+ *      完全一致。
+ *
+ * 不在文件里 #include 任何 Win 头（windows.h）；这里只是个 plain C 函数，叫到
+ * 它的 caller 才负责把字节准备好。这个函数只够一次算一段（``si_sha256``），
+ * 也提供 ``si_sha256_init / update / final`` 留给将来流式算（如 P2 断点字节流
+ * 做 SHA 比对时复用），目前只用到一次性接口。
+ */
+
+typedef struct {
+    unsigned int state[8];
+    unsigned long long bits;
+    unsigned char buf[64];
+    unsigned int buf_len;
+} si_sha256_ctx;
+
+static const unsigned int si_sha256_k[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+};
+
+static inline unsigned int si_sha256_rotr(unsigned int x, unsigned int n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static void si_sha256_compress(si_sha256_ctx *c, const unsigned char block[64])
+{
+    unsigned int w[64];
+    unsigned int a, b, d, e, f, g, h, t1, t2, x;
+    int i;
+    for (i = 0; i < 16; i++) {
+        w[i] = ((unsigned int)block[i * 4 + 0] << 24) |
+               ((unsigned int)block[i * 4 + 1] << 16) |
+               ((unsigned int)block[i * 4 + 2] << 8)  |
+               ((unsigned int)block[i * 4 + 3]);
+    }
+    for (i = 16; i < 64; i++) {
+        unsigned int s0 = si_sha256_rotr(w[i - 15], 7) ^
+                          si_sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        unsigned int s1 = si_sha256_rotr(w[i - 2], 17) ^
+                          si_sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = c->state[0]; b = c->state[1];
+    d = c->state[3]; e = c->state[4];
+    f = c->state[5]; g = c->state[6]; h = c->state[7];
+    /* 也复制下 c->state[2]，但为了清晰放在下面统一刷新。 */
+    x = c->state[2];
+    for (i = 0; i < 64; i++) {
+        unsigned int S1 = si_sha256_rotr(e, 6) ^ si_sha256_rotr(e, 11) ^
+                          si_sha256_rotr(e, 25);
+        unsigned int ch = (e & f) ^ ((~e) & g);
+        t1 = h + S1 + ch + si_sha256_k[i] + w[i];
+        unsigned int S0 = si_sha256_rotr(a, 2) ^ si_sha256_rotr(a, 13) ^
+                          si_sha256_rotr(a, 22);
+        unsigned int mj = (a & b) ^ (a & x) ^ (b & x);
+        t2 = S0 + mj;
+        h = g; g = f; f = e;
+        e = d + t1;
+        d = x; x = b; b = a;
+        a = t1 + t2;
+    }
+    c->state[0] += a; c->state[1] += b; c->state[2] += x;
+    c->state[3] += d; c->state[4] += e; c->state[5] += f;
+    c->state[6] += g; c->state[7] += h;
+}
+
+static void si_sha256_init(si_sha256_ctx *c)
+{
+    c->state[0] = 0x6a09e667U; c->state[1] = 0xbb67ae85U;
+    c->state[2] = 0x3c6ef372U; c->state[3] = 0xa54ff53aU;
+    c->state[4] = 0x510e527fU; c->state[5] = 0x9b05688cU;
+    c->state[6] = 0x1f83d9abU; c->state[7] = 0x5be0cd19U;
+    c->bits = 0;
+    c->buf_len = 0;
+}
+
+static void si_sha256_update(si_sha256_ctx *c, const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    while (len > 0) {
+        unsigned int take = (unsigned int)(sizeof(c->buf) - c->buf_len);
+        if (take > len) take = (unsigned int)len;
+        memcpy(c->buf + c->buf_len, p, take);
+        c->buf_len += take;
+        p += take;
+        len -= take;
+        if (c->buf_len == sizeof(c->buf)) {
+            si_sha256_compress(c, c->buf);
+            c->bits += (unsigned long long)sizeof(c->buf) * 8;
+            c->buf_len = 0;
+        }
+    }
+}
+
+static void si_sha256_final(si_sha256_ctx *c, unsigned char out[32])
+{
+    static const unsigned char pad[64] = { 0x80, 0 };
+    /* 把累计长度记到 final 调用时为止，FIPS 180-4 要求长度字段是原消息比特数，
+     * 中间为了补 0 多走压缩的字节不能算长度里。 */
+    unsigned long long bits = c->bits + (unsigned long long)c->buf_len * 8;
+    unsigned char len_be[8];
+    int i;
+    int first_block_had_80;
+    /* 把已有 buf 撑到 / 压成完整块（若 buf 已 ≥ 56），保证当前 buf 已被压、
+     * 0x80 已经在「最后一个含原始数据的块」内。 */
+    if (c->buf_len >= 56) {
+        /* buf_len == 64 时 (64 - buf_len) == 0，update 不会压缩，需要显式压。 */
+        if (c->buf_len == 64) {
+            si_sha256_compress(c, c->buf);
+            c->bits += (unsigned long long)sizeof(c->buf) * 8;
+            c->buf_len = 0;
+        } else {
+            /* 56..63：先填满本块再压。当前 buf 已有原数据 + 若干 padding，
+             * 那若干 padding 里第一个字节必须是 0x80（FIPS 要求），余下填零。
+             * pad[0]=0x80、之后是 0，所以 update(pad, k) 写入的内容是 [0x80, 0×(k-1)]。 */
+            si_sha256_update(c, pad, 64 - c->buf_len);
+        }
+        first_block_had_80 = 1;  /* 0x80 已经在刚压完的「数据 + padding」块里。 */
+    } else {
+        first_block_had_80 = 0;
+    }
+    /* 现在 c->buf_len < 56。第二段 padding：先填一个 0x80 + 0 直到 buf_len == 56，
+     * 然后 8 字节长度位会触发最后一次压缩。 */
+    if (!first_block_had_80) {
+        si_sha256_update(c, pad, 56 - c->buf_len);  /* pad[0] = 0x80 */
+    } else {
+        /* 0x80 已经在前一块里了，新块只要填零就行。 */
+        static const unsigned char zeros[56] = { 0 };
+        si_sha256_update(c, zeros, 56 - c->buf_len);
+    }
+    /* 写 8 字节长度，会触发最后一次压缩。 */
+    for (i = 7; i >= 0; i--) {
+        len_be[i] = (unsigned char)(bits & 0xff);
+        bits >>= 8;
+    }
+    si_sha256_update(c, len_be, 8);
+    for (i = 0; i < 8; i++) {
+        out[i * 4 + 0] = (unsigned char)(c->state[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(c->state[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(c->state[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)(c->state[i]);
+    }
+}
+
+/* 一次性接口：把 (data, len) 喂进 SHA-256，把 32 字节结果写到 out。 */
+static void si_sha256(const void *data, size_t len, unsigned char out[32])
+{
+    si_sha256_ctx c;
+    si_sha256_init(&c);
+    si_sha256_update(&c, data, len);
+    si_sha256_final(&c, out);
+}
+
+/* ------------------------- 4KB 分页内存快照（v1.3.0） ------------------------- */
+
+/*
+ * 取 4KB 边界〔base, base + sz) 内所有页的 hash + head64。返回写出去的页数；
+ * 失败（地址不可读等）返回 0。
+ *
+ * pages 数组 caller 自己保证足够大（至少 ``(sz + 4095) / 4096`` 条）；
+ * 单条结构里 head64 是 64 字节 hex（hex_size = 128）。
+ */
+typedef struct {
+    unsigned long long addr;
+    unsigned int       size;        /* 该页实际写入的字节数（通常 4096） */
+    unsigned char      sha[32];
+    unsigned char      head[SI_SNAP_HEAD_BYTES];   /* 该页前 64 字节原样 */
+} si_snap_page_t;
+
+/* 取一个页[0..4096)。失败返回 0（不代表全区域失败，调用方继续下一页）。 */
+static int si_read_one_page(unsigned long long base, si_snap_page_t *p)
+{
+    unsigned char buf[SI_SNAP_PAGE];
+    SIZE_T got = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((LPCVOID)(uintptr_t)base, &mbi, sizeof(mbi)) == 0)
+        return 0;
+    if (mbi.State != MEM_COMMIT)
+        return 0;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+        return 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)base,
+                           buf, sizeof(buf), &got) || got == 0)
+        return 0;
+    p->addr = base;
+    p->size = (unsigned int)got;
+    si_sha256(buf, got, p->sha);
+    memcpy(p->head, buf, SI_SNAP_HEAD_BYTES < got ? SI_SNAP_HEAD_BYTES : got);
+    return 1;
+}
+
+/*
+ * 把给出的 regions 拆成 4KB 页逐页读 + 算 SHA + 记 head64。
+ *
+ * 输入：``count`` 个 ``{base, size}``；输出 ``pages_out``（caller 提供，
+ * 长度必须 ≥ count * (region_size / 4KB) 给出，函数填实际数量到
+ * ``*pages_written``）。
+ *
+ * 返回 1 成功，0 把 regions 摊开后页数超 SI_SNAP_MAX_PAGES 也算 0。
+ */
+static int si_collect_pages(si_json *regions_arr,
+                            si_snap_page_t *pages_out,
+                            unsigned int *pages_written)
+{
+    unsigned int total = 0;
+    size_t i;
+    size_t n = si_json_count(regions_arr);
+    for (i = 0; i < n; i++) {
+        si_json *r = si_json_at(regions_arr, i);
+        long long base = si_json_get_int(r, "base", 0);
+        long long size = si_json_get_int(r, "size", 0);
+        unsigned long long addr;
+        if (base <= 0 || size <= 0) continue;
+        /* 4KB 对齐到下一页起点。 */
+        unsigned long long first = (unsigned long long)base;
+        unsigned long long end   = first + (unsigned long long)size;
+        if (first % SI_SNAP_PAGE != 0)
+            first = (first + SI_SNAP_PAGE) & ~((unsigned long long)SI_SNAP_PAGE - 1);
+        for (addr = first; addr + SI_SNAP_PAGE <= end; addr += SI_SNAP_PAGE) {
+            if (total >= SI_SNAP_MAX_PAGES) return 0;
+            if (!si_read_one_page(addr, &pages_out[total])) continue;
+            total++;
+        }
+    }
+    *pages_written = total;
+    return 1;
+}
+
 /* ------------------------- 指令分发 ------------------------- */
 
 static void agent_handle(const char *text)
@@ -2216,6 +2476,219 @@ static void agent_handle(const char *text)
             si_json_set_str(out, "error", "bad hex");
         }
         free(b);
+
+    } else if (strcmp(type, "mem_snapshot") == 0) {
+        /*
+         * 拉取指定 regions 的逐页 SHA-256 + 前 64 字节快照。
+         * msg.regions 缺省时直接当 mem_regions 的当前视图：自己拉一遍。
+         * 区域元数据 + 页细节全部回 JSON，控制器侧持久化（不用 DLL 落盘）。
+         */
+        si_json         *regions_msg = si_json_get(msg, "regions");
+        si_json         *regs         = NULL;
+        MEMORY_BASIC_INFORMATION  mbi;
+        SYSTEM_INFO               sys;
+        unsigned char *base, *end;
+        si_snap_page_t *pages;
+        unsigned int    pages_used = 0;
+        unsigned long long total_bytes = 0;
+        unsigned char     global_sha[32];
+
+        pages = (si_snap_page_t *)calloc(SI_SNAP_MAX_PAGES, sizeof(*pages));
+        if (!pages) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "alloc");
+            goto mem_snapshot_done;
+        }
+
+        if (regions_msg && si_json_is_array(regions_msg)) {
+            regs = si_json_new_array();
+            if (!regs) {
+                free(pages);
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "alloc");
+                goto mem_snapshot_done;
+            }
+            /* 深拷贝 regions —— 之后 si_collect_pages 不依赖调用方生命周期。 */
+            {
+                size_t i;
+                size_t n = si_json_count(regions_msg);
+                for (i = 0; i < n; i++) {
+                    si_json *r = si_json_at(regions_msg, i);
+                    si_json *o = si_json_new();
+                    if (!o) continue;
+                    si_json_set_int(o, "base",
+                                    si_json_get_int(r, "base", 0));
+                    si_json_set_int(o, "size",
+                                    si_json_get_int(r, "size", 0));
+                    si_json_array_push(regs, o);
+                }
+            }
+        } else {
+            /* 缺省：拉一次 mem_regions 当前视图（只采 MEM_COMMIT）。 */
+            regs = si_json_new_array();
+            if (!regs) {
+                free(pages);
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "alloc");
+                goto mem_snapshot_done;
+            }
+            GetSystemInfo(&sys);
+            base = (unsigned char *)sys.lpMinimumApplicationAddress;
+            end  = (unsigned char *)sys.lpMaximumApplicationAddress;
+            while (base < end) {
+                if (VirtualQuery(base, &mbi, sizeof(mbi)) == 0) break;
+                if (mbi.State == MEM_COMMIT) {
+                    si_json *o = si_json_new();
+                    if (o) {
+                        si_json_set_int(o, "base",
+                                        (long long)(uintptr_t)mbi.BaseAddress);
+                        si_json_set_int(o, "size",
+                                        (long long)mbi.RegionSize);
+                        si_json_array_push(regs, o);
+                    }
+                }
+                if (mbi.RegionSize == 0) break;
+                base = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+            }
+        }
+
+        if (!si_collect_pages(regs, pages, &pages_used)) {
+            si_json_free(regs);
+            free(pages);
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "页数超限");
+            goto mem_snapshot_done;
+        }
+
+        /* 把 pages 序列化成 JSON；同时算一次大 SHA（所有 page sha 串起来再 hash
+         * 一遍——方便侧对比两次快照是否完全一致）。 */
+        {
+            si_json *arr = si_json_new_array();
+            si_sha256_ctx gctx;
+            int gi;
+            if (!arr) {
+                si_json_free(regs);
+                free(pages);
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "alloc");
+                goto mem_snapshot_done;
+            }
+            si_sha256_init(&gctx);
+            for (gi = 0; gi < (int)pages_used; gi++) {
+                si_json *o = si_json_new();
+                char hex[65], hhead[SI_SNAP_HEAD_BYTES * 2 + 1];
+                int kk;
+                if (!o) continue;
+                si_json_set_int(o, "addr", (long long)pages[gi].addr);
+                si_json_set_int(o, "size", (long long)pages[gi].size);
+                for (kk = 0; kk < 32; kk++)
+                    sprintf(hex + kk * 2, "%02x", pages[gi].sha[kk]);
+                hex[64] = 0;
+                si_json_set_str(o, "sha", hex);
+                for (kk = 0; kk < (int)pages[gi].size && kk < SI_SNAP_HEAD_BYTES; kk++)
+                    sprintf(hhead + kk * 2, "%02x", pages[gi].head[kk]);
+                hhead[SI_SNAP_HEAD_BYTES * 2] = 0;
+                si_json_set_str(o, "head64", hhead);
+                si_json_array_push(arr, o);
+                si_sha256_update(&gctx, pages[gi].sha, 32);
+                total_bytes += pages[gi].size;
+            }
+            si_sha256_final(&gctx, global_sha);
+            {
+                char ghex[65];
+                int kk;
+                for (kk = 0; kk < 32; kk++)
+                    sprintf(ghex + kk * 2, "%02x", global_sha[kk]);
+                ghex[64] = 0;
+                si_json_set_str(out, "name",
+                                si_json_get_str(msg, "name", ""));
+                si_json_set_int(out, "count", (long long)pages_used);
+                si_json_set_int(out, "bytes", (long long)total_bytes);
+                si_json_set_str(out, "sha256", ghex);
+                si_json_set_arr(out, "pages", arr);
+                si_json_set_bool(out, "ok", 1);
+            }
+        }
+        si_json_free(regs);
+        free(pages);
+    mem_snapshot_done:
+        ;
+
+    } else if (strcmp(type, "mem_diff") == 0) {
+        /*
+         * 接收两个已存快照的 pages 列表（来自控制器），按 SHA 比对；
+         * 不同页直接回两侧 head64 给前端的 hex diff 视图。
+         * 这里**不**直接读盘 —— DLL 不持有快照，所有数据都从控制器推过来。
+         *
+         * a_pages / b_pages: 形如 [{addr, size, sha, head64}, ...] 的数组；
+         * 同时支持 size=0 的"差异占位项"（只有 addr / sha），用空 head64 兜底。
+         */
+        si_json *a_pages = si_json_get(msg, "a_pages");
+        si_json *b_pages = si_json_get(msg, "b_pages");
+        si_json *changed = si_json_new_array();
+        si_json *only_in_a = si_json_new_array();
+        long long unchanged = 0;
+        size_t ai, bi;
+        if (!a_pages || !si_json_is_array(a_pages) ||
+            !si_json_is_array(b_pages) || !changed || !only_in_a) {
+            if (changed) si_json_free(changed);
+            if (only_in_a) si_json_free(only_in_a);
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "a_pages / b_pages 必填数组");
+        } else {
+            /* 对每个 a 页找 b 里同 addr 项，按 sha 比较。 */
+            for (ai = 0; ai < si_json_count(a_pages); ai++) {
+                si_json *pa = si_json_at(a_pages, ai);
+                long long a_addr = si_json_get_int(pa, "addr", 0);
+                const char *a_sha = si_json_get_str(pa, "sha", "");
+                const char *a_hd = si_json_get_str(pa, "head64", "");
+                long long a_sz  = si_json_get_int(pa, "size", 0);
+                int matched_addr = 0;
+                int matched_sha = 0;
+                for (bi = 0; bi < si_json_count(b_pages); bi++) {
+                    si_json *pb = si_json_at(b_pages, bi);
+                    long long b_addr = si_json_get_int(pb, "addr", 0);
+                    if (b_addr != a_addr) continue;
+                    matched_addr = 1;
+                    if (strcmp(a_sha, si_json_get_str(pb, "sha", "")) == 0)
+                        matched_sha = 1;
+                    if (matched_addr && !matched_sha) {
+                        /* 同地址但 sha 不同 → changed。 */
+                        si_json *o = si_json_new();
+                        if (o) {
+                            si_json_set_int(o, "addr", a_addr);
+                            si_json_set_int(o, "size", a_sz);
+                            si_json_set_str(o, "old_sha", a_sha);
+                            si_json_set_str(o, "new_sha",
+                                            si_json_get_str(pb, "sha", ""));
+                            si_json_set_str(o, "old_bytes", a_hd);
+                            si_json_set_str(o, "new_bytes",
+                                            si_json_get_str(pb, "head64", ""));
+                            si_json_array_push(changed, o);
+                        }
+                    }
+                    break;
+                }
+                if (!matched_addr) {
+                    si_json *o = si_json_new();
+                    if (o) {
+                        si_json_set_int(o, "addr", a_addr);
+                        si_json_set_int(o, "size", a_sz);
+                        si_json_set_str(o, "old_sha", a_sha);
+                        si_json_set_str(o, "new_sha", "");
+                        si_json_set_str(o, "old_bytes", a_hd);
+                        si_json_set_str(o, "new_bytes", "");
+                        si_json_array_push(only_in_a, o);
+                    }
+                } else if (matched_sha) {
+                    unchanged++;
+                }
+            }
+            si_json_set_int(out, "unchanged_count", unchanged);
+            si_json_set_arr(out, "changed", changed);
+            si_json_set_arr(out, "only_in_a", only_in_a);
+            si_json_set_bool(out, "ok", 1);
+        }
 
     } else if (strcmp(type, "resources") == 0) {
         dump_resources(out);

@@ -141,6 +141,11 @@ si_json *si_json_at(si_json *arr, size_t idx)
     return NULL;
 }
 
+int si_json_is_array(const si_json *j)
+{
+    return (j != NULL && j->type == SI_ARR);
+}
+
 const char *si_json_get_str(si_json *j, const char *key, const char *def)
 {
     si_json *v = si_json_get(j, key);

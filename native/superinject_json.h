@@ -38,6 +38,8 @@ long long    si_json_get_int(si_json *j, const char *key, long long def);
 int          si_json_get_bool(si_json *j, const char *key, int def);
 si_json     *si_json_get(si_json *j, const char *key);
 si_json     *si_json_at(si_json *arr, size_t idx);
+/* 类型判定 —— 避免 caller 触碰 struct si_json 的内部。 */
+int          si_json_is_array(const si_json *j);
 
 /* 序列化 / 反序列化 */
 char    *si_json_dump(si_json *j);      /* 调用方用 si_free 释放 */

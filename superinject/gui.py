@@ -170,6 +170,22 @@ class Api:
     def mem_regions(self, pid: int) -> dict:
         return self.controller.mem_regions(int(pid))
 
+    # -------------------------------------------------- 内存快照 / diff
+
+    def list_snapshots(self, pid: int) -> list:
+        return self.controller.list_snapshots(int(pid))
+
+    def snapshot(self, pid: int, name: str, regions: list = []) -> dict:
+        # default=[] is safe here because the controller copies via list(regions)
+        return self.controller.snapshot(int(pid), name, regions)
+
+    def diff_snapshot(self, pid: int, name1: str, name2: str,
+                      limit: int = 0) -> dict:
+        return self.controller.diff(int(pid), name1, name2, limit=limit)
+
+    def delete_snapshot(self, pid: int, name: str) -> bool:
+        return self.controller.delete_snapshot(int(pid), name)
+
     # -------------------------------------------------- 资源
 
     def resources(self, pids: list) -> list:

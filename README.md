@@ -32,6 +32,7 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | 冻结进程 | `NtSuspendProcess` 挂起全部线程，目标进程**完全无响应**；可随时解除，并核实线程真实挂起状态 |
 | 内存搜索 | 支持 `4D 5A ?? ??` 通配的十六进制模式扫描，可批量在多进程内搜索 |
 | 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
+| 内存快照 / diff | 4KB 分页 SHA-256 + 前 64 字节快照，落盘到 `%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json`；二次操作可对比任意两份快照的差异页（先看全局 SHA 找变化页，再展示 `head64` 两栏 hex），既找得到 1 字节改动也不会随进程跑出 MB 级 false positive |
 | 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
 | 崩溃转储 | DLL 在 `DllMain` 里装 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler`，目标进程 ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE 时自动写 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` 与同名 `.json` 元数据 sidecar；控制器在 `on_detach` 时按"水位线"扫目录，把新文件合成 `event:crash` 推到事件队列，CLI/前端都能消费 |
 | 事件流 | DLL / 控制器都能主动推 `type=event:*` 帧（包括崩溃转储、patch 落地等）—— 不参与 id 匹配，专为「通知但不期望响应」设计；CLI `events` 子命令支持 `--follow` 持续轮询 |
@@ -158,6 +159,8 @@ SuperInject.exe -c -y inject --pid 100 --pid 200 --arch x86
 SuperInject.exe -c -y freeze 1234
 SuperInject.exe -c -y mem-read 1234 0x401000 64
 SuperInject.exe -c -y mem-search 1234 '4D 5A ?? ??'
+SuperInject.exe -c -y snapshot 1234 --name before --region 0x401000 0x1000
+SuperInject.exe -c -y diff 1234 --a before --b after --limit 32
 SuperInject.exe -c -y unload 1234
 SuperInject.exe -c -y terminate 1234
 SuperInject.exe -c -y status

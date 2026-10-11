@@ -38,6 +38,7 @@
     <button class="nav-seg" data-target="panel-control">控制</button>
     <button class="nav-seg" data-target="panel-res">资源</button>
     <button class="nav-seg" data-target="panel-mem">内存</button>
+    <button class="nav-seg" data-target="panel-snap">快照</button>
     <button class="nav-seg" data-target="panel-log">日志</button>
   </nav>
 </div>
@@ -151,6 +152,46 @@
       <div class="row end">
         <span id="ed-msg" class="muted"></span>
         <button id="btn-write" class="danger">写入选中进程</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-snap">
+    <div class="panel-head"><h2>内存快照 / diff</h2>
+      <span class="hint">拍下当前进程某段内存的 SHA-256 + 前 64 字节，再做两次对比</span>
+      <span class="grow"></span>
+      <button id="btn-snap-refresh" class="ghost">刷新列表</button>
+    </div>
+    <div class="snap-row">
+      <div class="snap-list-wrap">
+        <div class="snap-list-bar">
+          <input id="snap-name" placeholder="快照名（必填）" />
+          <button id="btn-snap-new" class="primary">新建快照</button>
+          <button id="btn-snap-diff" class="ghost" disabled>Diff 选中的两个</button>
+          <button id="btn-snap-del" class="warn" disabled>删除</button>
+        </div>
+        <table id="snap-table">
+          <thead><tr>
+            <th class="c-sel"></th>
+            <th>名字</th>
+            <th>时间</th>
+            <th>页数</th>
+            <th>大小</th>
+            <th>SHA-256</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="snap-diff-wrap">
+        <div class="snap-diff-bar">
+          <span class="muted">A:</span>
+          <select id="snap-a"></select>
+          <span class="muted">B:</span>
+          <select id="snap-b"></select>
+        </div>
+        <div id="snap-diff-result" class="results">
+          <div class="muted pad">选两份快照再点 Diff →</div>
+        </div>
       </div>
     </div>
   </section>
