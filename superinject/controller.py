@@ -573,6 +573,30 @@ class Controller:
             "budget": int(budget),
         }, timeout=15)
 
+    # ---------------------------------------------------------- 线程
+
+    def threads(self, pid: int) -> dict:
+        """列目标进程所有线程（DLL 自带工作线程会过滤掉）。"""
+        return self.server.request(pid, {"type": "threads"}, timeout=15)
+
+    def thread_suspend(self, pid: int, tid: int) -> dict:
+        """只挂起一个线程。返回操作前的 SuspendCount 与操作后的读数。"""
+        return self.server.request(pid,
+                                   {"type": "thread_suspend",
+                                    "tid": int(tid)},
+                                   timeout=10)
+
+    def thread_resume(self, pid: int, tid: int) -> dict:
+        return self.server.request(pid,
+                                   {"type": "thread_resume",
+                                    "tid": int(tid)},
+                                   timeout=10)
+
+    def thread_set(self, pid: int, tid: int, suspended: bool) -> dict:
+        """``suspended=True`` 时挂起；``False`` 时恢复。统一入口便于前端调用。"""
+        return (self.thread_suspend(pid, tid) if suspended
+                else self.thread_resume(pid, tid))
+
     # ---------------------------------------------------------- 内存
 
     def mem_search(self, pids: List[int], pattern: str, max_results: int = 256

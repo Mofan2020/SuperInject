@@ -359,6 +359,87 @@ def test_exports_forwards_address_and_name(monkeypatch, capsys):
     assert seen["args"] == (1234, "user32.dll", 0x7FFE0000, 32)
 
 
+# ----------------------------------------------------------- 线程
+
+def test_threads_and_thread_control(monkeypatch, capsys):
+    """threads / thread-suspend / thread-resume 子命令端到端。"""
+    threads_resp = {
+        "ok": True,
+        "threads": [
+            {"tid": 4321, "base_priority": 8, "delta_priority": 0,
+             "suspend_count": 0, "state": "Wait", "wait_reason": "UserRequest",
+             "description": "main"},
+            {"tid": 8765, "base_priority": 8, "delta_priority": 0,
+             "suspend_count": 1, "state": "Ready", "wait_reason": "",
+             "description": "worker"},
+        ],
+    }
+
+    class FakeCtrl:
+        def threads(self, pid):
+            self.seen_threads = pid
+            return threads_resp
+
+        def thread_suspend(self, pid, tid):
+            self.suspend_call = (pid, tid)
+            return {"ok": True, "tid": tid,
+                    "prev_suspend_count": 0, "suspend_count": 1}
+
+        def thread_resume(self, pid, tid):
+            self.resume_call = (pid, tid)
+            return {"ok": True, "tid": tid,
+                    "prev_suspend_count": 1, "suspend_count": 0}
+
+    ctrl = FakeCtrl()
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: ctrl)
+
+    rc = cli.run(["-c", "-y", "--json", "threads", "--pid", "9999"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "threads"
+    assert len(data["threads"]) == 2
+    assert data["threads"][0]["tid"] == 4321
+    assert ctrl.seen_threads == 9999
+
+    rc = cli.run(["-c", "-y", "--json", "thread-suspend",
+                  "--pid", "9999", "--tid", "8765"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "thread-suspend"
+    assert data["tid"] == 8765
+    assert data["prev_suspend_count"] == 0
+    assert data["suspend_count"] == 1
+    assert ctrl.suspend_call == (9999, 8765)
+
+    rc = cli.run(["-c", "-y", "--json", "thread-resume",
+                  "--pid", "9999", "--tid", "8765"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "thread-resume"
+    assert data["prev_suspend_count"] == 1
+    assert data["suspend_count"] == 0
+    assert ctrl.resume_call == (9999, 8765)
+
+
+def test_threads_returns_error_on_fail(monkeypatch, capsys):
+    class FakeCtrl:
+        def threads(self, pid):
+            return {"ok": False, "error": "DLL 未注入",
+                    "threads": []}
+
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "threads", "--pid", "9999"])
+    # CLI 协议：dict.ok=False 时 exit code 2（与其它命令一致）
+    assert rc == 2
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] is False
+    assert data["error"] == "DLL 未注入"
+
+
 # ----------------------------------------------------------- events / dumps
 
 def test_events_lists_in_memory_queue(monkeypatch, capsys):

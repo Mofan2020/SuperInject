@@ -213,6 +213,17 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp.add_argument("--base", default="",
                     help="按基址（0x 前缀）")
     sp.add_argument("--budget", type=int, default=256)
+
+    sp = sub.add_parser("threads", help="列出目标进程的所有线程")
+    sp.add_argument("--pid", type=int, required=True)
+
+    sp = sub.add_parser("thread-suspend", help="只挂起一个线程")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--tid", type=int, required=True)
+
+    sp = sub.add_parser("thread-resume", help="只恢复一个线程")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--tid", type=int, required=True)
     sp = sub.add_parser("ping", help="连通性自检")
     add_pid_positional(sp)
     sp = sub.add_parser("unload", help="卸载注入的 DLL")
@@ -637,6 +648,24 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
                 "pid": int(args.pid),
                 "count": int(resp.get("count", 0)),
                 "exports": resp.get("exports", [])}
+    if sub == "threads":
+        resp = _ensure_controller().threads(int(args.pid))
+        return {"ok": bool(resp.get("ok")), "kind": "threads",
+                "pid": int(args.pid),
+                "threads": resp.get("threads", []),
+                "error": resp.get("error", "")}
+    if sub == "thread-suspend":
+        resp = _ensure_controller().thread_suspend(int(args.pid), int(args.tid))
+        return {"ok": bool(resp.get("ok")), "kind": "thread-suspend",
+                "pid": int(args.pid), "tid": int(args.tid),
+                **({k: v for k, v in resp.items()
+                    if k in {"prev_suspend_count", "suspend_count"}})}
+    if sub == "thread-resume":
+        resp = _ensure_controller().thread_resume(int(args.pid), int(args.tid))
+        return {"ok": bool(resp.get("ok")), "kind": "thread-resume",
+                "pid": int(args.pid), "tid": int(args.tid),
+                **({k: v for k, v in resp.items()
+                    if k in {"prev_suspend_count", "suspend_count"}})}
     if sub == "unload":
         return {"ok": True, "kind": "unload",
                 "results": _ensure_controller().unload(_normalize_pids(args))}

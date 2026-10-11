@@ -1128,6 +1128,7 @@ static int mem_write_bytes(void *target, const unsigned char *bytes, size_t n,
 }
 
 /* ------------------------- 崩溃转储 ------------------------- */
+
 /*
  * 目标进程崩溃时，自动把堆栈落盘到 %TEMP%\SuperInject\<pid>\dump-<tick>.dmp，
  * 同时写一份 .json sidecar 记录 reason / code / address / tid / 时间戳，便于
@@ -1320,7 +1321,214 @@ static void agent_uninstall_crash_handlers(void)
     }
 }
 
-/* ------------------------- 模块导出表（轻量 PE 解析） ------------------------- */
+/* ------------------------- 线程枚举 / 单线程冻结 ------------------------- */
+
+/*
+ * 目标进程线程列表（按 tid 输出，便于 GUI 列出来精确只冻死一条线程）。
+ *
+ * 用 Thread32First / Thread32Next（tlhelp32.h 已在 include 列表里），
+ * 配合 GetThreadDescription（Win10+）给出友好名字。
+ *
+ * 单线程挂起：NtSuspendThread / NtResumeThread。SuspendCount 用
+ * NtQueryInformationThread(ThreadBasicInformation) 读，可信。
+ *
+ * 注意：
+ *   - OpenThread 用 THREAD_SUSPEND_RESUME 权限即可；
+ *   - 不要 NtSuspendProcess 自己，否则自己挂了整个进程；
+ *   - g_worker 线程是 DLL 自带连接线程，故意跳过；GUI 看见它也没意义。
+ */
+
+typedef LONG (NTAPI *si_NtQueryInformationThread_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+typedef LONG (NTAPI *si_NtSuspendThread_t)(HANDLE, PULONG);
+typedef LONG (NTAPI *si_NtResumeThread_t)(HANDLE, PULONG);
+
+#define SI_ThreadBasicInformation   0
+#define SI_MAX_THREADS_PER_LIST     256
+
+typedef struct _THREAD_BASIC_INFORMATION_SI {
+    NTSTATUS ExitStatus;
+    PVOID    TebBaseAddress;
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    LONG     Priority;
+    LONG     BasePriority;
+    ULONG    SuspendCount;   /* 字段位置与 NT 结构兼容（winternl.h 不公开） */
+} THREAD_BASIC_INFORMATION_SI;
+
+/* Win10+ 才有，不可用时返回 0。 */
+static DWORD g_self_thread_id = 0;
+
+static const char *thread_state_name(DWORD state)
+{
+    switch (state) {
+    case 0:  return "Initialized";
+    case 1:  return "Ready";
+    case 2:  return "Running";
+    case 3:  return "Standby";
+    case 4:  return "Terminated";
+    case 5:  return "Wait";
+    case 6:  return "Transition";
+    case 7:  return "DeferredReady";
+    default: return "?";
+    }
+}
+
+static const char *thread_wait_reason(DWORD reason)
+{
+    /* THREAD_WAIT_REASON 取值见 winnt.h（多数 enum 与 Reversi/MS docs 对齐） */
+    switch (reason) {
+    case 0:  return "Executive";
+    case 1:  return "FreePage";
+    case 2:  return "PageIn";
+    case 3:  return "PoolAllocation";
+    case 4:  return "DelayExecution";
+    case 5:  return "Suspended";
+    case 6:  return "UserRequest";
+    case 7:  return "WrExecutive";
+    case 8:  return "WrFreePage";
+    case 9:  return "WrPageIn";
+    case 10: return "WrPoolAllocation";
+    case 11: return "WrDelayExecution";
+    case 12: return "WrSuspended";
+    case 13: return "WrUserRequest";
+    case 14: return "WrEventPair";
+    case 15: return "WrQueue";
+    case 16: return "WrLpcReceive";
+    case 17: return "WrLpcReply";
+    case 18: return "WrVirtualMemory";
+    case 19: return "WrPageOut";
+    case 20: return "WrRendezvous";
+    case 21: return "WrKeyedEvent";
+    case 22: return "WrTerminated";
+    case 27: return "WrProcessInSwap";
+    case 28: return "WrCpuAlert";
+    case 29: return "WrCallback";
+    case 30: return "WrDeferredReady";
+    case 31: return "WrDeferredReadyFiber";
+    default: return "";
+    }
+}
+
+static si_NtSuspendThread_t fn_nt_suspend   = NULL;
+static si_NtResumeThread_t  fn_nt_resume    = NULL;
+static si_NtQueryInformationThread_t fn_nt_query_t = NULL;
+
+static void nt_thread_funcs_init(void)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    if (!fn_nt_suspend)
+        fn_nt_suspend = (si_NtSuspendThread_t)
+            GetProcAddress(ntdll, "NtSuspendThread");
+    if (!fn_nt_resume)
+        fn_nt_resume = (si_NtResumeThread_t)
+            GetProcAddress(ntdll, "NtResumeThread");
+    if (!fn_nt_query_t)
+        fn_nt_query_t = (si_NtQueryInformationThread_t)
+            GetProcAddress(ntdll, "NtQueryInformationThread");
+}
+
+/* 给单个 tid 拿当前 SuspendCount（不可用时返回 -1）。*/
+static long thread_suspend_count(DWORD tid)
+{
+    THREAD_BASIC_INFORMATION_SI tbi;
+    ULONG got = 0;
+    HANDLE h;
+    long sc = -1;
+    if (!fn_nt_query_t) return -1;
+    h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return -1;
+    if (fn_nt_query_t(h, SI_ThreadBasicInformation, &tbi, sizeof(tbi), &got) >= 0)
+        sc = (long)tbi.SuspendCount;
+    CloseHandle(h);
+    return sc;
+}
+
+/* 给单个 tid 拿 GetThreadDescription（Win10+），不可用时返回空字符串。*/
+static void thread_description(DWORD tid, WCHAR *buf, size_t bufsz)
+{
+    buf[0] = 0;
+    {
+        typedef HRESULT (WINAPI *GetThreadDescription_t)(HANDLE, PWSTR *);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (!k32) return;
+        GetThreadDescription_t gtd = (GetThreadDescription_t)
+            GetProcAddress(k32, "GetThreadDescription");
+        if (!gtd) return;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!h) return;
+        PWSTR p = NULL;
+        if (SUCCEEDED(gtd(h, &p)) && p) {
+            wcsncpy(buf, p, bufsz / sizeof(WCHAR) - 1);
+            buf[bufsz / sizeof(WCHAR) - 1] = 0;
+            LocalFree(p);
+        }
+        CloseHandle(h);
+    }
+}
+
+static void collect_threads(si_json *arr)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te;
+    int emitted = 0;
+    if (snap == INVALID_HANDLE_VALUE) return;
+    te.dwSize = sizeof(te);
+    if (!Thread32First(snap, &te)) { CloseHandle(snap); return; }
+    do {
+        if (te.th32OwnerProcessID != g_pid) continue;
+        {
+            si_json *o;
+            WCHAR  desc[64] = {0};
+            char   desc_utf8[64] = {0};
+            if (g_self_thread_id == 0) g_self_thread_id = GetCurrentThreadId();
+            if (te.th32ThreadID == g_self_thread_id) continue;
+            thread_description(te.th32ThreadID, desc, sizeof(desc));
+            utf8_path(desc, desc_utf8, sizeof(desc_utf8));
+            o = si_json_new();
+            if (!o) continue;
+            si_json_set_int(o, "tid", (long long)te.th32ThreadID);
+            si_json_set_int(o, "base_priority", (long long)te.tpBasePri);
+            si_json_set_int(o, "delta_priority", (long long)te.tpDeltaPri);
+            si_json_set_int(o, "suspend_count",
+                            (long long)thread_suspend_count(te.th32ThreadID));
+            si_json_set_str(o, "state", thread_state_name(te.dwFlags & 0xff));
+            si_json_set_str(o, "wait_reason", thread_wait_reason(
+                (te.dwFlags >> 16) & 0x7fff));
+            si_json_set_str(o, "description", desc_utf8);
+            si_json_array_push(arr, o);
+            emitted++;
+            if (emitted >= SI_MAX_THREADS_PER_LIST) break;
+        }
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+}
+
+static int do_suspend_thread(DWORD tid)
+{
+    HANDLE h;
+    LONG prev = 0, rc;
+    if (!fn_nt_suspend) return -1;
+    h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!h) return -1;
+    rc = fn_nt_suspend(h, &prev);
+    CloseHandle(h);
+    if (rc < 0) return -1;
+    return (int)prev;   /* 调用前的 SuspendCount；调用后 +1 */
+}
+
+static int do_resume_thread(DWORD tid)
+{
+    HANDLE h;
+    LONG prev = 0, rc;
+    if (!fn_nt_resume) return -1;
+    h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!h) return -1;
+    rc = fn_nt_resume(h, &prev);
+    CloseHandle(h);
+    if (rc < 0) return -1;
+    return (int)prev;   /* 调用前的 SuspendCount */
+}
 
 /*
  * 解析目标模块的 IMAGE_EXPORT_DIRECTORY。**不依赖 dbghelp / symsrv**，
@@ -1561,6 +1769,50 @@ static void agent_handle(const char *text)
         si_json_set_arr(out, "exports", exports);
         si_json_set_int(out, "count", (long long)n);
         si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "threads") == 0) {
+        /* 目标进程线程枚举。结果：threads=[{tid, base_priority, delta_priority,
+         *                       suspend_count, state, wait_reason, description}] */
+        si_json *arr = si_json_new_array();
+        if (!arr) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "alloc");
+        } else {
+            nt_thread_funcs_init();
+            collect_threads(arr);
+            si_json_set_arr(out, "threads", arr);
+            si_json_set_bool(out, "ok", 1);
+        }
+
+    } else if (strcmp(type, "thread_suspend") == 0 ||
+               strcmp(type, "thread_resume") == 0) {
+        long long tid = si_json_get_int(msg, "tid", 0);
+        int prev = -1;
+        long sc  = -1;
+        if (tid <= 0) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "tid 必填正整数");
+        } else {
+            nt_thread_funcs_init();
+            if (type[7] == 's')
+                prev = do_suspend_thread((DWORD)tid);
+            else
+                prev = do_resume_thread((DWORD)tid);
+            sc = thread_suspend_count((DWORD)tid);
+            if (prev < 0) {
+                char buf[96];
+                snprintf(buf, sizeof(buf), "操作失败 (0x%lX / %s)",
+                         (unsigned long)GetLastError(),
+                         type[7] == 's' ? "NtSuspendThread" : "NtResumeThread");
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", buf);
+            } else {
+                si_json_set_int(out, "tid", tid);
+                si_json_set_int(out, "prev_suspend_count", (long long)prev);
+                si_json_set_int(out, "suspend_count", sc);
+                si_json_set_bool(out, "ok", 1);
+            }
+        }
 
     } else if (strcmp(type, "mem_regions") == 0) {
         si_json                 *arr = si_json_new_array();
