@@ -186,6 +186,71 @@ class Api:
     def delete_snapshot(self, pid: int, name: str) -> bool:
         return self.controller.delete_snapshot(int(pid), name)
 
+    # -------------------------------------------------- 硬件断点（v1.3.0 P2）
+
+    def bp_set(self, pid: int, target: str, tid: int = 0,
+               bp_type: str = "exec", size: int = 1) -> dict:
+        """前端用：先拉一次 info + 模块 exports 再喂给 controller 解析
+        ``module!symbol+0x42``；并把当前 symbols 索引挂在 Controller 上
+        以便后续 bp_remove 复用。"""
+        idx = self._build_bp_index(int(pid), target)
+        return self.controller.breakpoint_set(
+            int(pid), address=0, target=target,
+            tid=int(tid), bp_type=str(bp_type), size=int(size),
+            symbol_index=idx,
+        )
+
+    def bp_list(self, pid: int) -> dict:
+        return self.controller.breakpoint_list(int(pid))
+
+    def bp_remove(self, pid: int, target: str, tid: int = 0) -> dict:
+        idx = self._build_bp_index(int(pid), target)
+        return self.controller.breakpoint_remove(
+            int(pid), address=0, target=target, tid=int(tid),
+            symbol_index=idx,
+        )
+
+    def bp_clear(self, pid: int) -> dict:
+        return self.controller.breakpoint_clear(int(pid))
+
+    def _build_bp_index(self, pid: int, target: str):
+        """给前端 / GUI 用的轻量级索引构造（解析失败返 None）。"""
+        if not target or "!" not in target:
+            return None
+        import re as _re
+        m = _re.match(r"\s*([^!\s]+)!", target or "")
+        if not m:
+            return None
+        mod_name = m.group(1)
+        try:
+            info = self.controller.info([pid], no_exports=True, budget=0)
+        except Exception:
+            return None
+        if not isinstance(info, list) or not info:
+            return None
+        modules = (info[0] or {}).get("modules", []) if isinstance(info[0], dict) else []
+        from .symbols import build_module_index, merge_export_payload
+        index = build_module_index(modules)
+        found = next((k for k in index if k.lower() == mod_name.lower()), None)
+        if not found:
+            return index
+        try:
+            resp = self.controller.exports(int(pid), name=found, budget=512)
+            if resp and resp.get("ok"):
+                merge_export_payload(index, found, resp)
+        except Exception:
+            pass
+        return index
+
+    # -------------------------------------------------- 事件（崩溃 / patch / 断点）
+
+    def list_events(self, pid: int = 0, name: str = "",
+                    clear: bool = False) -> list:
+        return self.controller.list_events(
+            int(pid) if pid else None,
+            name=name or None, clear=bool(clear),
+        )
+
     # -------------------------------------------------- 资源
 
     def resources(self, pids: list) -> list:

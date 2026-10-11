@@ -754,6 +754,141 @@ class Controller:
             return SnapshotStore(root=Path(override))
         return SnapshotStore(root=snapshot_root())
 
+    # ---------------------------------------------------------- 硬件断点（P2）
+
+    def breakpoint_set(self, pid: int, address: int = 0, *,
+                       target: str = "", tid: int = 0,
+                       bp_type: str = "exec", size: int = 1,
+                       symbol_index: Optional[dict] = None) -> dict:
+        """装载一条硬件断点。
+
+        - ``address`` 非 0 时直接下发数字地址；
+        - ``target`` 是字符串，支持 ``0x401000`` 或 ``module!symbol+0x42``
+          形式 —— 由 ``superinject.symbols.resolve_symbol`` 在给定
+          ``symbol_index`` 中查找；
+        - 二者都给时优先 ``address``；都没给返回错误。
+
+        返回 ``{ok, addr, slot, kind, ...}`` 或 ``{ok: False, error: ...}``。
+        命中事件通过 ``on_event`` 推送（``event:breakpoint``），字段
+        schema 见 agent.c 的 si_send_breakpoint_event —— P3 阶段补全
+        ``regs`` / ``stack`` 字段。
+        """
+        # P3 占位字段写死成空对象 / 空数组（在 DLL 端落地），不在控制器造
+        resolved = None
+        if address == 0 and target:
+            from .symbols import resolve_symbol
+            ix = symbol_index if symbol_index is not None else {}
+            resolved = resolve_symbol(ix, target)
+            if resolved:
+                addr_int, _mod, _off, _sym = resolved
+                address = int(addr_int)
+            else:
+                # fallback: 把 target 当整数（最后努力一次）
+                try:
+                    address = int(str(target), 0)
+                except (ValueError, TypeError):
+                    return {"ok": False,
+                            "error": f"无法解析符号 / 地址: {target!r}",
+                            "pid": int(pid)}
+        if address == 0:
+            return {"ok": False, "error": "缺少 address 或可解析的 target",
+                    "pid": int(pid)}
+        bp_type_s = (bp_type or "exec").lower()
+        if bp_type_s not in {"exec", "read", "write", "rw"}:
+            return {"ok": False,
+                    "error": f"不支持的 type: {bp_type!r}",
+                    "pid": int(pid)}
+        msg: dict = {
+            "type": "bp_set",
+            "address": int(address),
+            "tid": int(tid),
+            "type_str": bp_type_s,
+            "len": int(size) if size else 1,
+        }
+        resp = self.server.request(int(pid), msg, timeout=10)
+        out = {"pid": int(pid), "requested": target or f"0x{address:x}",
+               "address": int(address),
+               "resolved": bool(resolved),
+               "resolved_symbol": resolved[3] if resolved else None,
+               "resolved_module": resolved[1] if resolved else None}
+        if not resp.get("ok"):
+            out["ok"] = False
+            out["error"] = resp.get("error", "bp_set 失败")
+            return out
+        out["ok"] = True
+        out["slot"] = int(resp.get("slot", -1))
+        out["kind"] = "hw" if out["slot"] >= 0 else "veh"
+        out["type"] = resp.get("type") or bp_type_s
+        out["len"] = int(resp.get("len", size if size else 1))
+        out["tid"] = int(resp.get("tid", tid))
+        return out
+
+    def breakpoint_list(self, pid: int) -> dict:
+        """返回目标进程所有当前装载的断点（含命中计数）。"""
+        resp = self.server.request(int(pid), {"type": "bp_list"}, timeout=10)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "bp_list 失败"),
+                    "pid": int(pid)}
+        return {
+            "ok": True,
+            "pid": int(pid),
+            "bps": list(resp.get("bps", [])),
+            "hw_slots_used":  int(resp.get("hw_slots_used", 0)),
+            "hw_slots_total": int(resp.get("hw_slots_total", 0)),
+            "veh_slots_used": int(resp.get("veh_slots_used", 0)),
+            "veh_slots_total": int(resp.get("veh_slots_total", 0)),
+        }
+
+    def breakpoint_remove(self, pid: int, address: int = 0, *,
+                          target: str = "", tid: int = 0,
+                          symbol_index: Optional[dict] = None) -> dict:
+        """卸一条断点。``address`` 或 ``target`` 其中之一必填。"""
+        addr_int = int(address or 0)
+        if addr_int == 0 and target:
+            from .symbols import resolve_symbol
+            ix = symbol_index if symbol_index is not None else {}
+            resolved = resolve_symbol(ix, target)
+            if resolved:
+                addr_int = int(resolved[0])
+            else:
+                try:
+                    addr_int = int(str(target), 0)
+                except (ValueError, TypeError):
+                    return {"ok": False,
+                            "error": f"无法解析 {target!r}",
+                            "pid": int(pid)}
+        if addr_int == 0:
+            return {"ok": False, "error": "缺少 address 或可解析的 target",
+                    "pid": int(pid)}
+        resp = self.server.request(int(pid), {
+            "type": "bp_remove",
+            "address": addr_int,
+            "tid": int(tid),
+        }, timeout=10)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "bp_remove 失败"),
+                    "pid": int(pid)}
+        return {
+            "ok": True,
+            "pid": int(pid),
+            "address": addr_int,
+            "removed_hw":  int(resp.get("removed_hw", 0)),
+            "removed_veh": int(resp.get("removed_veh", 0)),
+        }
+
+    def breakpoint_clear(self, pid: int) -> dict:
+        """清空目标进程所有断点。"""
+        resp = self.server.request(int(pid), {"type": "bp_clear"}, timeout=10)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "bp_clear 失败"),
+                    "pid": int(pid)}
+        return {
+            "ok": True,
+            "pid": int(pid),
+            "cleared_hw":  int(resp.get("cleared_hw", 0)),
+            "cleared_veh": int(resp.get("cleared_veh", 0)),
+        }
+
     # ---------------------------------------------------------- 资源
 
     def resources(self, pids: List[int]) -> List[dict]:

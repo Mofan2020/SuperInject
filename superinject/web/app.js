@@ -564,6 +564,231 @@
     state.snapPid = selected()[0] || null;
   };
 
+  // ---------------------------------------------------------- 硬件断点（v1.3.0 P2）
+  //
+  // 视图：
+  //   - 顶部：装载表单（target / type / size / tid）
+  //   - 列表：当前 PID 的所有 bp，命中数随事件实时刷新
+  //   - 折叠：命中事件流（点开查看，"复制最新 payload" 给 Agent 看）
+  //
+  // GUI ↔ Controller 一致："module!symbol+0x42" 自动经 symbols 层解析，
+  // 与 bp_set / bp_remove / bp_list / bp_clear 四个 RPC 一一对应。
+  state.bps = [];            // [{addr, type, len, kind, tid, hit_count, slot}, ...]
+  state.bpPid = null;
+  state.bpEvents = [];       // 最近命中事件
+
+  function shortAddr(a) {
+    return "0x" + Number(a).toString(16).padStart(8, "0");
+  }
+
+  function renderBps() {
+    const tb = $("#bp-table tbody");
+    tb.innerHTML = "";
+    if (!state.bps.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="7" class="empty">先在进程表选中目标 → 输入地址/符号 → 装载</td>';
+      tb.appendChild(tr);
+    } else {
+      state.bps.forEach((bp) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+          `<td>${shortAddr(bp.addr)}</td>` +
+          `<td>${escapeHtml(bp.type || "")}</td>` +
+          `<td>${bp.len || 1}</td>` +
+          `<td>${escapeHtml(bp.kind || (bp.slot >= 0 ? "hw" : "veh"))}</td>` +
+          `<td>${bp.tid || 0}</td>` +
+          `<td><b>${bp.hit_count || 0}</b></td>` +
+          `<td><button class="warn small" data-addr="${bp.addr}" data-tid="${bp.tid || 0}">移除</button></td>`;
+        tb.appendChild(tr);
+      });
+      tb.querySelectorAll("button[data-addr]").forEach((btn) => {
+        btn.addEventListener("click", () => removeBpByAddr(
+          Number(btn.dataset.addr), Number(btn.dataset.tid),
+        ));
+      });
+    }
+    $("#btn-bp-clear").disabled = state.bps.length === 0;
+  }
+
+  async function refreshBps() {
+    if (!state.bpPid) {
+      log("请先在进程表里选中一个进程后再刷新断点列表", "warn");
+      return;
+    }
+    const r = await call("bp_list", state.bpPid);
+    if (r && r.ok) {
+      state.bps = Array.isArray(r.bps) ? r.bps : [];
+      renderBps();
+      log(`断点列表：hw ${r.hw_slots_used}/${r.hw_slots_total}，veh ${r.veh_slots_used}/${r.veh_slots_total}`, "ok");
+    } else {
+      log("bp_list 失败: " + (r && r.error || "未知错误"), "err");
+    }
+  }
+
+  async function setBpFromForm() {
+    if (!state.bpPid) {
+      log("请先在进程表里选中一个目标进程", "warn");
+      return;
+    }
+    const target = ($("#bp-target").value || "").trim();
+    if (!target) {
+      log("请先输入地址 / 模块符号", "warn");
+      return;
+    }
+    const bp_type = $("#bp-type").value || "exec";
+    const size = parseInt($("#bp-size").value || "1", 10);
+    const tid = parseInt($("#bp-tid").value || "0", 10);
+    log(`装载断点 pid=${state.bpPid} ${target} type=${bp_type} size=${size} tid=${tid}…`);
+    const r = await call("bp_set", state.bpPid, target, tid, bp_type, size);
+    if (r && r.ok) {
+      log(`断点装载：${shortAddr(r.address)} slot=${r.slot} kind=${r.kind} ` +
+          (r.resolved_symbol ? `(sym ${r.resolved_module}!${r.resolved_symbol})` : ""),
+          "ok");
+      $("#bp-target").value = "";
+      await refreshBps();
+    } else {
+      log("bp_set 失败: " + (r && r.error || "未知错误"), "err");
+    }
+  }
+
+  async function removeBpByAddr(addr, tid) {
+    if (!state.bpPid) return;
+    // 直接传数字字面量；GUI 不再经过符号解析层（断点已经按 addr 唯一定位）。
+    const target = "0x" + Number(addr).toString(16);
+    log(`移除断点 ${target} tid=${tid}…`);
+    const r = await call("bp_remove", state.bpPid, target, tid);
+    if (r && r.ok) {
+      log(`已移除 (hw ${r.removed_hw}, veh ${r.removed_veh})`, "ok");
+      await refreshBps();
+    } else {
+      log("bp_remove 失败: " + (r && r.error || "未知错误"), "err");
+    }
+  }
+
+  async function clearAllBps() {
+    if (!state.bpPid) return;
+    if (!await confirmBox("移除所有断点", `即将清空 pid=${state.bpPid} 的所有断点。`)) return;
+    const r = await call("bp_clear", state.bpPid);
+    if (r && r.ok) {
+      log(`已清空（hw ${r.cleared_hw}, veh ${r.cleared_veh}）`, "ok");
+      await refreshBps();
+    } else {
+      log("bp_clear 失败: " + (r && r.error || "未知错误"), "err");
+    }
+  }
+
+  async function refreshBpEvents() {
+    if (!state.bpPid) return;
+    const items = await call("list_events", state.bpPid, "breakpoint");
+    const arr = Array.isArray(items) ? items : [];
+    state.bpEvents = arr.slice(-20).reverse();   // 最新在上
+    const box = $("#bp-events");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!state.bpEvents.length) {
+      box.innerHTML = '<div class="muted pad">尚无命中事件</div>';
+      $("#btn-bp-copy").disabled = true;
+      return;
+    }
+    state.bpEvents.forEach((e, idx) => {
+      const row = document.createElement("div");
+      row.className = "bp-evt";
+      const t = new Date(e.ts_ms || Date.now()).toLocaleTimeString();
+      row.innerHTML =
+        `<div class="meta">#${state.bpEvents.length - idx} ${t} · ` +
+        `addr <b>${shortAddr(e.addr)}</b> · tid <b>${e.tid || 0}</b> · ` +
+        `hit <b>${e.hit_count || 0}</b> · kind <b>${e.kind || (e.slot >= 0 ? "hw" : "veh")}</b></div>`;
+      const pre = document.createElement("pre");
+      pre.className = "bp-evt-payload";
+      pre.textContent = JSON.stringify(e, null, 2);
+      row.appendChild(pre);
+      box.appendChild(row);
+    });
+    $("#btn-bp-copy").disabled = !state.bpEvents.length;
+  }
+
+  async function copyLatestBpPayload() {
+    if (!state.bpEvents.length) return;
+    const text = JSON.stringify(state.bpEvents[0], null, 2);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // 降级走陈旧 Clipboard API
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand && document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      log("已复制最新一条命中 payload 到剪贴板", "ok");
+    } catch (e) {
+      log("复制失败: " + e, "err");
+    }
+  }
+
+  function clearBpEvents() {
+    if (!state.bpPid) return;
+    // 取完清空（事件列表）
+    call("list_events", state.bpPid, "breakpoint", true).then(() => {
+      state.bpEvents = [];
+      const box = $("#bp-events");
+      if (box) box.innerHTML = '<div class="muted pad">已清空</div>';
+      $("#btn-bp-copy").disabled = true;
+    });
+  }
+
+  // 绑定 button + 表单 + 选中 PID 时联动
+  (function initBpPanel() {
+    $("#btn-bp-refresh").addEventListener("click", refreshBps);
+    $("#btn-bp-set").addEventListener("click", setBpFromForm);
+    $("#btn-bp-clear").addEventListener("click", clearAllBps);
+    $("#bp-target").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") setBpFromForm();
+    });
+    $("#btn-bp-copy").addEventListener("click", copyLatestBpPayload);
+    $("#btn-bp-clear-events").addEventListener("click", clearBpEvents);
+  })();
+
+  // 进程选择变化 → 同步刷新断点列表 + 命中事件。
+  // 不是另开一条事件总线，而是直接订阅 checkbox 的 change 事件 / 行
+  // click：因为不同区域（事件 / 断点 / patch_list 等）都依赖选中 PID，
+  // 用统一的 state.sel.add / delete 钩子更稳。
+  (function hookBpSelection() {
+    const selTable = $("#proc-table");
+    if (!selTable) return;
+    const sync = () => {
+      const arr = Array.from(state.sel);
+      const pid = arr.length ? arr[0] : null;
+      if (pid && pid !== state.bpPid) {
+        state.bpPid = pid;
+        refreshBps();
+        refreshBpEvents();
+      } else if (!pid) {
+        state.bpPid = null;
+      }
+    };
+    selTable.addEventListener("change", (e) => {
+      if (e.target.tagName === "INPUT") sync();
+    });
+    selTable.addEventListener("click", (e) => {
+      // 行级 click 在 tr.addEventListener 里跑；DOM 冒泡到 table 后再补一刀
+      if (e.target.closest("tr")) sync();
+    });
+  })();
+
+  // 与上面 hook 重复，避免一边 hook 不到；保留 null 占位以便将来扩展。
+  const _origOnSel = window.__onProcSelForBp__;
+  document.addEventListener("supinject:selection-changed", (ev) => {
+    const pid = ev && ev.detail && ev.detail.pid;
+    if (pid) {
+      state.bpPid = pid;
+      refreshBps();
+      refreshBpEvents();
+    }
+  });
+
   // ---------------------------------------------------------- 分区导航
   // 整页滚动后用一个分段控件在功能区之间跳转；滚动时自动高亮当前区。
   (function initNav() {

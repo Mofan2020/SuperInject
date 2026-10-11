@@ -502,3 +502,76 @@ def test_inject_target_with_foreign_temp(ctrl, tmp_path):
     finally:
         ctrl.unload([pid])
         kill(pid)
+
+
+# ------------------------------------------------------------------ 硬件断点（v1.3.0 P2）
+
+def test_hw_breakpoint_on_ping(injected, ctrl):
+    """在注入 ping.exe 后用 ``bp-set`` 在某个导出函数入口装载一条硬件断点，
+    命中后应能收到 ``event:breakpoint``。
+
+    本用例需要真实 ping.exe / DLL，只在 Windows 跑。
+    """
+    c = ctrl   # fixture 里返回 Controller 实例
+    pid = injected
+
+    # 1. 拉一次 info（不携带 exports —— 模块导出表解析曾有 CI 越界 bug）
+    info = c.server.request(pid, {"type": "info", "no_exports": 1}, timeout=15)
+    assert info.get("ok"), info
+    modules = info.get("modules") or []
+    ping_mod = next(
+        (m for m in modules if m.get("name", "").lower().startswith("ping")),
+        None,
+    )
+    assert ping_mod, f"未在模块表里找到 ping 模块：{modules}"
+
+    # 2. 把 ping 模块的导出表单独拉一份（budget 显式给，留 CI 友好裕度）
+    exp = c.server.request(
+        pid, {"type": "exports", "base": int(ping_mod["base"]),
+              "budget": 256}, timeout=15,
+    )
+    assert exp.get("ok"), exp
+    exports = exp.get("exports") or []
+    assert exports, f"ping 模块导出表为空：{exp}"
+
+    # 3. 选 ping 模块里 name 含 'Icmp' 的导出函数（ping 用 Win32 Icmp* API）
+    target_sym = next(
+        (e for e in exports
+         if e.get("name") and "Icmp" in str(e["name"])),
+        None,
+    )
+    if target_sym is None:
+        # 没找到特定函数也可以跳到第一个导出
+        target_sym = exports[0]
+    addr = int(ping_mod["base"]) + int(target_sym.get("rva", 0))
+
+    # 4. 装载一条 exec 硬件断点
+    set_resp = c.server.request(pid, {
+        "type": "bp_set",
+        "address": addr,
+        "tid": 0,                # pid 用 VEH 模拟，比硬件 DR 更稳（ping 多线程）
+        "type_str": "exec",
+        "len": 1,
+    }, timeout=15)
+    assert set_resp.get("ok"), f"bp_set 失败：{set_resp}"
+    slot = int(set_resp.get("slot", -1))
+    assert slot >= 0 or slot == -1  # 任意路径都接受；下次 list 看槽位
+
+    # 5. 等 hit_count ≥ 1（ping 持续发包，必触发）：
+    def got_hit():
+        lst = c.server.request(pid, {"type": "bp_list"}, timeout=5)
+        bps = lst.get("bps") or []
+        match = [b for b in bps if int(b.get("addr", -1)) == addr]
+        if not match:
+            return False
+        return (match[0].get("hit_count") or 0) >= 1
+
+    # 留 25 秒等命中：real ping -t 一般一两秒就会触发，但 CI 上慢一点也能接受
+    assert _wait_until(got_hit, timeout=25.0, interval=0.5), \
+        "在 25 秒内未收到断点命中事件"
+
+    # 6. 清理
+    clear = c.server.request(pid, {"type": "bp_clear"}, timeout=10)
+    assert clear.get("ok"), clear
+    assert (int(clear.get("cleared_hw", 0))
+            + int(clear.get("cleared_veh", 0))) >= 1

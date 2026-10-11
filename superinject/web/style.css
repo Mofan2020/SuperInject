@@ -531,3 +531,94 @@ td.path { color: var(--label-2); font-size: 11.5px; word-break: break-all; }
 @media (max-width: 980px) {
   .snap-row { grid-template-columns: 1fr; }
 }
+
+
+/* ---------------------------------------------------------- 硬件断点面板（v1.3.0 P2） */
+.bp-add-bar {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 6px;
+  padding: 9px 13px;
+  background: rgba(255,255,255,.02);
+  border-bottom: 1px solid var(--separator);
+}
+.bp-add-bar input,
+.bp-add-bar select {
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--input-bd);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.bp-add-bar #bp-target { flex: 1 1 220px; min-width: 180px; }
+#bp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+#bp-table th, #bp-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--separator);
+  text-align: left;
+}
+#bp-table th {
+  background: var(--card-hi);
+  color: var(--label-2);
+  font-weight: 500;
+}
+#bp-table td {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#bp-table td:nth-child(2),
+#bp-table td:nth-child(3),
+#bp-table td:nth-child(4),
+#bp-table td:nth-child(5),
+#bp-table td:nth-child(6) {
+  font-family: inherit;
+}
+#bp-table .empty {
+  text-align: center; color: var(--label-3); padding: 16px 12px;
+  font-family: inherit;
+}
+#bp-table button.small { padding: 2px 8px; font-size: 11px; }
+.bp-events {
+  border-top: 1px solid var(--separator);
+  padding: 10px 13px 14px;
+}
+.bp-events summary { cursor: pointer; font-size: 12.5px; color: var(--label-2); }
+.bp-events-bar {
+  margin-top: 6px;
+  display: flex; gap: 6px;
+}
+#bp-events.bp-events-list {
+  margin-top: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--separator);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: rgba(255,255,255,.03);
+  font-size: 11.5px;
+}
+.bp-evt {
+  border-bottom: 1px dashed var(--separator);
+  padding: 5px 0;
+}
+.bp-evt:last-child { border-bottom: none; }
+.bp-evt .meta {
+  color: var(--label-2);
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+.bp-evt .meta b { color: var(--ok); }
+.bp-evt-payload {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  background: rgba(0,0,0,.18);
+  padding: 5px 7px;
+  border-radius: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}

@@ -42,7 +42,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import dll_manager, ipc, winapi
 from .console import safe_print
@@ -79,6 +79,10 @@ HELP_TEXT = """\
   diff --pid N --a A --b B [--limit N]
   snapshots --pid N
   snapshot-delete --pid N --name NAME
+  bp-set --pid N TARGET [--tid TID] [--type exec|read|write|rw] [--size 1|2|4|8]
+  bp-list --pid N
+  bp-remove --pid N TARGET [--tid TID]
+  bp-clear --pid N
   unload --pid N...
   terminate --pid N...
   open PATH
@@ -290,6 +294,32 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp = sub.add_parser("snapshot-delete", help="删除一个已存快照")
     sp.add_argument("--pid", type=int, required=True)
     sp.add_argument("--name", required=True)
+
+    # ----------- 硬件断点（P2 v1.3.0）-----------
+
+    sp = sub.add_parser("bp-set", help="装载一条硬件断点")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("target",
+                    help="数字地址（0x401000）或 module!symbol+0x42 形式")
+    sp.add_argument("--tid", type=int, default=0,
+                    help="目标线程；0=进程级（VEH 模拟）")
+    sp.add_argument("--type", default="exec",
+                    choices=["exec", "read", "write", "rw"],
+                    help="断点类型（DR7 R/W 字段）")
+    sp.add_argument("--size", type=int, default=1, choices=[1, 2, 4, 8],
+                    help="长度（与 type 配合；exec 默认 1，write/rw 取 1/2/4/8）")
+
+    sp = sub.add_parser("bp-list", help="列出目标进程所有断点")
+    sp.add_argument("--pid", type=int, required=True)
+
+    sp = sub.add_parser("bp-remove", help="移除一条断点")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("target",
+                    help="数字地址或 module!symbol+0x42 形式")
+    sp.add_argument("--tid", type=int, default=0)
+
+    sp = sub.add_parser("bp-clear", help="清空目标进程所有断点")
+    sp.add_argument("--pid", type=int, required=True)
 
     sp = sub.add_parser("open", help="资源管理器定位文件")
     sp.add_argument("path")
@@ -544,6 +574,42 @@ def _check_yes_or_exit(yes: bool) -> int:
     return 3
 
 
+def _build_bp_index(controller: Controller, pid: int, target: str) -> Optional[dict]:
+    """为 ``bp-set`` / ``bp-remove`` 在 ``module!symbol+0x42`` 形式下构造
+    一个 symbols 解析索引：先 info() 拉模块列表（不强制带 exports，避免 CI
+    ping 的导出表越界），再单独 ``exports()`` 拉 ``module`` 名对应模块。
+
+    返回 ``None`` 时 Controller 会按 fallback（数字）处理；返回 ``{}`` 表
+    示模块确实不存在。
+    """
+    import re as _re
+    m = _re.match(r"\s*([^!\s]+)!", target or "")
+    if not m:
+        return None
+    mod_name = m.group(1)
+    try:
+        info_resp = controller.info([pid], no_exports=True, budget=0)
+        if not info_resp:
+            return None
+        modules = (info_resp[0] or {}).get("modules", []) if isinstance(info_resp, list) else []
+    except Exception:
+        modules = []
+    index: Dict[str, dict] = {}
+    from .symbols import build_module_index
+    index = build_module_index(modules)
+    found = next((k for k in index if k.lower() == mod_name.lower()), None)
+    if not found:
+        return index  # 让 controller.resolve_symbol 报"找不到模块"
+    try:
+        exp_resp = controller.exports(int(pid), name=found, budget=512)
+        if exp_resp and exp_resp.get("ok"):
+            from .symbols import merge_export_payload
+            merge_export_payload(index, found, exp_resp)
+    except Exception:
+        pass
+    return index
+
+
 def _skip_elevation() -> bool:
     """测试用：跳过 elevate.ensure_privilege 调用。"""
     return False
@@ -776,6 +842,52 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
                                                   str(args.name))
         return {"ok": ok, "kind": "snapshot-delete",
                 "name": str(args.name), "deleted": ok}
+
+    # ----------- 硬件断点（P2 v1.3.0）-----------
+
+    if sub == "bp-set":
+        from .ipc import parse_int
+        c = _ensure_controller()
+        # 解析 target：先按数字地址试；不行就走模块索引自动拉一次 info。
+        target = str(args.target)
+        addr = 0
+        try:
+            addr = parse_int(target)
+        except ValueError:
+            addr = 0
+        index = None
+        if addr == 0 and "!" in target:
+            # 拉一次 info + 对应模块 exports，再给到 controller 解析符号
+            index = _build_bp_index(c, int(args.pid), target)
+        return c.breakpoint_set(int(args.pid), address=addr,
+                                target=target if addr == 0 else "",
+                                tid=int(args.tid),
+                                bp_type=str(args.type),
+                                size=int(args.size),
+                                symbol_index=index)
+
+    if sub == "bp-list":
+        return _ensure_controller().breakpoint_list(int(args.pid))
+
+    if sub == "bp-remove":
+        from .ipc import parse_int
+        c = _ensure_controller()
+        target = str(args.target)
+        addr = 0
+        try:
+            addr = parse_int(target)
+        except ValueError:
+            addr = 0
+        index = None
+        if addr == 0 and "!" in target:
+            index = _build_bp_index(c, int(args.pid), target)
+        return c.breakpoint_remove(int(args.pid), address=addr,
+                                   target=target if addr == 0 else "",
+                                   tid=int(args.tid),
+                                   symbol_index=index)
+
+    if sub == "bp-clear":
+        return _ensure_controller().breakpoint_clear(int(args.pid))
 
     if sub == "open":
         ok = _ensure_controller().open_path(args.path)

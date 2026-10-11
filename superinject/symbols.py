@@ -131,3 +131,85 @@ def merge_export_payload(index: Dict[str, dict], module_name: str,
     mod["exports"] = items
     mod["exports_count"] = int(payload.get("count") or len(items))
     return mod["exports_count"]
+
+
+# P2 硬件断点：把 ``module!symbol+0x42`` 这种字符串解析回地址。
+#
+# 形式与限制：
+#   ``module``                模块名（不计大小写）
+#   ``module+0x42``           无符号：模块基址 + 该偏移
+#   ``module!symbol``         符号入口（导出表匹配第一个）
+#   ``module!symbol+0x42``    符号入口 + 偏移
+#   ``0x401000``              原始 16/10 进制整数 —— 直接返回
+#
+# 失败返回 ``None``，让 Controller 决定是否 fallback 到原始数字地址。
+#
+# 正则说明：先按 ``!`` 切成 module / rest；rest 段再按可选 ``+offset`` 切。
+# 这样 ``foo.dll!bar+0x42`` 不会因为 ``+`` 在两个字符组里都要排除而配失败。
+_SYMBOL_REST_RE = re.compile(
+    r"^(?P<sym>[^+]*)"
+    r"(?P<off>\s*\+\s*0x[0-9a-fA-F]+|\s*\+\s*\d+)?\s*$"
+)
+
+
+def resolve_symbol(index: Dict[str, dict], target: str
+                   ) -> Optional[Tuple[int, str, int, Optional[str]]]:
+    """解析 ``module!symbol+offset`` 形式的字符串，返回 ``(addr, module,
+    offset, symbol_or_None)``。
+
+    - 字符串看起来像纯数字（"0x401000" / "4198400"） → 直接转 int 返回；
+    - 含 ``!`` 或 ``+`` 时按 *module[!symbol][+offset]* 解析；
+    - 该模块尚未有 ``exports`` 列表时按 offset 形式可用（只按 base+offset）；
+    - 找不到模块 / 找不到符号 → 返回 None。
+    """
+    if target is None:
+        return None
+    text = str(target).strip()
+    if not text:
+        return None
+    # 纯数字地址 → 直接返回
+    if re.fullmatch(r"(0x)?[0-9a-fA-F]+", text):
+        addr = parse_int(text, 0)
+        return (addr, "", 0, None) if addr else None
+
+    # 先按 ``!`` 切；rest 段再细分。
+    if "!" in text:
+        mod_name, _, rest = text.partition("!")
+    elif "+" in text:
+        # 没有 ``!`` —— 模块名 + 偏移
+        mod_name, _, rest = text.partition("+")
+        rest = "+" + rest
+    else:
+        # 单段（纯模块名，没有 ! 和 +） —— base + 0
+        mod_name = text
+        rest = ""
+
+    mod_name = mod_name.strip()
+    if not mod_name:
+        return None
+    m = _SYMBOL_REST_RE.match(rest or "")
+    if not m:
+        return None
+    sym_name = (m.group("sym") or "").strip()
+    off_text = (m.group("off") or "").strip()
+    offset = parse_int(off_text.replace("+", "").strip() or "0", 0) if off_text else 0
+
+    # 不计大小写匹配 module 名
+    lookup = {k.lower(): v for k, v in index.items()}
+    mod = lookup.get(mod_name.lower())
+    if not mod:
+        return None
+    base = int(mod.get("base") or 0)
+    if not base:
+        return None
+    if sym_name:
+        # 在模块导出里找名字完全匹配的（名字包含子串也行 —— 给"模糊匹配"留口）
+        for exp in mod.get("exports") or []:
+            name = str(exp.get("name") or "")
+            if not name:
+                continue
+            if name == sym_name or sym_name.lower() in name.lower():
+                rva = int(exp.get("rva") or 0)
+                return (base + rva + offset, mod["name"], offset, name)
+        return None
+    return (base + offset, mod["name"], offset, None)

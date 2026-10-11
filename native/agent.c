@@ -98,6 +98,155 @@ static int si_is_elevated(void)
 #define SI_SNAP_HEAD_BYTES   64           /* 每页保留的最前 64 字节 */
 #define SI_SNAP_MAX_PAGES    16384        /* 单次快照最多覆盖 64MB（按页算） */
 
+/*
+ * P2 硬件断点 —— DR0-DR3 + VEH 兜底（v1.3.0）
+ *
+ * x86 单条 debug addr 寄存器（DR0..DR3）只有 4 个槽，DR7 控制位（LE/GE +
+ * LEN/RW）决定类型与启用。第 5 条及以上没有硬件槽可用，于是走"进程级 VEH
+ * 模拟"：单条 INT3 / 写入 fa 标志位（参见 handle_breakpoint）—— 命中
+ * 后从 P2 走不到硬件，但能装而且能 push 事件。文档明确告诉用户：
+ *
+ *   - 指定 --tid 时用硬件 4 槽（快，无运行时开销）
+ *   - 不指定 --tid（默认）按当前实现走 VEH 模拟（命中时通过查
+ *     target addr 表确认，未命中继续）
+ *
+ * 注：v1.2.0 的崩溃转储 VEH（AddVectoredExceptionHandler 1）继续保留，
+ * *同一 handler* 内部先按 ExceptionCode 分流：
+ *
+ *   - EXCEPTION_BREAKPOINT / EXCEPTION_SINGLE_STEP：先看是不是我们模拟的
+ *     断点（按 RIP 命中查表），命中 → 装成本次异常（让目标线程被冻结一
+ *     下），调 send_breakpoint_event 给控制器推 event:breakpoint，
+ *     返回 EXCEPTION_CONTINUE_EXECUTION；
+ *   - 其它异常走原崩溃转储路径。
+ */
+#define SI_BP_MAX_DR_SLOTS    4           /* DR0-DR3 */
+#define SI_BP_MAX_VEH         32          /* 进程级 VEH 模拟槽（远超实际需要） */
+
+/*
+ * DR7 控制位填法（Intel SDM, Vol. 3B）：
+ *   L0..L3 在 DR7 偏 0/2/4/6 bit 0：本地启用（per-thread, SetThreadContext 装）；
+ *   G0..G3 在偏 0/2/4/6 bit 1：全局启用（进程级，但需要内核态切换 DR7）；
+ *   R/W0..R/W3 在偏 16/20/24/28 的 bit 16-17：0=exec,1=write,2=I/O,3=R/W；
+ *   LEN0..LEN3 在偏 16/20/24/28 的 bit 18-19：0=1B,1=2B,2=8B（不支持）,
+ *                                                3=4B。
+ *
+ * 单条断点的控制字段是 DR7 中"局部启用 + RW + LEN 4 位 + 启用 L 标志"。
+ */
+#define SI_BP_DR7_ENABLE_BIT(slot)   (1u << (2 * (slot)))          /* L0..L3 */
+#define SI_BP_DR7_RW_SHIFT(slot)     (16 + 4 * (slot))             /* R/W0..R/W3 */
+#define SI_BP_DR7_LEN_SHIFT(slot)    (18 + 4 * (slot))             /* LEN0..LEN3 */
+
+/*
+ * RW 编码（DR7 R/W 位）：
+ *   0 = instruction fetch (exec)
+ *   1 = data write
+ *   2 = I/O read/write
+ *   3 = data read/write
+ *
+ * LEN 编码（DR7 LEN 位）：
+ *   0 = 1 byte
+ *   1 = 2 bytes
+ *   2 = 8 bytes
+ *   3 = 4 bytes
+ *
+ * 用户协议里 type 是字符串，controller 会先翻译成数值再下发；这里再做一次
+ * 最后的合法性校验，确保非法组合不会装进 DR7（避免说"已装好但根本不会触发"）。
+ */
+static unsigned char si_dr7_rw_for(int type)
+{
+    switch (type) {
+    case 0:                                          /* exec 1B */
+    case 6:                                          /* exec 2B */
+    case 7:                                          /* exec 4B */
+        return 0;
+    case 1:                                          /* read 1B */
+    case 3:                                          /* rw 2B */
+    case 4:                                          /* rw 4B */
+    case 5:                                          /* rw 8B（长度可能 8） */
+        return 3;
+    case 2:                                          /* write 1B */
+        return 1;
+    default:
+        return 0;                                    /* 默认 exec */
+    }
+}
+
+static unsigned char si_dr7_len_for(int type, int len)
+{
+    switch (type) {
+    case 6:                                          /* exec 2B */
+        return 1;
+    case 7:                                          /* exec 4B */
+        return 3;
+    case 4:                                          /* rw 4B */
+        return 3;
+    case 5:                                          /* rw 8B */
+        return 2;                                    /* 8 字节 len=10b */
+    case 3:                                          /* rw 2B */
+        return 1;
+    default:
+        return 0;                                    /* 1B */
+    }
+    (void)len;                                       /* 已用 type 决定 */
+}
+
+typedef struct {
+    DWORD  tid;            /* 目标线程；0 = 进程级（VEH 模拟） */
+    ULONG_PTR addr;       /* 断点地址 */
+    int    type;           /* 见 si_dr7_rw_for */
+    int    len;            /* 1 / 2 / 4 / 8 */
+    int    slot;           /* DR0-DR3（hw）；-1 = VEH 模拟 */
+    int    enabled;
+    int    hit_count;
+} si_breakpoint_t;
+
+static si_breakpoint_t g_hw_bps   [SI_BP_MAX_DR_SLOTS];
+static si_breakpoint_t g_veh_bps  [SI_BP_MAX_VEH];
+/* 注：曾经的 g_hw_used 全局计数改用循环求 enabled 数以避免变量漂移。 */
+
+/* 短句柄保护 send_all：VEH 命中时与 worker 线程都调用 send_json，加锁保
+ * 险。CriticalSection 在 DllMain 初始化，进程结束 Windows 自己回收。 */
+static CRITICAL_SECTION g_send_cs;
+static int              g_send_cs_inited = 0;
+
+/*
+ * "VEH 模拟"用什么手段实现：当 SLOT 用完或用户希望走整进程命中时，我们
+ * 不能在 4 个硬件槽放下更多 bp。两条可行路径：
+ *
+ *  - INT3 0xCC patch：把 addr 的首字节改成 0xCC，命中时 Eip 在
+ *    ExceptionAddress 上会指到这条指令的下一条（=addr+1）。命中后我们
+ *    推事件，最后回到原线程。原字节和原保护属性记到 g_veh_bps 里。
+ *
+ *  - guard page：把 addr 所在的 page 设 PAGE_GUARD，命中时靠
+ *    STATUS_GUARD_PAGE。我们走 INT3 路径，因为它不破坏内存布局，
+ *    也避开了"目标在 RunByOther 状态"的兼容性陷阱。
+ *
+ * 单条命中处理：VEH 看到 ExceptionCode == EXCEPTION_BREAKPOINT 且
+ * ExceptionAddress 命中 g_veh_bps[*].addr → 推事件，把 addr 的首字节
+ * 重写回原值（暂时"单步"过去），单步命中后再把 0xCC 装回去 —— 避免
+ * 同一条 INT3 同一执行路径递归。
+ *
+ * 注意：VEH 模拟的 cont flow 比 hw 慢（一次 INT3 至少两次异常），但只
+ * 在 P2 阶段是 fallback；P3 寄存器捕获时不需要"原字节暂存表"作额外
+ * 同步，只读 CONTEXT 来填。再说，bp_set 已经把它们和 hit_count 一起
+ * 更新，hit 在 VEH handler 内部加锁（同样用 g_send_cs 即可）。
+ */
+typedef struct {
+    ULONG_PTR addr;
+    BYTE      orig_byte;       /* 被改成的 0xCC 之前的字节 */
+    int       used;            /* 槽是否已用 */
+} si_veh_slot_t;
+
+static si_veh_slot_t g_veh_patch[SI_BP_MAX_VEH];
+
+static void si_send_cs_init(void)
+{
+    if (!g_send_cs_inited) {
+        InitializeCriticalSection(&g_send_cs);
+        g_send_cs_inited = 1;
+    }
+}
+
 /* NtQueryVirtualMemory 信息类（等价于 winternl.h 的 MemoryMappedFilenameInformation） */
 #define SI_MemoryMappedFilenameInformation 2
 
@@ -208,7 +357,15 @@ static int send_json(si_json *j)
     }
     memcpy(frame, &n, 4);
     memcpy(frame + 4, text, n);
-    ok = send_all(frame, (size_t)n + 4);
+    /* send 可能从 worker（agent_handle）和 VEH 命中线程并发调用，
+     * 加锁避免半帧。g_send_cs 在 DllMain 初始化。 */
+    if (g_send_cs_inited) EnterCriticalSection(&g_send_cs);
+    if (g_sock != INVALID_SOCKET) {
+        ok = send_all(frame, (size_t)n + 4);
+    } else {
+        ok = 0;
+    }
+    if (g_send_cs_inited) LeaveCriticalSection(&g_send_cs);
     si_free(text);
     free(frame);
     if (!ok) log_msg("send_json: 发送失败 err=%d bytes=%lu",
@@ -1287,6 +1444,185 @@ static int si_should_capture(EXCEPTION_POINTERS *ep)
     return 1;
 }
 
+/*
+ * P2 硬件断点 —— VEH 流程集成。
+ *
+ * v1.2.0 的 crash handler 在 VEH 先看 si_should_capture：EXCEPTION_BREAKPOINT
+ * 被当成"我们自己没用过"挡掉。P2 引入后这条不再合适 — — 我们 install 的 VEH
+ * 模拟断点就是 EXCEPTION_BREAKPOINT 信号。所以我们 *不让 si_should_capture 改*
+ * ，而是在 VEH handler 的入口先做一次匹配：ExceptionRecord->ExceptionAddress
+ * 是否在我们的 VEH 模拟表里。命中 → 走 bp 路径，**不再**走到
+ * si_should_capture/崩溃转储。
+ *
+ * 这条路径要承担三件事：
+ *   1. 让 BP 触发线程被冻结（EXCEPTION_CONTINUE_EXECUTION 即可，VEH 退出
+ *      后那条线程的 EXCEPTION_DISPATCH 流程停在断点）；
+ *   2. 推一条 event:breakpoint 给控制器；
+ *   3. 因为本线程被冻住，hit_count + 1 + 把 0xCC 还原回原字节 → 再走单步让
+ *      处理器过这条指令 → 单步命中后再把 0xCC 重写回去（避免 hot loop）。
+ */
+
+static long si_send_breakpoint_event(si_breakpoint_t *bp, ULONG_PTR fault_addr,
+                                      DWORD tid)
+{
+    si_json *evt = si_json_new();
+    if (!evt) return 0;
+    bp->hit_count++;
+    /*
+     * 协议字段约定（v1.3.0 P2）：
+     *   type        — 固定 "event:breakpoint"
+     *   addr        — 断点地址
+     *   pid / tid   — 触发线程
+     *   slot        — 硬件槽（0..3），VEH 模拟为 -1
+     *   kind        — "hw" 或 "veh"（GDB "breakpoint vs watchpoint" 思路）
+     *   fault_addr  — 实际触发时的 ExceptionAddress（VEH 路径下与 addr 略差）
+     *   hit_count   — 命中次数（递增）
+     *   regs        — 占位对象，P3 阶段补全（CONTEXT_FULL）
+     *   stack       — 占位数组，P3 阶段补全（16 个 QWORD）
+     *
+     * 占位字段从一开始就要在协议里存在，避免 P3 接入时再改 schema。
+     */
+    si_json_set_str(evt, "type", "event:breakpoint");
+    si_json_set_int(evt, "addr", (long long)bp->addr);
+    si_json_set_int(evt, "pid", (long long)g_pid);
+    si_json_set_int(evt, "tid", (long long)tid);
+    si_json_set_int(evt, "slot", bp->slot);
+    si_json_set_str(evt, "kind", bp->slot < 0 ? "veh" : "hw");
+    si_json_set_int(evt, "fault_addr", (long long)fault_addr);
+    si_json_set_int(evt, "hit_count", (long long)bp->hit_count);
+    si_json_set_int(evt, "bp_type", (long long)bp->type);
+    si_json_set_int(evt, "bp_len",  (long long)bp->len);
+    /* P3 占位：regs / stack 字段先为空 obj / 空 arr。 */
+    si_json_set_obj(evt, "regs",  si_json_new());
+    si_json_set_arr(evt, "stack", si_json_new_array());
+    send_json(evt);
+    si_json_free(evt);
+    return 1;
+}
+
+/*
+ * 在 g_veh_patch 里查找命中 addr。命中返回槽下标，否则 -1。
+ * patch 表是按"首字节改成 0xCC"的地址为 key；命中时 EIP/RIP 会指向
+ * fault_addr（本指令的下一字节，即 addr+1）。
+ */
+static int si_veh_lookup_fault(ULONG_PTR fault_addr, ULONG_PTR *orig_addr)
+{
+    int i;
+    ULONG_PTR want = fault_addr ? (fault_addr - 1) : 0;   /* INT3 单字节 */
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_patch[i].used) continue;
+        if (g_veh_patch[i].addr == want) {
+            *orig_addr = want;
+            return i;
+        }
+        /* 兼容调用方直接传 orig addr（命中点在一条 INT3 之后）。 */
+        if (g_veh_patch[i].addr == fault_addr) {
+            *orig_addr = fault_addr;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* 用 VirtualProtect 把 addr 的首字节写成 0xCC，记下原值。失败返回 0。 */
+static int si_veh_patch_one(ULONG_PTR addr, BYTE *orig_out)
+{
+    DWORD old_prot = 0;
+    BYTE  orig;
+    SIZE_T wrote;
+    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr,
+                           &orig, 1, NULL)) {
+        return 0;
+    }
+    /* 调用前 page 有可能不是 PAGE_EXECUTE_READWRITE，先尝试改成它。 */
+    if (!VirtualProtect((LPVOID)addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+        return 0;
+    }
+    if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)addr,
+                            (LPCVOID)(BYTE[]){0xCC}, 1, &wrote) || wrote != 1) {
+        VirtualProtect((LPVOID)addr, 1, old_prot, &old_prot);
+        return 0;
+    }
+    VirtualProtect((LPVOID)addr, 1, old_prot, &old_prot);
+    *orig_out = orig;
+    return 1;
+}
+
+/* 把原字节写回。 */
+static void si_veh_unpatch(int idx)
+{
+    DWORD old_prot = 0;
+    if (idx < 0 || idx >= SI_BP_MAX_VEH || !g_veh_patch[idx].used) return;
+    if (!VirtualProtect((LPVOID)g_veh_patch[idx].addr, 1,
+                        PAGE_EXECUTE_READWRITE, &old_prot)) return;
+    (void)WriteProcessMemory(GetCurrentProcess(),
+                              (LPVOID)g_veh_patch[idx].addr,
+                              (LPCVOID)&g_veh_patch[idx].orig_byte,
+                              1, NULL);
+    VirtualProtect((LPVOID)g_veh_patch[idx].addr, 1, old_prot, &old_prot);
+}
+
+/* VEH 命中分支。命中并处理返回 EXCEPTION_CONTINUE_EXECUTION。 */
+static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
+{
+    ULONG_PTR fault = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+    ULONG_PTR orig = 0;
+    int idx = si_veh_lookup_fault(fault, &orig);
+    if (idx < 0) return EXCEPTION_CONTINUE_SEARCH;          /* 不是我们的 BP */
+    /* bp record：在 g_veh_bps 里以 orig 为 key 找对应记录，更新 hit_count */
+    si_breakpoint_t *bp = NULL;
+    int i;
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (g_veh_bps[i].addr == orig && g_veh_bps[i].enabled) {
+            bp = &g_veh_bps[i];
+            break;
+        }
+    }
+    if (!bp) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD tid = GetCurrentThreadId();
+    si_send_breakpoint_event(bp, fault, tid);
+    /* 单步跳过去 —— 把 0xCC 还原回原字节，并把 Eip 跳到 orig 地址；
+     * 用 TRAP_FLAG 会再触发 SINGLE_STEP，我们在 crt_main_dispatch 里再
+     * 装回去。 */
+    si_veh_unpatch(idx);
+    CONTEXT *ctx = ep->ContextRecord;
+    /* RIP 回到 orig；flags 加 TF（x86/x64 都是 bit 8）。 */
+    ctx->Rip = (DWORD64)orig;  /* x64 上 RunByOther 也能改 RIP */
+#if defined(_M_X64) || defined(__x86_64__)
+    ctx->EFlags |= 0x100;       /* TRAP_FLAG */
+#else
+    ctx->EFlags |= 0x100;
+#endif
+    /* 标记本 idx 需要 SINGLE_STEP 命中后重装 0xCC：用一个全局槽记。 */
+    /* idx 复用 g_veh_bps 里的 NULL 槽 + 计数字段。下面直接用 g_veh_bps[i]
+     * 的 type 字段做"待重装"标记，简化 — — type |= 0x80 意味着 pending。 */
+    bp->type |= 0x80;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/* SINGLE_STEP 命中：把之前 unpatch 的 0xCC 重装回去。 */
+static LONG si_veh_single_step_dispatch(EXCEPTION_POINTERS *ep)
+{
+    int i;
+    CONTEXT *ctx = ep->ContextRecord;
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_bps[i].enabled) continue;
+        if (!(g_veh_bps[i].type & 0x80)) continue;
+        g_veh_bps[i].type &= ~0x80;
+        /* 找到对应 patch 槽，重写 0xCC */
+        int j;
+        for (j = 0; j < SI_BP_MAX_VEH; j++) {
+            if (g_veh_patch[j].used && g_veh_patch[j].addr == g_veh_bps[i].addr) {
+                si_veh_patch_one(g_veh_bps[i].addr, &g_veh_patch[j].orig_byte);
+                break;
+            }
+        }
+    }
+    /* 清 TRAP_FLAG */
+    ctx->EFlags &= ~0x100u;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 static LONG WINAPI agent_seh_filter(EXCEPTION_POINTERS *ep)
 {
     if (!si_should_capture(ep)) return EXCEPTION_CONTINUE_SEARCH;
@@ -1297,6 +1633,22 @@ static LONG WINAPI agent_seh_filter(EXCEPTION_POINTERS *ep)
 
 static LONG WINAPI agent_veh_filter(EXCEPTION_POINTERS *ep)
 {
+    /*
+     * P2 硬件断点 VEH 命中 —— 在 si_should_capture 之前先匹配。
+     * 不是我们自己的 BP → 返回 SEARCH，让 si_should_capture 跑；
+     * 是我们自己的 → 走 bp 分支，绕开崩溃转储。
+     */
+    if (ep && ep->ExceptionRecord) {
+        DWORD c0 = ep->ExceptionRecord->ExceptionCode;
+        if (c0 == EXCEPTION_BREAKPOINT) {
+            LONG rc = si_veh_breakpoint_dispatch(ep);
+            if (rc != EXCEPTION_CONTINUE_SEARCH) return rc;
+        } else if (c0 == EXCEPTION_SINGLE_STEP) {
+            LONG rc = si_veh_single_step_dispatch(ep);
+            if (rc != EXCEPTION_CONTINUE_SEARCH) return rc;
+        }
+    }
+
     if (!si_should_capture(ep)) return EXCEPTION_CONTINUE_SEARCH;
     /*
      * 栈溢出 / 非法指令时 VEH 在一块极小栈上（guard page 后的几个字节）被
@@ -2235,6 +2587,363 @@ static int si_collect_pages(si_json *regions_arr,
 
 /* ------------------------- 指令分发 ------------------------- */
 
+/*
+ * ------------------------- P2 硬件断点命令 -------------------------
+ *
+ * bp_set / bp_list / bp_remove / bp_clear —— 由 agent_handle 调度到。
+ *
+ * 类型编码（与 controller 端约定）：
+ *   type ∈ {"exec", "read", "write", "rw"} + len ∈ {1, 2, 4, 8}
+ *
+ *  - 当 controller 给的是 "module!symbol+0x42" 形式时，它会先在本地解析成
+ *    addr 再下发 —— P2 不在 DLL 端做符号解析（导出表来自另一条 info 通道）。
+ *  - tid=0 时走 VEH 模拟（不受线程限制，但受总条目数 SI_BP_MAX_VEH 限制）。
+ *  - tid>0 时先用线程上下文 SetThreadContext 装到 DR0-DR3；4 槽用完后
+ *    自动降到 VEH 模拟（remaining 槽用 si_veh_* 路径）。
+ *  - 硬件槽不够 + VEH 槽也不够 → 返回 no_slot_available 让用户主动 remove。
+ */
+
+static int si_bp_type_to_code(const char *type_str)
+{
+    if (!type_str) return 0;
+    if (strcmp(type_str, "exec")  == 0) return 0;
+    if (strcmp(type_str, "read")  == 0) return 1;
+    if (strcmp(type_str, "write") == 0) return 2;
+    if (strcmp(type_str, "rw")    == 0) return 3;
+    return -1;
+}
+
+static const char *si_bp_code_to_type(int code)
+{
+    switch (code & 0x7F) {
+    case 0: return "exec";
+    case 1: return "read";
+    case 2: return "write";
+    case 3: return "rw";
+    case 6: return "exec2";
+    case 7: return "exec4";
+    case 4: return "rw4";
+    case 5: return "rw8";
+    }
+    return "exec";
+}
+
+/* 找一个未用的硬件槽（enabled == 0），返下标；找不到 -1。 */
+static int si_bp_find_free_hw(void)
+{
+    int i;
+    for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+        if (!g_hw_bps[i].enabled) return i;
+    }
+    return -1;
+}
+
+/* 找一个未用的 VEH 槽（含 bp 与 patch 表并行分配）。返下标，找不到 -1。 */
+static int si_bp_find_free_veh(void)
+{
+    int i;
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_bps[i].enabled) return -1;
+    }
+    /* 全 enabled 看是否有"已 enabled 但 patch 槽没了"的崩溃态，保守拒绝。 */
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_patch[i].used && !g_veh_bps[i].enabled) return i;
+    }
+    return -1;
+}
+
+/* 按 addr + tid 找记录，返回下标，找不到 -1。P2 测试用例会引用——保留。 */
+__attribute__((unused))
+static int si_bp_lookup_hw_by_addr(DWORD tid, ULONG_PTR addr)
+{
+    int i;
+    for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+        if (g_hw_bps[i].enabled &&
+            g_hw_bps[i].addr == addr &&
+            g_hw_bps[i].tid  == tid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+__attribute__((unused))
+static int si_bp_lookup_veh_by_addr(ULONG_PTR addr)
+{
+    int i;
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (g_veh_bps[i].enabled && g_veh_bps[i].addr == addr) return i;
+    }
+    return -1;
+}
+
+/*
+ * 用 SetThreadContext 装一条硬件断点。slot 用 si_bp_find_free_hw 选。
+ * 失败（OpenThread 失败 / SetThreadContext 失败）保留返回值供调用方。
+ */
+static int si_bp_set_hw(int slot, DWORD tid, ULONG_PTR addr, int type, int len)
+{
+    HANDLE  th = NULL;
+    CONTEXT ctx;
+    DWORD   dr7;
+    DWORD   dr6;
+    BOOL    ok;
+    /* OpenThread 也只用于我们自己的进程。PROCESS_VM_OPERATION 已够，
+     * 但我们要改 context —— 用 THREAD_GET_CONTEXT + SET_CONTEXT 即可。 */
+    DWORD access = THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                   THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION;
+    th = OpenThread(access, FALSE, tid);
+    if (!th) {
+        log_msg("bp_set_hw: OpenThread(%lu) 失败 err=%lu",
+                (unsigned long)tid, (unsigned long)GetLastError());
+        return 0;
+    }
+    if (SuspendThread(th) == (DWORD)-1) {
+        log_msg("bp_set_hw: SuspendThread(%lu) 失败 err=%lu",
+                (unsigned long)tid, (unsigned long)GetLastError());
+        CloseHandle(th);
+        return 0;
+    }
+    memset(&ctx, 0, sizeof(ctx));
+#if defined(_M_X64) || defined(__x86_64__)
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_AMD64;
+#else
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_i386;
+#endif
+    /* CONTEXT_i386 / CONTEXT_AMD64 在 Windows SDK winnt.h 里分别是 x86 与
+     * x64 上下文标志 —— 一次只一个；WOW64 / 32 位 DLL 编译走 CONTEXT_i386
+     * + 编译器字段（Dr0..3 是 DWORD）。 */
+    /* 取 context 实际上 cl 会忽略「不匹配本机」的标志，所以两个都给也行。*/
+    ok = GetThreadContext(th, &ctx);
+    if (!ok) {
+        log_msg("bp_set_hw: GetThreadContext(%lu) 失败 err=%lu",
+                (unsigned long)tid, (unsigned long)GetLastError());
+        (void)ResumeThread(th);
+        CloseHandle(th);
+        return 0;
+    }
+    /*
+     * DR 寄存器是固定字节（x64 寄存器名均带 R 前缀；x86 / WOW64 自动适用
+     * 编译宏）。WOW64 路径 P3 详细化，P2 阶段用 64 位定义打 64 位 DLL，
+     * 32 位 DLL 走 _M_IX86 分支。
+     */
+#if defined(_M_X64) || defined(__x86_64__)
+    switch (slot) {
+    case 0: ctx.Dr0 = addr; break;
+    case 1: ctx.Dr1 = addr; break;
+    case 2: ctx.Dr2 = addr; break;
+    case 3: ctx.Dr3 = addr; break;
+    default: break;
+    }
+    dr7 = ctx.Dr7;
+    dr7 &= ~(0xFu << (16 + 4 * slot));      /* 清 RW/LEN 字段 */
+    dr7 |= ((DWORD)si_dr7_rw_for(type) << SI_BP_DR7_RW_SHIFT(slot));
+    dr7 |= ((DWORD)si_dr7_len_for(type, len) << SI_BP_DR7_LEN_SHIFT(slot));
+    dr7 |= SI_BP_DR7_ENABLE_BIT(slot);      /* 本地启用 L 位 */
+    /* 顺手清 G 位（避免和别的调试器冲突） */
+    dr7 &= ~((DWORD)1u << (2 * slot + 1));
+    ctx.Dr7 = dr7;
+    /* Dr6 用于读"哪条断点命中"，先清空（DR6 是只读 DR6.B0..3） */
+    dr6 = ctx.Dr6;
+    dr6 &= ~(0xFu);
+    ctx.Dr6 = dr6;
+#else
+    switch (slot) {
+    case 0: ctx.Dr0 = (DWORD)addr; break;
+    case 1: ctx.Dr1 = (DWORD)addr; break;
+    case 2: ctx.Dr2 = (DWORD)addr; break;
+    case 3: ctx.Dr3 = (DWORD)addr; break;
+    default: break;
+    }
+    dr7 = ctx.Dr7;
+    dr7 &= ~(0xFu << (16 + 4 * slot));
+    dr7 |= ((DWORD)si_dr7_rw_for(type) << SI_BP_DR7_RW_SHIFT(slot));
+    dr7 |= ((DWORD)si_dr7_len_for(type, len) << SI_BP_DR7_LEN_SHIFT(slot));
+    dr7 |= SI_BP_DR7_ENABLE_BIT(slot);
+    dr7 &= ~((DWORD)1u << (2 * slot + 1));
+    ctx.Dr7 = dr7;
+    ctx.Dr6 &= ~(0xFu);
+#endif
+    ok = SetThreadContext(th, &ctx);
+    if (!ok) {
+        log_msg("bp_set_hw: SetThreadContext(%lu) 失败 err=%lu",
+                (unsigned long)tid, (unsigned long)GetLastError());
+        (void)ResumeThread(th);
+        CloseHandle(th);
+        return 0;
+    }
+    (void)ResumeThread(th);
+    CloseHandle(th);
+    return 1;
+}
+
+/*
+ * 清除一个 hardware 槽：Dr{slot} 清 0、Dr7 启用位清 0。
+ */
+static void si_bp_clear_hw(int slot, DWORD tid)
+{
+    HANDLE th;
+    DWORD  access = THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION;
+    CONTEXT ctx;
+    th = OpenThread(access, FALSE, tid);
+    if (!th) return;
+    if (SuspendThread(th) == (DWORD)-1) {
+        CloseHandle(th);
+        return;
+    }
+    memset(&ctx, 0, sizeof(ctx));
+#if defined(_M_X64) || defined(__x86_64__)
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_AMD64;
+#else
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_i386;
+#endif
+    if (!GetThreadContext(th, &ctx)) {
+        ResumeThread(th);
+        CloseHandle(th);
+        return;
+    }
+#if defined(_M_X64) || defined(__x86_64__)
+    switch (slot) {
+    case 0: ctx.Dr0 = 0; break;
+    case 1: ctx.Dr1 = 0; break;
+    case 2: ctx.Dr2 = 0; break;
+    case 3: ctx.Dr3 = 0; break;
+    default: break;
+    }
+    ctx.Dr7 &= ~SI_BP_DR7_ENABLE_BIT(slot);
+    ctx.Dr7 &= ~(0xFu << SI_BP_DR7_RW_SHIFT(slot));
+    ctx.Dr7 &= ~(0x3u << SI_BP_DR7_LEN_SHIFT(slot));
+#else
+    switch (slot) {
+    case 0: ctx.Dr0 = 0; break;
+    case 1: ctx.Dr1 = 0; break;
+    case 2: ctx.Dr2 = 0; break;
+    case 3: ctx.Dr3 = 0; break;
+    default: break;
+    }
+    ctx.Dr7 &= ~SI_BP_DR7_ENABLE_BIT(slot);
+    ctx.Dr7 &= ~(0xFu << SI_BP_DR7_RW_SHIFT(slot));
+    ctx.Dr7 &= ~(0x3u << SI_BP_DR7_LEN_SHIFT(slot));
+#endif
+    (void)SetThreadContext(th, &ctx);
+    ResumeThread(th);
+    CloseHandle(th);
+}
+
+/*
+ * 装载 VEH 模拟断点：1) 找空槽 2) patch 首字节 3) 记录在 g_veh_bps 与
+ * g_veh_patch 中。失败把已修改的字节还原。
+ */
+static int si_bp_set_veh(ULONG_PTR addr, int type, int len, int *out_idx,
+                          int *out_patch_idx)
+{
+    int idx = -1, pidx = -1, i;
+    BYTE orig = 0;
+    /* 找 bp 槽位 */
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_bps[i].enabled) { idx = i; break; }
+    }
+    if (idx < 0) return 0;
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_patch[i].used && idx == i) { pidx = i; break; }
+    }
+    /* 实际上 g_veh_bps 和 g_veh_patch 是平行表（同样下标）；我们刻意分两个
+     * 表是为了将来允许同地址多次 bp_set（不会在 P2 出现，但留口子）。 */
+    pidx = idx;
+    if (g_veh_patch[pidx].used) return 0;
+    if (!si_veh_patch_one(addr, &orig)) {
+        return 0;
+    }
+    g_veh_patch[pidx].addr      = addr;
+    g_veh_patch[pidx].orig_byte = orig;
+    g_veh_patch[pidx].used      = 1;
+    g_veh_bps[idx].addr    = addr;
+    g_veh_bps[idx].type    = type;
+    g_veh_bps[idx].len     = len;
+    g_veh_bps[idx].tid     = 0;
+    g_veh_bps[idx].slot    = -1;
+    g_veh_bps[idx].enabled = 1;
+    g_veh_bps[idx].hit_count = 0;
+    *out_idx = idx;
+    *out_patch_idx = pidx;
+    return 1;
+}
+
+static void si_bp_clear_all(si_json *out)
+{
+    int i, cleared_hw = 0, cleared_veh = 0;
+    for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+        if (g_hw_bps[i].enabled) {
+            DWORD tid = g_hw_bps[i].tid;
+            si_bp_clear_hw(i, tid);
+            g_hw_bps[i].enabled = 0;
+            g_hw_bps[i].addr = 0;
+            cleared_hw++;
+        }
+    }
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (g_veh_bps[i].enabled) {
+            si_veh_unpatch(i);
+            g_veh_bps[i].enabled = 0;
+            g_veh_bps[i].addr = 0;
+            g_veh_bps[i].type = 0;
+            g_veh_bps[i].hit_count = 0;
+            g_veh_patch[i].used = 0;
+            g_veh_patch[i].addr = 0;
+            g_veh_patch[i].orig_byte = 0;
+            cleared_veh++;
+        }
+    }
+    si_json_set_int(out, "cleared_hw", (long long)cleared_hw);
+    si_json_set_int(out, "cleared_veh", (long long)cleared_veh);
+}
+
+/* 把所有断点序列化成数组，挂到 out 下的 bps 字段。 */
+static void si_bp_dump(si_json *out)
+{
+    si_json *arr = si_json_new_array();
+    int i;
+    si_json_set_int(out, "hw_slots_total", SI_BP_MAX_DR_SLOTS);
+    si_json_set_int(out, "veh_slots_total", SI_BP_MAX_VEH);
+    {
+        int hw_used = 0, veh_used = 0;
+        for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+            if (g_hw_bps[i].enabled) hw_used++;
+        }
+        for (i = 0; i < SI_BP_MAX_VEH; i++) {
+            if (g_veh_bps[i].enabled) veh_used++;
+        }
+        si_json_set_int(out, "hw_slots_used",  hw_used);
+        si_json_set_int(out, "veh_slots_used", veh_used);
+    }
+    for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+        if (!g_hw_bps[i].enabled) continue;
+        si_json *o = si_json_new();
+        si_json_set_int(o, "addr",   (long long)g_hw_bps[i].addr);
+        si_json_set_int(o, "tid",    (long long)g_hw_bps[i].tid);
+        si_json_set_int(o, "slot",   (long long)g_hw_bps[i].slot);
+        si_json_set_str(o, "kind",   "hw");
+        si_json_set_str(o, "type",   si_bp_code_to_type(g_hw_bps[i].type));
+        si_json_set_int(o, "len",    (long long)g_hw_bps[i].len);
+        si_json_set_int(o, "hit_count", (long long)g_hw_bps[i].hit_count);
+        si_json_array_push(arr, o);
+    }
+    for (i = 0; i < SI_BP_MAX_VEH; i++) {
+        if (!g_veh_bps[i].enabled) continue;
+        si_json *o = si_json_new();
+        si_json_set_int(o, "addr",   (long long)g_veh_bps[i].addr);
+        si_json_set_int(o, "tid",    0);
+        si_json_set_int(o, "slot",   -1);
+        si_json_set_str(o, "kind",   "veh");
+        si_json_set_str(o, "type",   si_bp_code_to_type(g_veh_bps[i].type));
+        si_json_set_int(o, "len",    (long long)g_veh_bps[i].len);
+        si_json_set_int(o, "hit_count", (long long)g_veh_bps[i].hit_count);
+        si_json_array_push(arr, o);
+    }
+    si_json_set_arr(out, "bps", arr);
+}
+
 static void agent_handle(const char *text)
 {
     si_json     *msg = si_json_parse(text);
@@ -2694,6 +3403,132 @@ static void agent_handle(const char *text)
         dump_resources(out);
         si_json_set_bool(out, "ok", 1);
 
+    } else if (strcmp(type, "bp_set") == 0) {
+        /*
+         * 装载一条硬件断点（优先硬件 DR 槽，不够用 VEH 模拟）。
+         *
+         * 协议字段：
+         *   tid           1=指定线程（SetThreadContext 装 DR），0=进程级（VEH 模拟）
+         *   address       ULONG_PTR ——必须给
+         *   type          "exec"/"read"/"write"/"rw"
+         *   len           1/2/4/8（对 exec/rw 有效；默认 1）
+         *
+         * 命中后通过 event:breakpoint 推送，参见 si_veh_breakpoint_dispatch
+         * 与 si_send_breakpoint_event。
+         */
+        long long    addr_ll = si_json_get_int(msg, "address", 0);
+        DWORD        tid     = (DWORD)si_json_get_int(msg, "tid", 0);
+        const char  *type_s  = si_json_get_str(msg, "type", "exec");
+        int          len     = (int)si_json_get_int(msg, "len", 1);
+        int          code    = si_bp_type_to_code(type_s);
+        ULONG_PTR    addr    = (ULONG_PTR)addr_ll;
+        if (code < 0) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "invalid type");
+        } else if (addr == 0) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "missing address");
+        } else if (tid != 0) {
+            int slot = si_bp_find_free_hw();
+            if (slot < 0 && si_bp_find_free_veh() < 0) {
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "no_slot_available");
+            } else if (slot >= 0 && si_bp_set_hw(slot, tid, addr, code, len)) {
+                g_hw_bps[slot].addr    = addr;
+                g_hw_bps[slot].tid     = tid;
+                g_hw_bps[slot].type    = code;
+                g_hw_bps[slot].len     = len;
+                g_hw_bps[slot].slot    = slot;
+                g_hw_bps[slot].enabled = 1;
+                g_hw_bps[slot].hit_count = 0;
+                si_json_set_int(out, "addr",   (long long)addr);
+                si_json_set_int(out, "tid",    (long long)tid);
+                si_json_set_int(out, "slot",   (long long)slot);
+                si_json_set_int(out, "kind",   0);  /* 0=hw */
+                si_json_set_str(out, "type",   type_s);
+                si_json_set_int(out, "len",    (long long)len);
+                si_json_set_bool(out, "ok", 1);
+            } else {
+                /* hw 失败/不可用 → 退化到 VEH 模拟（同样适用 tid>0） */
+                int idx = -1, pidx = -1;
+                if (!si_bp_set_veh(addr, code, len, &idx, &pidx)) {
+                    si_json_set_bool(out, "ok", 0);
+                    si_json_set_str(out, "error", "no_slot_available");
+                } else {
+                    si_json_set_int(out, "addr", (long long)addr);
+                    si_json_set_int(out, "tid",  (long long)tid);
+                    si_json_set_int(out, "slot", -1);
+                    si_json_set_int(out, "kind", 1);
+                    si_json_set_str(out, "type", type_s);
+                    si_json_set_int(out, "len",  (long long)len);
+                    si_json_set_bool(out, "ok", 1);
+                }
+            }
+        } else {
+            /* tid == 0：直接 VEH 模拟 */
+            int idx = -1, pidx = -1;
+            if (!si_bp_set_veh(addr, code, len, &idx, &pidx)) {
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "no_slot_available");
+            } else {
+                si_json_set_int(out, "addr", (long long)addr);
+                si_json_set_int(out, "tid",  0);
+                si_json_set_int(out, "slot", -1);
+                si_json_set_int(out, "kind", 1);
+                si_json_set_str(out, "type", type_s);
+                si_json_set_int(out, "len",  (long long)len);
+                si_json_set_bool(out, "ok", 1);
+            }
+        }
+
+    } else if (strcmp(type, "bp_list") == 0) {
+        si_bp_dump(out);
+        si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "bp_remove") == 0) {
+        /*
+         * 卸一条断点：按 address 找（hw 用 tid+addr 限缩）。
+         *   addr   必填
+         *   tid    hw 路径下用作定位，veh 忽略
+         */
+        long long addr_ll = si_json_get_int(msg, "address", 0);
+        DWORD     tid     = (DWORD)si_json_get_int(msg, "tid", 0);
+        ULONG_PTR addr    = (ULONG_PTR)addr_ll;
+        int removed_hw  = 0, removed_veh = 0;
+        if (addr != 0) {
+            int i;
+            for (i = 0; i < SI_BP_MAX_DR_SLOTS; i++) {
+                if (g_hw_bps[i].enabled && g_hw_bps[i].addr == addr &&
+                    (tid == 0 || g_hw_bps[i].tid == tid)) {
+                    DWORD otid = g_hw_bps[i].tid;
+                    si_bp_clear_hw(i, otid);
+                    g_hw_bps[i].enabled = 0;
+                    g_hw_bps[i].addr = 0;
+                    removed_hw++;
+                }
+            }
+            for (i = 0; i < SI_BP_MAX_VEH; i++) {
+                if (g_veh_bps[i].enabled && g_veh_bps[i].addr == addr) {
+                    si_veh_unpatch(i);
+                    g_veh_bps[i].enabled = 0;
+                    g_veh_bps[i].addr = 0;
+                    g_veh_bps[i].type = 0;
+                    g_veh_bps[i].hit_count = 0;
+                    g_veh_patch[i].used = 0;
+                    g_veh_patch[i].addr = 0;
+                    g_veh_patch[i].orig_byte = 0;
+                    removed_veh++;
+                }
+            }
+        }
+        si_json_set_int(out, "removed_hw",  (long long)removed_hw);
+        si_json_set_int(out, "removed_veh", (long long)removed_veh);
+        si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "bp_clear") == 0) {
+        si_bp_clear_all(out);
+        si_json_set_bool(out, "ok", 1);
+
     } else if (strcmp(type, "patch_inject") == 0) {
         long long addr = si_json_get_int(msg, "address", 0);
         const char *hex = si_json_get_str(msg, "hex", "");
@@ -2839,6 +3674,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
          * SetUnhandledExceptionFilter / AddVectoredExceptionHandler 自身
          * 是轻量调用，副作用在目标进程触发异常时才真正发生，所以这里
          * 直接装没问题。 */
+        si_send_cs_init();
         agent_install_crash_handlers();
         /*
          * 在线程里建连、收发（不在 DllMain 里做 I/O）：
@@ -2851,6 +3687,26 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             shutdown(g_sock, SD_BOTH);
             closesocket(g_sock);
             g_sock = INVALID_SOCKET;
+        }
+        /* P2 — 把所有 bp 还原回原字节以免卸 DLL 后留下"被改成 0xCC 的代码"。 */
+        {
+            int i;
+            for (i = 0; i < SI_BP_MAX_VEH; i++) {
+                if (g_veh_bps[i].enabled && g_veh_patch[i].used) {
+                    /* 这里只 unpatch，不动 g_hw_bps —— hw 在线程 detach 时
+                     * 已经由线程退出流程处理。 */
+                    DWORD old_prot = 0;
+                    if (VirtualProtect((LPVOID)g_veh_patch[i].addr, 1,
+                                       PAGE_EXECUTE_READWRITE, &old_prot)) {
+                        (void)WriteProcessMemory(GetCurrentProcess(),
+                                                  (LPVOID)g_veh_patch[i].addr,
+                                                  (LPCVOID)&g_veh_patch[i].orig_byte,
+                                                  1, NULL);
+                        VirtualProtect((LPVOID)g_veh_patch[i].addr, 1,
+                                       old_prot, &old_prot);
+                    }
+                }
+            }
         }
         agent_uninstall_crash_handlers();
         break;

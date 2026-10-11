@@ -196,6 +196,53 @@
     </div>
   </section>
 
+  <!-- v1.3.0 P2：硬件断点（DR0-DR3 + VEH 兜底） -->
+  <section class="panel" id="panel-bp">
+    <div class="panel-head"><h2>硬件断点</h2>
+      <span class="hint">指定 --tid 走硬件 DR 槽（4 个，上限），不指定走 VEH 模拟（更多）</span>
+      <span class="grow"></span>
+      <button id="btn-bp-refresh" class="ghost">刷新列表</button>
+      <button id="btn-bp-clear" class="warn" disabled>全部移除</button>
+    </div>
+    <div class="bp-add-bar">
+      <input id="bp-target" placeholder="module!symbol+0x42  或  0x401000" />
+      <select id="bp-type">
+        <option value="exec">exec</option>
+        <option value="read">read</option>
+        <option value="write">write</option>
+        <option value="rw">rw</option>
+      </select>
+      <select id="bp-size">
+        <option value="1">1B</option>
+        <option value="2">2B</option>
+        <option value="4">4B</option>
+        <option value="8">8B</option>
+      </select>
+      <input id="bp-tid" type="number" placeholder="tid (0=进程)" value="0" min="0" step="1" style="width:90px"/>
+      <button id="btn-bp-set" class="primary">装载</button>
+    </div>
+    <table id="bp-table">
+      <thead><tr>
+        <th>地址</th>
+        <th>类型</th>
+        <th>大小</th>
+        <th>kind</th>
+        <th>tid</th>
+        <th>命中数</th>
+        <th class="c-act"></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <details class="bp-events">
+      <summary>命中事件流（点开查看 / "复制 payload" 给 Agent 看）</summary>
+      <div class="bp-events-bar">
+        <button id="btn-bp-copy" class="ghost" disabled>复制最新一条 payload</button>
+        <button id="btn-bp-clear-events" class="ghost">清空</button>
+      </div>
+      <div id="bp-events" class="log bp-events-list"></div>
+    </details>
+  </section>
+
   <section class="panel" id="panel-log">
     <div class="panel-head"><h2>日志 / 结果</h2>
       <span class="grow"></span>

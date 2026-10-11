@@ -467,3 +467,130 @@ P1 是 v1.3.0 计划里最独立的一节：纯 controller + agent.c，不引入
   要再绑编译开关，违反「DLL 字节唯一来源是编译产物」的硬规矩。
 * 没做快照自动去重（同一秒拍两次内容相同就跳过）。 当前要求是"用户
   主动拍、不主动触发"，下次需要时再加。
+
+## 十四、v1.3.0：硬件断点（P2 调试核心之后半段）
+
+v1.3.0 调试能力的第二段。P1 已经把"对得上 1 字节改动"的快照落盘了，P2
+把"看得到运行到那一步"的断点也接上；P3 会再把现场抓全（寄存器 + 栈）。
+
+### 14.1 协议变更
+
+**DLL 侧（`native/agent.c`）**：
+
+* 新增 4 条命令：`bp_set` / `bp_list` / `bp_remove` / `bp_clear`。
+  - `bp_set` 参数：`tid`（非 0 → 硬件 DR 槽；0 → VEH 模拟）、`address`、
+    `type_str ∈ {exec, read, write, rw}`、`len ∈ {1,2,4,8}`。
+  - 槽位耗尽时返回 `{"ok": false, "error": "no_slot_available"}`。
+* 命中事件 payload（`event:breakpoint`）：
+  - 字段：`addr` / `pid` / `tid` / `slot`（-1=VEH）/ `kind`（"hw" | "veh"） /
+    `fault_addr` / `hit_count` / `bp_type` / `bp_len`。
+  - P3 **占位字段**：`regs`（空对象）/ `stack`（空数组）—— P2 阶段先把
+    schema 占位写好，避免 P3 接入时再改协议字段。
+* 同一 VEH handler 内分流（`agent_veh_filter` 顶部新增两段）：
+
+  ```c
+  if (c0 == EXCEPTION_BREAKPOINT) {
+      LONG rc = si_veh_breakpoint_dispatch(ep);
+      if (rc != EXCEPTION_CONTINUE_SEARCH) return rc;
+  } else if (c0 == EXCEPTION_SINGLE_STEP) {
+      LONG rc = si_veh_single_step_dispatch(ep);
+      if (rc != EXCEPTION_CONTINUE_SEARCH) return rc;
+  }
+  ```
+
+  —— 不新增 VEH。命中后 `CONTEXT.Rip` 回跳到 orig 字节、`EFlags |= TF`
+  走单步，`si_veh_single_step_dispatch` 把 `0xCC` 重装回去。
+
+**Controller 侧（`superinject/controller.py`）**：
+
+* 新增 4 个方法：`breakpoint_set` / `breakpoint_list` /
+  `breakpoint_remove` / `breakpoint_clear`。
+  - `breakpoint_set(address, target, tid, bp_type, size, symbol_index)`：
+    `module!symbol+offset` 形式先经过
+    `superinject.symbols.resolve_symbol` 转地址再下发；纯数字地址走
+    passthrough。
+* 命中事件透传：`Controller.on_event` 已就绪（v1.2.0），断点事件
+  即"主动推送、不期望响应"，与现有 `event:*` 通道一致。
+
+**符号层（`superinject/symbols.py`）**：
+
+* 新增 `resolve_symbol(index, target)` —— 把
+  `module!symbol+0x42` / `module+0x42` / `0x401000` 统一解到
+  `(addr, module_name, offset, symbol_or_None)`，找不到时返回 `None`。
+
+**CLI（`superinject/cli.py`）**：
+
+* 新增 4 个子命令：`bp-set` / `bp-list` / `bp-remove` / `bp-clear`。
+  - `bp-set <pid> <target> [--tid T] [--type exec|read|write|rw] [--size 1|2|4|8]`，
+    `target` 接受数字或 `module!symbol+0x42`；后者内部自动 `info` 拉模块表 +
+    `exports` 拉导出。
+* `--json` 输出结构化、默认 plain text。
+
+**GUI（`superinject/web/`）**：
+
+* 新增 `panel-bp` 面板（折叠式，在「内存快照 / diff」和「日志」之间）：
+  列表（地址 / 类型 / 大小 / kind / tid / 命中数）+ 装载表单 +
+  命中事件流（折叠，含「复制最新 payload」按钮，方便贴给 Agent）。
+
+### 14.2 改动文件
+
+* `native/agent.c`：新增约 600 行（P2 数据结构 + 4 个 bp_* 命令 + VEH 命中
+  分支与单步重装 + g_send_cs 锁）；DllMain 增加 si_send_cs_init 与
+  退出时把所有 VEH 模拟 patch 还原。
+* `superinject/symbols.py`：`resolve_symbol`（约 60 行，新增）。
+* `superinject/controller.py`：4 个方法（约 130 行，新增）+ `Tuple` 入
+  typing。
+* `superinject/cli.py`：4 个 subparser + 4 个 dispatch 块 +
+  `_build_bp_index` helper（约 100 行，新增）。
+* `superinject/gui.py`：4 个 Api 方法 + `_build_bp_index` + `list_events`
+  暴露（约 70 行，新增）。
+* `superinject/web/index.html`：`panel-bp` section（约 45 行 HTML）。
+* `superinject/web/app.js`：断点面板渲染 / 装载 / 移除 / 清空 / 命中事件
+  流轮询（约 200 行新增）。
+* `superinject/web/style.css`：断点面板样式（约 90 行新增）。
+* `tests/test_breakpoint.py`（新增）：跨平台 12 条单测，覆盖控制器协议帧、
+  symbols 解析（5 种形式）、事件 payload schema、槽位耗尽 fallback、
+  hw/VEH 两条路径并存。
+* `tests/test_integration_windows.py`（增量）：`test_hw_breakpoint_on_ping`，
+  真注入 ping.exe → 在 ping 模块的某个 `Icmp*` 导出上 bp_set → 等 25s
+  命中 → bp_clear 清理。
+
+### 14.3 验证证据
+
+* **DLL 编译零新 warning**：MinGW 走
+  `x86_64-w64-mingw32-gcc -shared -O2 -Wall -Wextra` 全部
+  `-Wcast-function-type` warning 仍是 v1.2.0 既存的（5 条全在
+  write_dump_with_meta / NtSuspendThread / NtResumeThread /
+  NtQueryInformationThread / GetThreadDescription），P2 没有
+  引入任何新 warning。
+* **单测**：基线 211 + 新增 12 = **223 passed**（含 5 skip = Windows-only）。
+  `ruff check` clean。
+* **DLL 体积**：181KB → 188KB（+7KB），断点指令路径未引入未用代码。
+
+### 14.4 P3 占位与硬规矩对照
+
+* **VEH 单 handler 分流**：`si_should_capture` 与崩溃转储逻辑未改动；
+  `agent_veh_filter` 入口先分 `EXCEPTION_BREAKPOINT` /
+  `EXCEPTION_SINGLE_STEP`，命中走 bp，否则继续原流程。**没**装新 VEH。
+* **不引入新 Python 依赖**：仍然只用 stdlib。`mcp` 等 P4 才进。
+* **P3 占位字段保留**：每个断点命中事件的 payload 强制带 `regs: {}` /
+  `stack: []`，对应的强约束在 `tests/test_breakpoint.py` 的
+  `test_breakpoint_event_payload_schema_construction`。
+* **CI 全绿**：`pytest tests -q --ignore=tests/test_integration_windows.py`
+  通过（基线 + 新增 = 223 passed，5 skip）；`ruff check` clean。
+* **DLL 编译零新 warning**：见 14.3。
+
+### 14.5 未做的部分与原因
+
+* **未做完整 CONTEXT 寄存器捕获**：P2 阶段 `regs` 字段是空 obj。
+  P3 会通过 `GetThreadContext` 取 CONTEXT_FULL（x64：rip/rsp/rbp/r8–r15 +
+  segments；x86：Eip/Esp/Ebp + segments），再把栈 16 个 QWORD 一起填进
+  `stack` 字段。schema 在 P2 已定好，P3 只填字段不重新设计。
+* **未做条件断点（条件表达式）**：plan 把这条留给 v1.4.0。P3 至少先把
+  CONTEXT 与栈捕获好，条件断点需要先有"代码能拿到 caller 给的 Python 表达式"的
+  边界（P5 的 MCP 工具期才会出现）。
+* **未做数据断点的原子 action（断点命中时跳/单步/写入寄存器改 Eip）**：
+  一旦装有"自定义命中动作"，需要把 `EXCEPTION_CONTINUE_EXECUTION` 之外的
+  路径考虑全（P3 之后单独走 P3.5 计划）。
+* **未做 CONSOLE 子命令 `bp-trace` 长跑模式**：长跑需要 controller 端对
+  命中做 ring-buffer + flush；同样放 P4 / MCP 阶段。
