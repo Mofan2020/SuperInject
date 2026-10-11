@@ -1215,13 +1215,14 @@ static int write_dump_with_meta(EXCEPTION_POINTERS *ep)
                 GetProcAddress(h, "MiniDumpWriteDump");
             if (fn) {
                 MINIDUMP_EXCEPTION_INFORMATION mei;
+                MINIDUMP_TYPE                  dump_type;
                 mei.ThreadId          = GetCurrentThreadId();
                 mei.ExceptionPointers = ep;
                 mei.ClientPointers    = FALSE;
+                dump_type = (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory
+                                            | MiniDumpWithThreadInfo);
                 ok = fn(GetCurrentProcess(), g_pid, file,
-                        MINIDUMP_TYPE(MiniDumpWithIndirectlyReferencedMemory
-                                      | MiniDumpWithThreadInfo),
-                        &mei, NULL, NULL) ? TRUE : FALSE;
+                        dump_type, &mei, NULL, NULL) ? TRUE : FALSE;
             }
             FreeLibrary(h);
         }
@@ -1345,14 +1346,26 @@ typedef LONG (NTAPI *si_NtResumeThread_t)(HANDLE, PULONG);
 #define SI_ThreadBasicInformation   0
 #define SI_MAX_THREADS_PER_LIST     256
 
+/*
+ * 真正的 THREAD_BASIC_INFORMATION 在 winternl.h / ntinternals.h 里：字段
+ * SuspendCount 的位置稳定（KeReleaseSemaphore + ETHREAD.SuspendCount）。
+ * 但 winternl.h 不保证每个 SDK 都暴露 NTSTATUS / CLIENT_ID 这几个工程化
+ * 字段名称（不同 MSVC 版本里 NtQueryInformationThread 第一次给了局部
+ * 结构体却未与 ntstatus.h 配合引用），所以这里自写一个只装我们要的字段
+ * 的最小子集，避开 SDK 兼容性陷阱。
+ *
+ * 字段顺序与对齐参考 MSDN：
+ *   ExitStatus / TebBaseAddress / ClientId (16-byte union) /
+ *   AffinityMask / Priority / BasePriority / SuspendCount
+ */
 typedef struct _THREAD_BASIC_INFORMATION_SI {
-    NTSTATUS ExitStatus;
-    PVOID    TebBaseAddress;
-    CLIENT_ID ClientId;
+    LONG      ExitStatus;          /* NTSTATUS ≈ LONG，避免拉 ntstatus.h */
+    PVOID     TebBaseAddress;
+    ULONG_PTR Padding0[2];         /* ClientId 占 16 字节（UniqueProcess + UniqueThread） */
     KAFFINITY AffinityMask;
-    LONG     Priority;
-    LONG     BasePriority;
-    ULONG    SuspendCount;   /* 字段位置与 NT 结构兼容（winternl.h 不公开） */
+    LONG      Priority;
+    LONG      BasePriority;
+    ULONG     SuspendCount;
 } THREAD_BASIC_INFORMATION_SI;
 
 /* Win10+ 才有，不可用时返回 0。 */
@@ -1507,7 +1520,8 @@ static void collect_threads(si_json *arr)
 static int do_suspend_thread(DWORD tid)
 {
     HANDLE h;
-    LONG prev = 0, rc;
+    ULONG prev = 0;
+    LONG  rc;
     if (!fn_nt_suspend) return -1;
     h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!h) return -1;
@@ -1520,7 +1534,8 @@ static int do_suspend_thread(DWORD tid)
 static int do_resume_thread(DWORD tid)
 {
     HANDLE h;
-    LONG prev = 0, rc;
+    ULONG prev = 0;
+    LONG  rc;
     if (!fn_nt_resume) return -1;
     h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!h) return -1;
@@ -1585,7 +1600,8 @@ static int collect_module_exports(LPVOID base, si_json *arr, int budget)
 {
     pe_image_t pe;
     DWORD      i, n_names, n_funcs;
-    DWORD     *funcs, *names, *ords;
+    DWORD     *funcs, *names;
+    WORD      *ords;
     const char *seen[SI_MAX_EXPORTS_PER_MODULE];
     int        seen_n = 0;
     int        emitted = 0;
