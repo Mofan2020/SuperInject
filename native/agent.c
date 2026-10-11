@@ -1128,7 +1128,6 @@ static int mem_write_bytes(void *target, const unsigned char *bytes, size_t n,
 }
 
 /* ------------------------- 崩溃转储 ------------------------- */
-
 /*
  * 目标进程崩溃时，自动把堆栈落盘到 %TEMP%\SuperInject\<pid>\dump-<tick>.dmp，
  * 同时写一份 .json sidecar 记录 reason / code / address / tid / 时间戳，便于
@@ -1321,6 +1320,143 @@ static void agent_uninstall_crash_handlers(void)
     }
 }
 
+/* ------------------------- 模块导出表（轻量 PE 解析） ------------------------- */
+
+/*
+ * 解析目标模块的 IMAGE_EXPORT_DIRECTORY。**不依赖 dbghelp / symsrv**，
+ * 手动按 data directory + AddressOf{Functions,Names,NameOrdinals} 三数组
+ * 解析，得到 [name, rva] 的列表（按名字排序）。
+ *
+ * 限制：
+ *   - 单模块最多 256 条导出（防止 api-ms-win-core-* 这类巨模块塞爆响应）；
+ *   - 转出的导出按名字去重（同一名字可能出现在多序号上）；
+ *   - 仅解析名字导出；forwarder chain 输出成原 rva，不跟随重定向。
+ */
+typedef struct {
+    LPVOID  ImageBase;       /* 进程内的实际加载基址 */
+    PIMAGE_DOS_HEADER DosHdr;
+    PIMAGE_NT_HEADERS NtHdr;
+    DWORD   ExportDirRva;
+    DWORD   ExportDirSize;
+    PIMAGE_EXPORT_DIRECTORY ExportDir;
+} pe_image_t;
+
+static int pe_parse_image(LPVOID base, pe_image_t *out)
+{
+    if (!base || !out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->ImageBase  = base;
+    out->DosHdr     = (PIMAGE_DOS_HEADER)base;
+    if (out->DosHdr->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if ((ULONG_PTR)out->DosHdr->e_lfanew > 0x10000) return 0;
+    out->NtHdr = (PIMAGE_NT_HEADERS)((BYTE *)base + out->DosHdr->e_lfanew);
+    if (out->NtHdr->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    if (out->NtHdr->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR_MAGIC) {
+        /* PE32 (32-bit) */
+        IMAGE_OPTIONAL_HEADER32 *o = &out->NtHdr->OptionalHeader;
+        out->ExportDirRva  = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        out->ExportDirSize = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    } else if (out->NtHdr->OptionalHeader.Magic ==
+               IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        IMAGE_OPTIONAL_HEADER64 *o = (PIMAGE_OPTIONAL_HEADER64)&out->NtHdr->OptionalHeader;
+        out->ExportDirRva  = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        out->ExportDirSize = o->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    } else {
+        return 0;
+    }
+    if (out->ExportDirRva == 0 || out->ExportDirSize == 0) return 0;
+    out->ExportDir = (PIMAGE_EXPORT_DIRECTORY)
+        ((BYTE *)base + out->ExportDirRva);
+    return 1;
+}
+
+#define SI_MAX_EXPORTS_PER_MODULE 256
+
+static int collect_module_exports(LPVOID base, si_json *arr, int budget)
+{
+    pe_image_t pe;
+    DWORD      i, n_names, n_funcs;
+    DWORD     *funcs, *names, *ords;
+    const char *seen[SI_MAX_EXPORTS_PER_MODULE];
+    int        seen_n = 0;
+    int        emitted = 0;
+
+    if (!pe_parse_image(base, &pe)) return 0;
+    n_names = pe.ExportDir->NumberOfNames;
+    n_funcs = pe.ExportDir->NumberOfFunctions;
+    funcs = (DWORD *)((BYTE *)base + pe.ExportDir->AddressOfFunctions);
+    names = (DWORD *)((BYTE *)base + pe.ExportDir->AddressOfNames);
+    ords  = (WORD  *)((BYTE *)base + pe.ExportDir->AddressOfNameOrdinals);
+    if (!funcs || !names || !ords) return 0;
+
+    /* 第一遍：发出带名字的导出 */
+    for (i = 0; i < n_names && emitted < budget; i++) {
+        DWORD rva;
+        WORD  ord;
+        const char *nm = (const char *)base + names[i];
+        if (!nm || !nm[0] || nm[0] == '\0') continue;
+        ord = ords[i];
+        if (ord >= n_funcs) continue;
+        rva = funcs[ord];
+        if (rva == 0) continue;
+        /* 去重 */
+        {
+            int j;
+            for (j = 0; j < seen_n; j++) if (seen[j] == nm) break;
+            if (j < seen_n) continue;
+            if (seen_n < SI_MAX_EXPORTS_PER_MODULE) seen[seen_n++] = nm;
+        }
+        {
+            si_json *o = si_json_new();
+            if (!o) continue;
+            si_json_set_str(o, "name", nm);
+            si_json_set_int(o, "rva", (long long)rva);
+            si_json_set_int(o, "ord", (long long)(pe.ExportDir->Base + ord));
+            si_json_array_push(arr, o);
+            emitted++;
+        }
+    }
+    /* 第二遍（只剩 budget 富裕时）：按 ordinal 列出口无名字的导出 */
+    for (i = 0; i < n_funcs && emitted < budget; i++) {
+        DWORD rva = funcs[i];
+        const char *nm = NULL;
+        si_json *o;
+        int j;
+        if (rva == 0) continue;
+        /* 这个序号是否已通过名字发过？ */
+        for (j = 0; j < (int)n_names; j++) {
+            if (ords[j] == i && names[j]) {
+                nm = (const char *)base + names[j];
+                break;
+            }
+        }
+        if (nm && nm[0]) continue;  /* 已经按名字发过了 */
+        o = si_json_new();
+        if (!o) continue;
+        si_json_set_str(o, "name", "");
+        si_json_set_int(o, "rva", (long long)rva);
+        si_json_set_int(o, "ord", (long long)(pe.ExportDir->Base + i));
+        si_json_array_push(arr, o);
+        emitted++;
+    }
+    return emitted;
+}
+
+static int si_export_set_cmp(const void *a, const void *b)
+{
+    const si_json *ja = *(const si_json *const *)a;
+    const si_json *jb = *(const si_json *const *)b;
+    const char *na = si_json_get_str(ja, "name", "");
+    const char *nb = si_json_get_str(jb, "name", "");
+    if (!na[0] && !nb[0])
+        return (int)(si_json_get_int(ja, "ord", 0)
+                  - si_json_get_int(jb, "ord", 0));
+    if (!na[0]) return  1;
+    if (!nb[0]) return -1;
+    return strcmp(na, nb);
+}
+
 /* ------------------------- 指令分发 ------------------------- */
 
 static void agent_handle(const char *text)
@@ -1356,6 +1492,11 @@ static void agent_handle(const char *text)
         si_json         *mods = si_json_new_array();
         HANDLE           snap;
         MODULEENTRY32W   me;
+        long long        no_exports = si_json_get_int(msg, "no_exports", 0);
+        long long        budget = si_json_get_int(msg, "budget", 64);
+        if (budget < 0) budget = 0;
+        if (budget > SI_MAX_EXPORTS_PER_MODULE)
+            budget = SI_MAX_EXPORTS_PER_MODULE;
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_pid);
         if (snap != INVALID_HANDLE_VALUE) {
             me.dwSize = sizeof(me);
@@ -1369,12 +1510,56 @@ static void agent_handle(const char *text)
                     si_json_set_str(m, "path", pth);
                     si_json_set_int(m, "base", (long long)(uintptr_t)me.modBaseAddr);
                     si_json_set_int(m, "size", (long long)me.modBaseSize);
+                    if (!no_exports && me.modBaseAddr && budget > 0) {
+                        si_json *exports = si_json_new_array();
+                        int n = collect_module_exports(me.modBaseAddr, exports,
+                                                       (int)budget);
+                        if (n > 0) si_json_set_arr(m, "exports", exports);
+                        si_json_free(exports);
+                        si_json_set_int(m, "exports_count", (long long)n);
+                    } else {
+                        si_json_set_int(m, "exports_count", 0);
+                    }
                     si_json_array_push(mods, m);
                 } while (Module32NextW(snap, &me));
             }
             CloseHandle(snap);
         }
         si_json_set_arr(out, "modules", mods);
+        si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "exports") == 0) {
+        /* 按基址或模块名单独解析一个模块的导出表。前端 GUI 模块行 hover 时用。 */
+        long long addr = si_json_get_int(msg, "base", 0);
+        const char *mod_name = si_json_get_str(msg, "name", "");
+        long long budget = si_json_get_int(msg, "budget", SI_MAX_EXPORTS_PER_MODULE);
+        if (budget <= 0) budget = SI_MAX_EXPORTS_PER_MODULE;
+        si_json *exports = si_json_new_array();
+        int      n = 0;
+        if (addr) {
+            n = collect_module_exports((LPVOID)(uintptr_t)addr, exports,
+                                       (int)budget);
+        } else if (mod_name[0]) {
+            HANDLE snap = CreateToolhelp32Snapshot(
+                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, g_pid);
+            if (snap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W me; me.dwSize = sizeof(me);
+                if (Module32FirstW(snap, &me)) {
+                    do {
+                        char nm[MAX_PATH];
+                        utf8_path(me.szModule, nm, MAX_PATH);
+                        if (_stricmp(nm, mod_name) == 0) {
+                            n = collect_module_exports(me.modBaseAddr, exports,
+                                                       (int)budget);
+                            break;
+                        }
+                    } while (Module32NextW(snap, &me));
+                }
+                CloseHandle(snap);
+            }
+        }
+        si_json_set_arr(out, "exports", exports);
+        si_json_set_int(out, "count", (long long)n);
         si_json_set_bool(out, "ok", 1);
 
     } else if (strcmp(type, "mem_regions") == 0) {

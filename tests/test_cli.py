@@ -313,6 +313,52 @@ def test_mem_search(monkeypatch, capsys):
     assert rc == 0
 
 
+def test_info_passes_no_exports_and_budget(monkeypatch, capsys):
+    seen = {}
+
+    class FakeCtrl:
+        def info(self, pids, no_exports, budget):
+            seen["pids"] = pids
+            seen["no_exports"] = no_exports
+            seen["budget"] = budget
+            return [{"pid": 100, "ok": True,
+                     "resp": {"modules": [], "ok": True}}]
+
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "info",
+                  "--pid", "100", "--no-exports", "--exports-budget", "8"])
+    assert rc == 0
+    assert seen["pids"] == [100]
+    assert seen["no_exports"] is True
+    assert seen["budget"] == 8
+
+
+def test_exports_forwards_address_and_name(monkeypatch, capsys):
+    seen = {}
+
+    class FakeCtrl:
+        def exports(self, pid, name, base, budget):
+            seen["args"] = (pid, name, base, budget)
+            return {"ok": True, "count": 2,
+                    "exports": [{"name": "Foo", "rva": 0x100, "ord": 1},
+                                {"name": "Bar", "rva": 0x200, "ord": 2}]}
+
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "exports",
+                  "--pid", "1234", "--name", "user32.dll",
+                  "--base", "0x7FFE0000", "--budget", "32"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "exports"
+    assert data["count"] == 2
+    assert {e["name"] for e in data["exports"]} == {"Foo", "Bar"}
+    assert seen["args"] == (1234, "user32.dll", 0x7FFE0000, 32)
+
+
 # ----------------------------------------------------------- events / dumps
 
 def test_events_lists_in_memory_queue(monkeypatch, capsys):

@@ -202,6 +202,17 @@ def _build_subparser() -> argparse.ArgumentParser:
     add_pid_positional(sp)
     sp = sub.add_parser("info", help="查询模块列表")
     add_pid_positional(sp)
+    sp.add_argument("--no-exports", action="store_true",
+                    help="不附带每个模块的导出表（更快、避免巨型模块撑爆响应）")
+    sp.add_argument("--exports-budget", type=int, default=64,
+                    help="单模块最多返回多少条导出（默认 64）")
+    sp = sub.add_parser("exports", help="解析某个模块的导出表")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--name", default="",
+                    help="按模块名（文件名，例如 ntdll.dll）")
+    sp.add_argument("--base", default="",
+                    help="按基址（0x 前缀）")
+    sp.add_argument("--budget", type=int, default=256)
     sp = sub.add_parser("ping", help="连通性自检")
     add_pid_positional(sp)
     sp = sub.add_parser("unload", help="卸载注入的 DLL")
@@ -607,8 +618,25 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
         return {"ok": True, "kind": "ping",
                 "results": _ensure_controller().ping(_normalize_pids(args))}
     if sub == "info":
+        pids = _normalize_pids(args)
         return {"ok": True, "kind": "info",
-                "results": _ensure_controller().info(_normalize_pids(args))}
+                "results": _ensure_controller().info(
+                    pids,
+                    no_exports=bool(getattr(args, "no_exports", False)),
+                    budget=int(getattr(args, "exports_budget", 64)))}
+    if sub == "exports":
+        from .ipc import parse_int as _parse_int
+        base = _parse_int(getattr(args, "base", "") or "0")
+        resp = _ensure_controller().exports(
+            int(args.pid),
+            name=str(getattr(args, "name", "") or ""),
+            base=base,
+            budget=int(getattr(args, "budget", 256)),
+        )
+        return {"ok": bool(resp.get("ok")), "kind": "exports",
+                "pid": int(args.pid),
+                "count": int(resp.get("count", 0)),
+                "exports": resp.get("exports", [])}
     if sub == "unload":
         return {"ok": True, "kind": "unload",
                 "results": _ensure_controller().unload(_normalize_pids(args))}

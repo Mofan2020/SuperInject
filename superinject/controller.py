@@ -549,8 +549,29 @@ class Controller:
     def ping(self, pids: List[int]) -> List[dict]:
         return self._control(pids, "ping", timeout=5)
 
-    def info(self, pids: List[int]) -> List[dict]:
-        return self._control(pids, "info", timeout=10)
+    def info(self, pids: List[int], no_exports: bool = False,
+             budget: int = 64) -> List[dict]:
+        def one(pid: int) -> dict:
+            resp = self.server.request(pid, {
+                "type": "info",
+                "no_exports": int(no_exports),
+                "budget": int(budget),
+            }, timeout=10)
+            return {"pid": pid, "ok": bool(resp.get("ok")),
+                    "resp": resp,
+                    "error": resp.get("error", "")}
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(pids)))) as pool:
+            return list(pool.map(one, pids))
+
+    def exports(self, pid: int, name: str = "", base: int = 0,
+                budget: int = 256) -> dict:
+        """拉单个模块的导出表（按名字或基址）。"""
+        return self.server.request(pid, {
+            "type": "exports",
+            "name": name or "",
+            "base": int(base) if base else 0,
+            "budget": int(budget),
+        }, timeout=15)
 
     # ---------------------------------------------------------- 内存
 
