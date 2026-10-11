@@ -218,6 +218,29 @@ def run_interactions(page, shots_dir: Path | None) -> None:
         "() => document.getElementById('log').children.length > 4", timeout=8000)
     check(True, "批量指令走到调用后端（日志有输出）")
 
+    # v1.3.0：快照 / 断点面板的懒加载路径。
+    # 布局检查只能看出「在不在」，看不出 mock 少一个方法导致的「点一下才炸」，
+    # 所以这里把两个面板的刷新按钮都真点一遍，断言列表真的被渲染出来。
+    # 注意：上面的 reload() 清掉了选中态，刷新列表依赖「当前选中 PID」，
+    # 这里要重新选一个进程，否则走的是「请先选中进程」的早退分支。
+    page.click("#proc-table tbody tr")
+    page.wait_for_timeout(200)
+    page.click('button.nav-seg[data-target="panel-snap"]')
+    page.wait_for_timeout(200)
+    page.click("#btn-snap-refresh")
+    page.wait_for_timeout(500)
+    snap_rows = page.evaluate(
+        "() => document.querySelectorAll('#snap-table tbody tr').length")
+    check(snap_rows >= 2, f"快照列表渲染（{snap_rows} 行）")
+
+    page.click('button.nav-seg[data-target="panel-bp"]')
+    page.wait_for_timeout(200)
+    page.click("#btn-bp-refresh")
+    page.wait_for_timeout(500)
+    bp_rows = page.evaluate(
+        "() => document.querySelectorAll('#bp-table tbody tr').length")
+    check(bp_rows >= 2, f"断点列表渲染（{bp_rows} 行）")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()

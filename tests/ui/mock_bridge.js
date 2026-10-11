@@ -116,6 +116,31 @@
     mem_read: () => ({ ok: true, hex: "4d5a90000300000004000000ffff0000" }),
     mem_write: () => ({ ok: true, written: 4 }),
     mem_regions: () => ({ ok: true, regions: [] }),
+
+    // ---- 内存快照（v1.3.0 P1）：让快照面板的渲染路径被走到 ----
+    // 字段名对齐 snapshots.SnapshotIndexEntry.to_dict()：
+    //   name / created_at(ISO8601) / bytes / sha256 / pages
+    list_snapshots: (pid) => ([
+      { name: "before", created_at: "2026-10-11T22:00:00", bytes: 4096,
+        sha256: "ab".repeat(32), pages: 1 },
+      { name: "after", created_at: "2026-10-11T22:10:00", bytes: 8192,
+        sha256: "cd".repeat(32), pages: 2 },
+    ]),
+    snapshot: (pid, name, regions) => ({
+      ok: true, pid, name: name || "snap", count: 1, bytes: 4096,
+      sha256: "ab".repeat(32),
+      pages: [{ addr: 140698000, size: 4096, sha: "ab".repeat(32),
+                head64: "4d5a90" + "00".repeat(29) + "0a" }],
+    }),
+    diff_snapshot: (pid, name1, name2, limit) => ({
+      ok: true, pid, a: name1, b: name2, unchanged_count: 0,
+      changed: [{ addr: 140698000, old_sha: "ab".repeat(32),
+                  new_sha: "cd".repeat(32),
+                  old_bytes: "4d5a9000", new_bytes: "4d5a9001" }],
+      only_in_a: [], only_in_b: [],
+    }),
+    delete_snapshot: (pid, name) => true,
+
     reveal: () => true,
     verify_dll: () => ({ ok: true, message: "DLL 校验通过",
                          path: `C:${BS}Tools${BS}SuperInjectAgent.dll` }),

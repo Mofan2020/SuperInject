@@ -698,3 +698,38 @@ P3 只填值。
 * **未做栈深度可配**：固定 16 项。需要更多时后续加 `--stack-depth`。
 * **未做数据断点命中时的原子动作**：同 14.5 —— 命中时改寄存器 / 跳转
   这类"自定义动作"不在 P3。
+
+## 十六、v1.3.0 修掉的 P1/P2 遗留（前端检查覆盖不足）
+
+P3 收尾时按「P1/P2 的验证证据里都只报了 pytest / ruff / DLL 编译」这条线复查，
+发现两类问题都不在单测覆盖范围内，靠 CI 的 `ui-layout` job（跑
+`tests/ui/render_check.py`）才会暴露：
+
+| # | 现象 | 根因 | 处理 |
+|---|------|------|------|
+| 1 | P2 的 x86 DLL **编不过**（`error: 'CONTEXT' has no member named 'Rip'`） | P3 之前的 VEH 单步回跳写死了 `ctx->Rip`，而 x86 的 `CONTEXT` 只有 `Eip`。x64 编译正常，所以只看 x64 的验证会漏掉 | 改为按位宽分派 `Rip`/`Eip`；同时 guard 掉 x86 未用的 `dr6`（MSVC `/WX` 会当错）。现在 x86 与 x64 都 0 error |
+| 2 | `render_check.py` 报 `a[name] is not a function` | P1 加了快照面板，但 `tests/ui/mock_bridge.js` 没补 `list_snapshots` / `snapshot` / `diff_snapshot` / `delete_snapshot`；`call()` 里 `a[name](...)` 的 TypeError 在 `Promise.resolve` 之前同步抛出，`.catch` 抓不到 | 补齐 4 个 mock 方法（字段名对齐 `SnapshotIndexEntry.to_dict()`）|
+| 3 | 快照列表 / 断点列表**从没被验证渲染过** | `render_check.py` 只检查「面板在不在视口内」（布局），不检查「点刷新后列表有没有数据」——所以 mock 少方法、方法返回空都不会被发现 | `run_interactions` 加两步：切到快照 / 断点面板 → 点「刷新列表」→ 断言 `tbody tr >= 2` |
+
+### 为什么「只验 pytest」不够
+
+P1 / P2 的报告都写了「pytest 全过 + ruff clean + DLL 编译成功」，看起来完整，
+但漏掉了两条真实路径：
+
+* **只编一个架构**：DLL 有两个产物（x64 / x86），只验 x64 会漏掉 x86 才有的
+  编译错误（`CONTEXT` 的字段名差异）。**教训：DLL 改动必须两个架构都编。**
+* **前端断言只覆盖布局**：`render_check.py` 的布局检查用的是「导航目标进入视口」，
+  面板存在即通过；面板内部的数据渲染路径（懒加载 + 列表拼装）完全没跑到，
+  于是 `mock_bridge.js` 这种「测试替身」与实际 API 的偏差不会被任何检查拦住。
+
+### 验证证据
+
+* 负向测试（证明校验器真的会拦，不是摆设）：把 `mock_bridge.js` 的
+  `list_snapshots` 改名 → `render_check.py` 立刻报
+  「快照列表渲染（0 行）」+「页面无 JS 报错（2 条）」并以 exit=1 结束；
+  恢复后重新全绿。
+* `x86_64-w64-mingw32-gcc -shared -O2 -DUNICODE -D_UNICODE ... -o /tmp/x64.dll`
+  → exit=0，5 条 warning（全部是既存 `-Wcast-function-type`）。
+* `i686-w64-mingw32-gcc ...` → exit=0；同一命令对 P2 的 `eaad008` 跑会得到
+  `error: 'CONTEXT' has no member named 'Rip'`（已用 `git archive eaad008` 复现）。
+* `python tests/ui/render_check.py` → 全绿（含新增的 2 项列表渲染断言）。
