@@ -980,3 +980,93 @@ Agent（Claude Desktop / Cursor）以 `SuperInject.exe mcp` 拉起 server 时，
 * **不做自动写 Agent 端配置文件**（P7）：仍靠「复制 Agent 配置」贴进
   `claude_desktop_config.json` / `mcp.json`。
 * **不做会话实时续期**：桥接服务在 `start` 时快照一次会话；会话过期后需重新授权并重启服务。
+
+## 二十、v1.3.0 P7：一键写入 Agent 端 MCP 配置
+
+P6 之后，Agent 端配置仍要用户自己把 `--print-config` 的片段粘进
+`claude_desktop_config.json` / `mcp.json`。P7 让 GUI 直接把
+`mcpServers.superinject` 合并进这些文件 —— 但**必须由用户在界面上点确认才发生**。
+这一步的难点不是「写文件」，是「**怎么在不制造数据事故的前提下写别人的配置文件**」。
+
+### 20.1 设计与硬约束
+
+* **合并，不覆盖**：读现有 JSON → 只在 `mcpServers` 下改 `superinject` 一个键 →
+  原样写回。其他顶层键、别人的 `mcpServers` 条目**全部保留**（单测断言：预置
+  `theme` / `nested` / `other-agent` 三个键，写完仍在）。
+* **写前备份**：已有文件先 `shutil.copy2` 成 `<文件名>.bak-<时间戳>`（同名已存在
+  再加序号），路径回给调用方、GUI 日志回显。备份内容必须与原文件**逐字一致**。
+* **原子写**：临时文件 + `os.replace`（与 `mcp_consent.save_consent` 同一手法）；
+  异常时清临时文件再抛，**不留 `.tmp*`**。
+* **坏 JSON 不动原文件**：解析失败 / 顶层非对象 / `mcpServers` 非对象，一律
+  `{ok: False, error}` 返回，**原文件一字节不改**（这是「用户手改坏了配置」的现场，
+  覆盖等于把用户的手改成果抹掉）。
+* **幂等**：`mcpServers.superinject` 内容完全一致 → `action="unchanged"`，
+  **不写、不备份**。
+* **不凭空建目录**：`targets()` 只探测不建目录 —— 「未安装的 Agent」不该因为一次
+  探测就多出一棵目录树。只有用户明确点了某目标的「写入」，才创建该文件的父目录。
+* **不静默**：后端 `write_agent_config` 只提供能力，**没有任何**「启动时 / 后台
+  自动写」的调用路径；前端先 `confirmBox` 说明「会备份 + 只改自己的键」，确认后才调。
+* **不引依赖**：只用标准库（json / os / shutil / sys / time / pathlib）；
+  条目里的 `command` / `args` **复用** `cli.mcp_config_snippet()`，不重复一套
+  「打包 exe vs 源码 `-m`」判定。
+
+目标探测（调用时读环境变量，测试可 `monkeypatch` 到 `tmp_path`）：
+
+| 目标 | 路径 |
+| --- | --- |
+| Claude Desktop（Windows） | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Desktop（macOS） | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Cursor | `~/.cursor/mcp.json` |
+
+另加 `SUPERINJECT_CLAUDE_DIR` / `SUPERINJECT_CURSOR_DIR` 覆盖（测试与自定义部署用）。
+
+### 20.2 改动文件
+
+* `superinject/mcp_config_writer.py`（新）：`targets()`、`write_config(target_id,
+  *, mode, launcher_path, dry_run)`、`claude_config_path()` / `cursor_config_path()`、
+  `_load_existing` / `_backup_path` / `_atomic_write_json`。
+* `superinject/gui.py`：`Api` 新增 `list_agent_targets()` / `write_agent_config(target_id, mode)`。
+* `superinject/web/index.html` / `app.js` / `style.css`：MCP 面板加「一键写入 Agent 配置」
+  区（每个目标一行：名字 + 路径 + 存在标记 + 「写入」按钮）；保留原「复制 Agent 配置」按钮。
+* `tests/test_mcp_config_writer.py`（新，17 例）、`tests/test_mcp_gui.py`（+4 例）、
+  `tests/ui/mock_bridge.js`（补 `list_agent_targets` / `write_agent_config` + 写入后
+  `exists` 翻转）、`tests/ui/render_check.py`（补 7 项断言）。
+* `README.md` / `docs/notes.md`：本章 + MCP 章节补「一键写入」。
+
+### 20.3 验证证据
+
+* `tests/test_mcp_config_writer.py`（17 例，跨平台 / macOS 可跑，`HOME`+`USERPROFILE`+
+  `APPDATA` 都指到 `tmp_path`）：`targets()` 结构合理且**不建目录**；路径按平台解析；
+  文件不存在 → `created`；已有配置文件含其他键 + 其他 `mcpServers` 条目 → **合并后全保留**；
+  内容一致 → `unchanged` 且**无 `.bak`、不重写**；内容不同 → `updated` + 备份内容
+  **逐字等于**原文件；坏 JSON / 顶层非对象 / `mcpServers` 非对象 → `ok=False` 且原文件未改；
+  `dry_run` → 不落盘不备份但回 entry；写入后**无 `.tmp*` 残留**；未知目标报错；
+  `mode=direct` / `launcher_path` 影响条目。
+* `tests/test_mcp_gui.py`（21 例，+4）：`list_agent_targets` 返回 list；
+  `write_agent_config` `created`→`updated` 且产生存在的备份；未知目标 `ok=False`；
+  `mode="direct"` 走直连 args。
+* `python3 tests/ui/render_check.py` → 全绿（159 项 PASS）。新增 7 项断言依赖 mock 的
+  `list_agent_targets` / `write_agent_config`：目标列表渲染 ≥2 行、每行带「写入」按钮、
+  显示配置路径、点「写入」弹确认框且文案含「备份」「mcpServers.superinject」、点确定后
+  日志出现「已写入」与 `.bak-` 路径。
+  **负向测试**：把 mock 的 `list_agent_targets` 改名 → render_check 在
+  `wait_for_function`（等待目标列表渲染）处 **TimeoutError 且 exit=1**；恢复后全绿。
+* `pytest tests -q --ignore=tests/test_integration_windows.py` → **326 passed / 5 skipped**
+  （P6 后 305 + 新增 21）；`ruff check superinject build tests run_superinject.py` → clean。
+
+### 20.4 未做的部分 / 为什么不做「自动写入」
+
+* **不做自动写入 / 启动时静默写**：用户对「程序悄悄改我机器上的配置文件」极度敏感。
+  一旦允许「启动就写」，就会在用户没意识到的情况下改动 Claude Desktop / Cursor 的配置
+  —— 出错时的现场（被覆盖的别人的 MCP 条目）无备份可查。因此 P7 只做「**用户点一下、
+  程序才写**」：写入动作的唯一入口是前端 `confirmBox` 后的 `write_agent_config`，
+  后端没有定时 / 启动钩子。（`write_config` 的 `dry_run=True` 也刻意返回「将要写什么」
+  而不落盘，供将来做「预览」按钮。）
+* **不做「删条目 / 撤销写入」**：目前只写不删。撤销一个 Agent 的 MCP 配置属于「又改一次
+  别人的文件」，留到有明确需求再说（用户可以手动删，或用备份还原）。
+* **不做 Claude Desktop 之外的更多 Agent**：先覆盖 Claude Desktop 与 Cursor 两个最常见目标；
+  其他（Windsurf / Continue / Cline 等）待有需求再按同一套 `targets()` + `write_config()`
+  形状扩展。
+* **只保证「不带 Windows 的 macOS/Linux/CI 上逻辑正确」**：真实的 Windows `%APPDATA%`
+  路径解析、以及 Agent 端（Claude Desktop / Cursor）是否真的加载了新配置，仍需用户在
+  目标机器上点一遍验证 —— CI 验不到这些。

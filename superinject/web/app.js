@@ -888,6 +888,7 @@
   // MCP server 由外部 Agent 以 stdio 拉起 `SuperInject.exe mcp`，读取同一份
   // consent 文件复用授权。状态全部来自后端 mcp_status()。
   state.mcp = { consent: { state: "none" }, server: {} };
+  state.mcpTargets = [];
 
   const MCP_STATE_META = {
     none: ["未授权", "off"],
@@ -1081,6 +1082,68 @@
     }
   }
 
+  // ---- v1.3.0 P7：一键写入 Agent 端配置（合并 + 备份 + 用户确认，不静默） ----
+  async function refreshAgentTargets() {
+    let list = [];
+    try {
+      list = await call("list_agent_targets");
+    } catch (e) {
+      list = [];
+    }
+    state.mcpTargets = Array.isArray(list) ? list : [];
+    renderAgentTargets();
+  }
+
+  function renderAgentTargets() {
+    const box = $("#mcp-targets");
+    if (!box) return;
+    const list = state.mcpTargets || [];
+    if (!list.length) {
+      box.innerHTML = '<div class="muted">未发现可写入的 Agent 配置目标。</div>';
+      return;
+    }
+    box.innerHTML = list.map((t) => {
+      const tag = t.exists ? '<span class="mcp-target-tag on">已存在</span>'
+                           : '<span class="mcp-target-tag off">未创建</span>';
+      return '<div class="mcp-target" data-target-id="' + escapeHtml(t.id) + '">' +
+        '<div class="mcp-target-info">' +
+          '<div class="mcp-target-name">' + escapeHtml(t.label) + ' ' + tag + '</div>' +
+          '<div class="mcp-target-path" title="' + escapeHtml(t.path || "") + '">' +
+            escapeHtml(t.path || "") + '</div>' +
+        '</div>' +
+        '<button class="ghost mcp-target-write" data-target-id="' +
+          escapeHtml(t.id) + '">写入</button>' +
+      '</div>';
+    }).join("");
+    box.querySelectorAll(".mcp-target-write").forEach((btn) => {
+      btn.addEventListener("click", () => writeAgentConfig(btn.dataset.targetId));
+    });
+  }
+
+  async function writeAgentConfig(targetId) {
+    const t = (state.mcpTargets || []).find((x) => x.id === targetId) || {};
+    const label = t.label || targetId;
+    const ok = await confirmBox("写入 Agent 配置",
+      "将把 SuperInject 的 mcpServers 条目写入：\n" + (t.path || targetId) +
+      "\n\n写入前会先备份原文件（<文件名>.bak-<时间戳>），并且只修改 " +
+      "mcpServers.superinject 这一个键，其他内容（含别人的 MCP 条目）原样保留。\n\n确定写入？");
+    if (!ok) return;
+    let res;
+    try {
+      res = await call("write_agent_config", targetId, "launcher");
+    } catch (e) {
+      log("写入 " + label + " 配置失败：" + e, "err");
+      return;
+    }
+    if (res && res.ok) {
+      log("已写入 " + label + " 配置（" + (res.action || "") + "）：" + (res.path || "") +
+          (res.backup ? "；原文件已备份到 " + res.backup : ""), "ok");
+    } else {
+      log("写入 " + label + " 配置失败：" + ((res && res.error) || "未知错误"), "err");
+    }
+    await refreshAgentTargets();
+  }
+
   (function initMcpPanel() {
     const open = $("#btn-mcp-consent");
     if (open) open.addEventListener("click", openConsentModal);
@@ -1102,7 +1165,11 @@
       if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     const seg = document.querySelector('button.nav-seg[data-target="panel-mcp"]');
-    if (seg) seg.addEventListener("click", refreshMcpStatus);
+    if (seg) seg.addEventListener("click", () => {
+      refreshMcpStatus();
+      refreshAgentTargets();
+    });
+    refreshAgentTargets();
   })();
 
   // 供后端 mcp_consent._open_consent_modal（parent.evaluate_js）调用。

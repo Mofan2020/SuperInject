@@ -447,6 +447,29 @@ class Api:
 
         return _snippet(mode="direct" if mode == "direct" else "launcher")
 
+    # -------------------------------------------------- 写 Agent 配置（v1.3.0 P7）
+
+    def list_agent_targets(self) -> list:
+        """可写入的 Agent 配置目标：``[{id, label, path, exists}]``。
+
+        只探测、不创建任何目录（``exists`` 只表示配置文件在不在）。
+        """
+        from . import mcp_config_writer
+
+        return mcp_config_writer.targets()
+
+    def write_agent_config(self, target_id: str, mode: str = "launcher") -> dict:
+        """把 SuperInject 条目合并进某个 Agent 的配置文件。
+
+        **只能由用户在界面上点确认后触发**（前端先弹确认框），后端不做任何
+        自动 / 静默写入。返回 ``{ok, path, action, backup, entry, error?}``：
+        合并写入、写前备份、坏 JSON 不动原文件、内容一致则 ``unchanged``。
+        """
+        from . import mcp_config_writer
+
+        return mcp_config_writer.write_config(
+            target_id, mode="direct" if mode == "direct" else "launcher")
+
     def revoke_consent(self) -> dict:
         """删除本地 consent 文件（清授权）。文件本就不存在也算成功。"""
         path = mcp_consent.consent_path()

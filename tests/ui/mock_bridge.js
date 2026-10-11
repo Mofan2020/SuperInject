@@ -86,6 +86,12 @@
   let mcpRunning = false;
   const MCP_PIPE = BS + BS + "." + BS + "pipe" + BS + "SuperInjectMCP";
 
+  // ---- v1.3.0 P7：Agent 端配置路径 + 「写入后翻成已存在」的可切换状态 ----
+  let mcpTargetsWritten = false;
+  const CLAUDE_CFG = "C:" + BS + "Users" + BS + "test" + BS + "AppData" + BS +
+    "Roaming" + BS + "Claude" + BS + "claude_desktop_config.json";
+  const CURSOR_CFG = "C:" + BS + "Users" + BS + "test" + BS + ".cursor" + BS + "mcp.json";
+
   const api = {
     bootstrap: () => ({
       app: "SuperInject", version: "1.0.2",
@@ -210,6 +216,25 @@
     mcp_config_snippet: () => JSON.stringify({
       mcpServers: { superinject: { command: "SuperInject.exe", args: ["mcp-launcher"], env: {} } },
     }, null, 2),
+
+    // ---- v1.3.0 P7：一键写入 Agent 配置（探测 + 写入 + 确认框路径） ----
+    // 写入后把 cursor 的 exists 翻成 true，验证「刷新目标列表」这条路径也被走到。
+    list_agent_targets: () => ([
+      { id: "claude-desktop", label: "Claude Desktop", path: CLAUDE_CFG, exists: true },
+      { id: "cursor", label: "Cursor", path: CURSOR_CFG, exists: mcpTargetsWritten },
+    ]),
+    write_agent_config: (targetId, mode) => {
+      mcpTargetsWritten = true;
+      return {
+        ok: true,
+        path: targetId === "cursor" ? CURSOR_CFG : CLAUDE_CFG,
+        action: "updated",
+        backup: CLAUDE_CFG + ".bak-20261011-120000",
+        entry: { command: "SuperInject.exe",
+                 args: [mode === "direct" ? "mcp" : "mcp-launcher"], env: {} },
+        dry_run: false,
+      };
+    },
   };
 
   window.pywebview = { api };

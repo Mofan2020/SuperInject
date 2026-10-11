@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -220,3 +221,52 @@ def test_mcp_config_snippet_defaults_to_launcher(api):
         api.mcp_config_snippet(mode="direct"))["mcpServers"]["superinject"]
     assert any(str(a) == "mcp" for a in direct["args"]), direct
     assert not any("mcp-launcher" in str(a) for a in direct["args"])
+
+
+# --------------------------------------------------------------------------- 写 Agent 配置（v1.3.0 P7）
+
+
+@pytest.fixture()
+def agent_dirs(monkeypatch, tmp_path):
+    """把两个 Agent 目标目录指到 tmp_path（用环境变量覆盖，跨平台确定）。"""
+    claude = tmp_path / "claude"
+    cursor = tmp_path / "cursor"
+    monkeypatch.setenv("SUPERINJECT_CLAUDE_DIR", str(claude))
+    monkeypatch.setenv("SUPERINJECT_CURSOR_DIR", str(cursor))
+    return {"claude": claude, "cursor": cursor}
+
+
+def test_list_agent_targets_returns_list(api, agent_dirs):
+    ts = api.list_agent_targets()
+    assert isinstance(ts, list) and ts, ts
+    ids = {t["id"] for t in ts}
+    assert {"claude-desktop", "cursor"} <= ids
+    for t in ts:
+        assert {"id", "label", "path", "exists"} <= set(t)
+
+
+def test_write_agent_config_creates_then_updates_with_backup(api, agent_dirs):
+    res = api.write_agent_config("cursor")
+    assert res["ok"] is True and res["action"] == "created", res
+    path = Path(res["path"])
+    assert path.exists()
+
+    # 改成不同内容再写 → updated，且产生备份
+    path.write_text(json.dumps({"mcpServers": {"superinject": {"command": "OLD"}}}),
+                    encoding="utf-8")
+    res2 = api.write_agent_config("cursor")
+    assert res2["ok"] is True and res2["action"] == "updated", res2
+    assert res2["backup"] and Path(res2["backup"]).exists()
+
+
+def test_write_agent_config_unknown_target_fails(api, agent_dirs):
+    res = api.write_agent_config("nope")
+    assert res["ok"] is False
+    assert res["error"]
+
+
+def test_write_agent_config_direct_mode_uses_direct_args(api, agent_dirs):
+    res = api.write_agent_config("cursor", "direct")
+    assert res["ok"] is True
+    args = [str(a) for a in res["entry"]["args"]]
+    assert "mcp" in args and not any("mcp-launcher" in a for a in args), args

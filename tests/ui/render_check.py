@@ -321,6 +321,38 @@ def run_interactions(page, shots_dir: Path | None) -> None:
         timeout=5000)
     check("已撤销" in page.inner_text("#log"), "撤销授权走到了 revoke_consent")
 
+    # v1.3.0 P7：一键写入 Agent 配置（探测目标 → 确认框 → 写入 → 日志回显备份）。
+    # 这些断言依赖 mock 的 list_agent_targets / write_agent_config 真被调用：
+    # 任一 mock 缺失或目标列表没渲染，下面一条会立刻变红（同 P1/P6 漏 mock 的教训）。
+    page.click('button.nav-seg[data-target="panel-mcp"]')
+    page.wait_for_function(
+        "() => document.querySelectorAll('#mcp-targets .mcp-target').length >= 2",
+        timeout=5000)
+    targets = page.evaluate("""() => ({
+        rows: document.querySelectorAll('#mcp-targets .mcp-target').length,
+        writeBtns: document.querySelectorAll('#mcp-targets .mcp-target-write').length,
+        firstPath: (document.querySelector('#mcp-targets .mcp-target-path') || {})
+                    .textContent || "",
+    })""")
+    check(targets["rows"] >= 2, f"Agent 目标列表渲染（{targets['rows']} 行）")
+    check(targets["writeBtns"] >= 2, f"每个目标带「写入」按钮（{targets['writeBtns']} 个）")
+    check("claude_desktop_config.json" in targets["firstPath"],
+          f"目标行显示配置路径（{targets['firstPath']}）")
+
+    before_write = page.evaluate("() => document.getElementById('log').children.length")
+    page.click("#mcp-targets .mcp-target-write")
+    page.wait_for_selector("#modal:not(.hidden)", timeout=5000)
+    modal_text = page.inner_text("#modal-text")
+    check("备份" in modal_text and "mcpServers.superinject" in modal_text,
+          "写入前确认框说明「会备份原文件 + 只改 mcpServers.superinject」")
+    page.click("#modal-ok")
+    page.wait_for_function(
+        f"() => document.getElementById('log').children.length > {before_write}",
+        timeout=5000)
+    log_text = page.inner_text("#log")
+    check("已写入" in log_text, "确认后写入走到 write_agent_config 并记日志")
+    check(".bak-" in log_text, "写入日志回显备份路径")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()

@@ -264,6 +264,12 @@
         <span class="mcp-pipe muted">命名管道：<code id="mcp-pipe-name">–</code> · 服务：<b id="mcp-pipe-state">未启用</b></span>
       </div>
       <div id="mcp-detail" class="mcp-detail">尚未授权任何目标。点「授权…」勾选 PID 白名单 / 进程名通配与能力分档。</div>
+      <div class="mcp-targets-block">
+        <div class="mcp-targets-head">
+          <span>一键写入 Agent 配置<small class="muted">（会先备份原文件，只改 <code>mcpServers.superinject</code> 一个键）</small></span>
+        </div>
+        <div id="mcp-targets" class="mcp-targets"></div>
+      </div>
       <div class="mcp-note muted">
         说明：授权后点「启用 MCP 服务」，本进程（已提权）会监听命名管道
         <code>\\.\pipe\SuperInjectMCP</code>。Agent 端配置用
