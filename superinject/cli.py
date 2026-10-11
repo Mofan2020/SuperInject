@@ -89,12 +89,21 @@ HELP_TEXT = """\
   status
   dll [--force]
 
+MCP server（给 AI Agent 用，stdio JSON-RPC）:
+  SuperInject.exe mcp [--consent-stdin] [--no-gui-consent] [--print-config]
+  --consent-stdin    从 stdin 一次性读授权配置（首行必须为大写 YES；
+                     pids= / names= / capabilities= 三行）
+  --no-gui-consent   跳过 GUI 授权弹窗（需配合 --consent-stdin）
+  --print-config     打印 Claude Desktop / Cursor 的 mcpServers 配置片段后退出
+
 示例:
   SuperInject -c -y list --path "C:\\Program Files\\Google\\Chrome\\Application"
   SuperInject -c -y inject 1234
   SuperInject -c -y freeze --pid 1234
   SuperInject -c -y mem-read --pid 1234 --address 0x401000 --size 64
   SuperInject -c -y 'inject 1234 --json'
+  SuperInject mcp --print-config
+  SuperInject mcp --consent-stdin --no-gui-consent < consent.txt
 
 ⚠️ 本工具仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！
 """
@@ -627,6 +636,119 @@ def _ensure_elevation(argv: List[str], want_system: bool):
         eargv.append("--as-admin")
     return _elev.ensure_privilege(eargv, auto_relaunch=True,
                                   want_system=want_system)
+
+
+# ---------------------------------------------------------------- MCP server
+
+
+def mcp_config_snippet(launcher_path: Optional[str] = None) -> str:
+    """生成 Claude Desktop / Cursor 的 ``mcpServers`` 配置片段（JSON 文本）。
+
+    打包产物：``command`` 指向 exe，``args`` 为 ``["mcp"]``；
+    源码运行：``command`` 指向当前解释器，``args`` 为 ``["-m", "superinject", "mcp"]``。
+    """
+    if launcher_path:
+        command, args = str(launcher_path), ["mcp"]
+    elif getattr(sys, "frozen", False):
+        command, args = sys.executable, ["mcp"]
+    else:
+        command, args = sys.executable, ["-m", "superinject", "mcp"]
+    cfg = {"mcpServers": {"superinject": {"command": command, "args": args,
+                                          "env": {}}}}
+    return json.dumps(cfg, ensure_ascii=False, indent=2)
+
+
+def _resolve_mcp_consent(ns: argparse.Namespace) -> Optional[Any]:
+    """按 ``mcp`` 子命令参数拿一个有效的 ConsentSession（拿不到返回 None）。
+
+    所有诊断信息一律走 **stderr** —— stdout 要留给 JSON-RPC 帧。
+    """
+    from . import mcp_consent
+
+    if getattr(ns, "consent_stdin", False):
+        try:
+            session = mcp_consent.request_consent_cli(sys.stdin)
+        except mcp_consent.ConsentError as exc:
+            safe_print(f"[mcp] consent 配置错误: {exc}", "stderr")
+            return None
+        try:
+            mcp_consent.save_consent(session)
+        except OSError as exc:
+            safe_print(f"[mcp] consent 落盘失败: {exc}", "stderr")
+            return None
+        safe_print(f"[mcp] 已授权：{session.targets_summary()}", "stderr")
+        return session
+
+    session = mcp_consent.load_consent()
+    if session is not None and mcp_consent.is_valid(session):
+        safe_print(f"[mcp] 复用有效授权：{session.targets_summary()}", "stderr")
+        return session
+
+    if getattr(ns, "no_gui_consent", False):
+        safe_print("[mcp] 无有效授权且指定了 --no-gui-consent；"
+                   "请用 --consent-stdin 提供配置", "stderr")
+        return None
+
+    got = mcp_consent.request_consent_gui(parent=None, existing=session)
+    if got is None:
+        safe_print("[mcp] 未获得有效授权：请在 GUI 中授权，"
+                   "或用 --consent-stdin 提供配置。", "stderr")
+    return got
+
+
+def run_mcp(argv: Optional[List[str]] = None) -> int:
+    """``SuperInject.exe mcp [--consent-stdin] [--no-gui-consent] [--print-config]``。
+
+    启动流程：解析参数 → （可选）打印配置 → 自检1 权限 → 取/建授权会话 →
+    起 stdio MCP server。与 ``-c`` 一样需要管理员/SYSTEM（要能注入目标）。
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "mcp":
+        argv = argv[1:]
+
+    parser = argparse.ArgumentParser(prog=f"{APP_NAME} mcp", add_help=True)
+    parser.add_argument("--consent-stdin", action="store_true",
+                        help="从 stdin 一次性读取授权配置（首行必须为大写 YES）")
+    parser.add_argument("--no-gui-consent", action="store_true",
+                        help="跳过 GUI 授权弹窗（需配合 --consent-stdin）")
+    parser.add_argument("--print-config", action="store_true",
+                        help="打印 Claude Desktop / Cursor 的 mcpServers 配置后退出")
+    try:
+        ns = parser.parse_args(argv)
+    except SystemExit as exc:  # argparse 解析失败自己 exit 2
+        return int(exc.code) if exc.code else 0
+
+    if ns.print_config:
+        safe_print(mcp_config_snippet())
+        return 0
+
+    if ns.no_gui_consent and not ns.consent_stdin:
+        safe_print("[mcp] --no-gui-consent 需要同时给出 --consent-stdin", "stderr")
+        return 64
+
+    # 自检1：权限（与 GUI / CLI 共用同一份实现）
+    if not _skip_elevation():
+        elev = _ensure_elevation(argv, want_system=True)
+        if elev.relaunched:
+            safe_print(f"[mcp] {elev.message}", "stderr")
+            return 0
+        if not elev.ok:
+            safe_print("[mcp] " + elev.message, "stderr")
+            log.error("MCP 权限自检失败: %s", elev.message)
+            return 1
+        if elev.degraded:
+            safe_print(f"[mcp] {elev.message}  原因: {elev.reason or '-'}", "stderr")
+
+    session = _resolve_mcp_consent(ns)
+    if session is None:
+        return 5
+
+    from . import mcp_server
+    try:
+        return mcp_server.run(transport="stdio", session=session)
+    except KeyboardInterrupt:
+        safe_print("[mcp] 用户中断", "stderr")
+        return 130
 
 
 def run(argv: Optional[List[str]] = None) -> int:

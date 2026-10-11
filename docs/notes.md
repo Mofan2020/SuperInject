@@ -733,3 +733,90 @@ P1 / P2 的报告都写了「pytest 全过 + ruff clean + DLL 编译成功」，
 * `i686-w64-mingw32-gcc ...` → exit=0；同一命令对 P2 的 `eaad008` 跑会得到
   `error: 'CONTEXT' has no member named 'Rip'`（已用 `git archive eaad008` 复现）。
 * `python tests/ui/render_check.py` → 全绿（含新增的 2 项列表渲染断言）。
+
+## 十七、v1.3.0 P4：MCP server + 会话授权
+
+把调试能力通过 MCP（stdio JSON-RPC）开放给 AI Agent。本阶段只做**协议层 + 授权层**，
+GUI 一键启停（P5）、无 UAC launcher（P6）、自动写 Agent 端配置（P7）都不在本阶段。
+
+### 17.1 协议与授权设计
+
+* **31 个工具，按能力分三档**（`read` 16 / `write` 14 / `dangerous` 1）。
+  `tools/list` 会**按会话授权过滤**：只勾 `read` 的会话根本看不到 `mem_write` /
+  `terminate`；硬调也只回结构化 `consent_denied`，**不落到 Controller**。
+* **目标白名单**：`pid_allowlist`（PID 精确）+ `name_glob`（进程名通配，大小写不敏感）。
+  两者都空 → 一律拒绝（避免「无授权即全放行」）。
+* **过期**：默认 30 分钟（`DEFAULT_TTL_SECONDS`）。
+* **防手改**：`SHA256(规范化字段 + 机器指纹)` 存进 `signature`，读回时用
+  `hmac.compare_digest` 做常量时间比较。改字段而签名对不上 → 会话作废。
+  **这是防误用不是防破解** —— 明文 JSON + 摘要，不做密钥级防护（见 SECURITY.md）。
+* **工具 description 面向 Agent 写**：每条都写清「做什么 + 副作用 + 是否需要注入端在线」，
+  例：`inject` 的 description 明说 `SIDE EFFECT: loads a DLL into the target and starts
+  a background thread in it`。README 里那种免责声明不写进 description。
+
+### 17.2 两条实现路径（SDK 可选，不是必需）
+
+`mcp_server.run()` 自动探测：装了官方 `mcp` SDK 且没有显式传 `stdin`/`stdout` 就用 SDK，
+否则走**裸 stdio JSON-RPC**（`initialize` / `tools/list` / `tools/call` / `ping` 四个方法
+足够 MCP 客户端握手与调用）。SDK 路径抛任何异常（版本差异）都会 `log.exception` 后
+降级到裸路径，**不会让 server 起不来**。
+
+**两者共用同一套** `mcp_router.list_tools()` / `call_tool()`，所以授权语义、工具清单、
+返回结构完全一致，不会出现「装了 SDK 就换一套行为」。
+
+### 17.3 偏离计划的两处（有理由）
+
+1. **`mcp` 不进必需依赖，改放 `[project.optional-dependencies]`**。
+   计划原文是加进 `dependencies`。实际实现时发现：本机 `pip install mcp` 直接
+   `No matching distribution found`（旧 pip / 索引受限环境会命中）。而 SDK 只是优化路径，
+   裸实现已验证完整可用。放进必需依赖会让「装不上一个可选包」直接变成「功能不可用 +
+   CI 全红」。所以改为 optional extra，并在 pyproject 注释里写明原因。
+2. **GUI 授权弹窗只留了接线口，没有在本阶段接通**。
+   `request_consent_gui(parent)` 在 `parent is None` 时**直接返回 None**（不弹窗），
+   而 CLI 侧调用时 parent 恒为 None —— 所以 `SuperInject.exe mcp`（不带
+   `--consent-stdin`、且本地没有有效授权）会**拒绝启动并提示**，而不是弹窗。
+   这是刻意的阶段性状态：真正的弹窗属于 P5（GUI 一键启动）的范围，本阶段先把
+   「没有授权就不许跑」这条底线立住。README 已按实际行为描述，等 P5 接上弹窗后再更新。
+
+### 17.4 改动文件
+
+* `superinject/mcp_consent.py`（新）：`ConsentSession` + 签名/校验 + `load/save_consent`
+  + `check_target` / `check_capability` + `request_consent_cli`（stdin 一次性读，
+  首行必须大写 `YES`）+ `request_consent_gui`（P5 接线口）。
+* `superinject/mcp_router.py`（新）：`ToolSpec` 表（31 条）+ `list_tools(session)` +
+  `call_tool(...)`（未知工具 / 能力不足 / 目标越界 → 三种结构化拒绝）。
+* `superinject/mcp_server.py`（新）：`handle_message`（纯函数、无 IO，便于单测）+
+  `run_stdio`（裸实现）+ `_run_sdk`（SDK 实现）+ `run()`（探测 + 兜底）。
+* `superinject/cli.py`：`mcp` 子命令 + `--consent-stdin` / `--no-gui-consent` /
+  `--print-config`；`mcp_config_snippet()` 生成 Agent 端配置。
+* `superinject/__main__.py`：`argv[0] == "mcp"` 分派（在 `-c` 判断之前）。
+* `superinject/web/consent.html`（新）：授权表单页（供 P5 的模态框加载）。
+* `pyproject.toml`：`[project.optional-dependencies] mcp = ["mcp>=1.0"]`。
+* `README.md` / `SECURITY.md`：MCP 用法 + 安全模型（含「不做什么」）。
+
+### 17.5 验证证据
+
+* `tests/test_mcp_consent.py`（24 例）：构造/签名、过期、**签名篡改后失效**、
+  PID 白名单、`name_glob` 大小写不敏感、空名单拒绝一切、能力分档、落盘往返、
+  损坏/形状不对的文件返回 None、CLI 解析（首行非 YES 拒绝、未知字段拒绝、缺
+  capabilities 拒绝）。
+* `tests/test_mcp_router.py`（14 例）：分档数量与计划一致（16/14/1）、只读会话看不到
+  写类工具、**越权时断言 `Controller` 调用记录为空**、目标越界拒绝、name_glob 放行、
+  每条工具都有非空 description 与合法 JSON Schema、带 PID 的工具必须声明 `target_args`。
+* `tests/test_mcp_server.py`（14 例）：`initialize` / `tools/list` / `tools/call`、
+  越权回 `isError=true` 且 Controller 未被调用、未知方法回 -32601、通知不回应、
+  **stdout 纯净性**（重定向 stdout 后逐行 `json.loads`，非 JSON 行会直接炸）、
+  坏包回 -32700 且主循环不退、空行跳过。
+* **负向测试**：把 `check_capability` 改成恒 `True`，3 个越权用例立刻红
+  （router 2 个 + server 1 个）；恢复后 28 例全过。证明这些断言真的会拦。
+* 端到端手工验证：`SuperInject.exe mcp --print-config` 输出的 `mcpServers` 片段正确；
+  `--consent-stdin` 喂配置后走 `run_stdio`，`initialize` + `tools/list` 响应正常，
+  16 个 read 工具带完整 description/schema，stdout 只有 JSON-RPC 帧。
+
+### 17.6 未做的部分
+
+* **远程传输（TCP / SSE）**：明确不做，只 stdio。远程调试请走 SSH + 同机 launcher。
+* **MCP resources / prompts**：只实现 `tools`。结构化只读视图留后续版本。
+* **多 Agent 并发**：server 假设单客户端；并发会话未设计。
+* **授权中途撤销的实时通知**：改白名单后已连接的 Agent 仍按旧会话运行到过期。
+* **不做密钥级防护**：见 SECURITY.md 的「防误用不是防破解」一节。

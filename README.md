@@ -34,6 +34,7 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
 | 内存快照 / diff | 4KB 分页 SHA-256 + 前 64 字节快照，落盘到 `%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json`；二次操作可对比任意两份快照的差异页（先看全局 SHA 找变化页，再展示 `head64` 两栏 hex），既找得到 1 字节改动也不会随进程跑出 MB 级 false positive |
 | 硬件断点（P2/P3 v1.3.0） | DR0-DR3 装线程级硬件断点（4 槽），DR7 控制位含 R/W / LEN / L 启用；槽位耗尽自动降到 VEH 模拟（`INT3 0xCC` patch + 单步重写）—— 命中推 `event:breakpoint` 给控制器，事件 payload 含 `addr / pid / tid / slot / kind / fault_addr / hit_count / regs / stack`。**命中事件含完整寄存器**（x64: RIP/RSP/RBP/RFLAGS/RAX-RDI/R8-R15/CS/SS；x86: EIP/ESP/EBP/EFLAGS/EAX-EDI/CS/SS）**和栈快照前 16 项**（每项 `{i, addr, value}`；RSP/ESP 页不可读时栈为空数组，事件照推） |
+| MCP server（P4 v1.3.0） | `SuperInject.exe mcp` 起 stdio JSON-RPC server，把 31 个调试能力（`read` 16 / `write` 14 / `dangerous` 1）按**会话授权**开关暴露给 AI Agent：启动时弹窗（或 `--consent-stdin` 一次性读配置）确认 PID 白名单 / 进程名通配符 / 能力分档，未授权的工具在 `tools/list` 里就不出现、硬调也只回 `consent_denied` 且**不会落到控制器**；默认走零依赖的裸 stdio 实现，装了官方 `mcp` SDK 则自动优先走 SDK、失败自动降级；`--print-config` 直接打印 Claude Desktop / Cursor 的 `mcpServers` 配置片段 |
 | 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
 | 崩溃转储 | DLL 在 `DllMain` 里装 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler`，目标进程 ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE 时自动写 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` 与同名 `.json` 元数据 sidecar；控制器在 `on_detach` 时按"水位线"扫目录，把新文件合成 `event:crash` 推到事件队列，CLI/前端都能消费 |
 | 事件流 | DLL / 控制器都能主动推 `type=event:*` 帧（包括崩溃转储、patch 落地等）—— 不参与 id 匹配，专为「通知但不期望响应」设计；CLI `events` 子命令支持 `--follow` 持续轮询 |
@@ -172,6 +173,31 @@ SuperInject.exe -c -y terminate 1234
 SuperInject.exe -c -y status
 SuperInject.exe -c -y dll                  # DLL 自校验
 ```
+
+MCP server（给 AI Agent 用，stdio JSON-RPC）：
+
+```
+SuperInject.exe mcp                               # 起 server（复用有效授权，没有则要求授权）
+SuperInject.exe mcp --print-config                # 只打印 Agent 端配置片段后退出
+SuperInject.exe mcp --consent-stdin --no-gui-consent < consent.txt
+```
+
+- 不带参数时：若本地已有**未过期**的授权会话就直接复用；否则拒绝启动并提示——
+  要么在 GUI 里授权，要么用 `--consent-stdin` 现场提供（授权只能由人给出，不能由 Agent 自签）。
+
+`consent.txt` 格式（首行必须是大写 `YES`，这一行就是授权同意）：
+
+```
+YES
+pids=1234,5678
+names=notepad*,mytool.exe
+capabilities=read,write
+```
+
+- `capabilities` 三档：`read`（列举 / 读内存 / 断点查询等）、`write`（写内存 / patch / 冻结 / 装断点等）、`dangerous`（终止进程）。
+- 未列出的目标进程一律拒绝；`pids` 与 `names` 都空 = 拒绝一切。
+- 授权默认 30 分钟过期，之后要重新授权。
+- `--print-config` 输出的片段贴进 Claude Desktop 的 `claude_desktop_config.json`（或 Cursor 的 `mcp.json`）即可让 Agent 发现本 server。
 
 CLI 模式：
 

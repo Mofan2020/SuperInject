@@ -21,6 +21,15 @@ dependencies = [
     "pywin32>=306; sys_platform == 'win32'",
 ]
 
+# MCP server（`SuperInject.exe mcp`）默认走**零依赖**的裸 stdio JSON-RPC 实现，
+# 所以官方 SDK 是可选增强而不是必需项：装了就自动优先走 SDK（stdio_server 会
+# 自己接管 sys.stdin/stdout），没装或版本对不上就退回裸实现 —— 两条路径对外
+# 行为一致（同一套 tools/list / tools/call 处理函数）。
+# 不放进 dependencies 的原因：mcp 包在某些环境（旧 pip / 受限索引）装不上，
+# 而它只是优化路径；放进必需依赖会让「装不上包」直接变成「功能不可用」。
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+
 [project.urls]
 Homepage = "https://github.com/Mofan2020/SuperInject"
 Repository = "https://github.com/Mofan2020/SuperInject"

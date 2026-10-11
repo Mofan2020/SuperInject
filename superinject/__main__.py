@@ -32,6 +32,8 @@ USAGE = """用法: SuperInject [选项]
   --report PATH    自检报告输出路径（默认写在程序目录下的 self-test-report.json）
   --keep-target    自检结束后保留目标进程（默认回收）
   --system-probe F 以当前身份把身份信息写到文件 F 后退出（自检内部使用）
+  mcp              起 MCP server（stdio JSON-RPC，给 AI Agent 用）
+                   [--consent-stdin] [--no-gui-consent] [--print-config]
   -h, --help       显示本帮助
 
 ⚠️ 仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！
@@ -107,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         from . import cli
         safe_print(cli.HELP_TEXT)
         return 0
+
+    # ---- MCP server：`SuperInject.exe mcp [...]`（stdio JSON-RPC，给 Agent 用）
+    if argv and argv[0] == "mcp":
+        from . import cli
+        return cli.run_mcp(argv)
 
     # ---- CLI 模式：-c 单独走 cli.run()，不再拉 GUI；提升权等均交给 CLI 自己处理
     if "-c" in argv or "--cli" in argv:
