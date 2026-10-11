@@ -1565,8 +1565,7 @@ typedef struct {
 
 static int pe_parse_image(LPVOID base, pe_image_t *out)
 {
-    IMAGE_OPTIONAL_HEADER32 *o32;
-    IMAGE_OPTIONAL_HEADER64 *o64;
+    IMAGE_OPTIONAL_HEADER64 o64;
     if (!base || !out) return 0;
     memset(out, 0, sizeof(*out));
     out->ImageBase  = base;
@@ -1578,27 +1577,28 @@ static int pe_parse_image(LPVOID base, pe_image_t *out)
 
     /*
      * PE32 与 PE32+ OptionalHeader 大小不同，但对"导出表目录"这一字段，
-     * 只是 IMAGE_DATA_DIRECTORY 在整个 header 内的偏移；DataDirectory
-     * 内 member 的 VirtualAddress / Size 在 32/64 是同一种类型。
-     * 取一个具体的 header 视图后立刻断言是 32 还是 64，再按那个尺寸
-     * 抓导出表目录的两个 Dword。MSVC 对共用 o 的两个分支会推断成
-     * "o64*"（PE32 不写赋值），所以这里必须显式分清楚：
-     *   - PE32 → 用 OptionalHeader 直接（结构同型）
-     *   - PE32+ → cast 成 IMAGE_OPTIONAL_HEADER64 *
-     * 不再用 if/else 共享 o，避免 cl /W4 + /WX 视为错误。
+     * DataDirectory 数组在前 16 项的 offset / 含义都相同。MSVC 的 IMAGE_NT_HEADERS
+     * 把 OptionalHeader 嵌成 IMAGE_OPTIONAL_HEADER（=PE32）layout；当 Magic
+     * 是 0x20b 时把同一段内存 cast 成 IMAGE_OPTIONAL_HEADER64 视作 PE32+
+     * DataDirectory，再读 ExportDirRva / ExportDirSize。
+     *
+     * 这里避开所有把 OptionalHeader 字段直接赋给 IMAGE_OPTIONAL_HEADER32*
+     * 的写法（cl /W4 + /WX 会以 C4133（C2440 隐式 cast）报错），改用 memcpy。
      */
     if (out->NtHdr->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR_MAGIC) {
-        o32 = &out->NtHdr->OptionalHeader;
-        out->ExportDirRva  = o32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        out->ExportDirSize = o32->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        memcpy(&out->ExportDirRva,
+               (const void *)&out->NtHdr->OptionalHeader.DataDirectory[
+                   IMAGE_DIRECTORY_ENTRY_EXPORT],
+               sizeof(out->ExportDirRva));
+        memcpy(&out->ExportDirSize,
+               (const void *)&out->NtHdr->OptionalHeader.DataDirectory[
+                   IMAGE_DIRECTORY_ENTRY_EXPORT].Size,
+               sizeof(out->ExportDirSize));
     } else if (out->NtHdr->OptionalHeader.Magic ==
                IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        o64 = (PIMAGE_OPTIONAL_HEADER64)&out->NtHdr->OptionalHeader;
-        (void)o64;
-        out->ExportDirRva  = ((IMAGE_OPTIONAL_HEADER64 *)o64)->
-            DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        out->ExportDirSize = ((IMAGE_OPTIONAL_HEADER64 *)o64)->
-            DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        memcpy(&o64, &out->NtHdr->OptionalHeader, sizeof(o64));
+        out->ExportDirRva  = o64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        out->ExportDirSize = o64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
     } else {
         return 0;
     }
