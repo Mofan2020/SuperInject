@@ -78,7 +78,7 @@ static int si_is_elevated(void)
     return elevated;
 }
 
-#define SI_VERSION "1.0.1"
+#define SI_VERSION "1.2.0"
 
 /* 资源导出上限，避免被调试进程里几十万个小文件拖死 */
 #define SI_MAX_SEEN          256
@@ -1651,18 +1651,245 @@ static int collect_module_exports(LPVOID base, si_json *arr, int budget)
     return emitted;
 }
 
-static int si_export_set_cmp(const void *a, const void *b)
+/* ------------------------- 内存 trampoline / 代码 patch ------------------------- */
+
+/*
+ * patch 机制：在目标地址写入"5 字节近跳转 E9 <rel32>"跳到我们刚 VirtualAlloc
+ * 的 shellcode 区；shellcode 末尾再以 E9 <rel32> 跳回目标地址+5 的原指令处。
+ * 原 5 字节备份，写回即还原（patch_revert）。
+ *
+ * 关键约束：
+ *   1. **绝对不许在加载器锁里执行**：包括 patch 自己写入的位置也不能是
+ *      加载器正在用的代码段。需要 patch 代码段时 mem_write_bytes 已经
+ *      用 VirtualProtect 改完保护再写，行为兼容。
+ *   2. **trampoline 区要 RWX**：直接在 shellcode 末尾追加 ret 是允许的，
+ *      但 trampoline 段必须可执行。这里走 VirtualAlloc + PAGE_EXECUTE_READWRITE。
+ *   3. **trampoline 段尽量近**：用 MEM_TOP_DOWN / 在目标 ±2GB 范围选址，
+ *      否则 rel32 装不下。这版用的是"近址选址"+E9，失败时也允许绝对 64-bit
+ *      跳转（mov r10 imm64; jmp r10）作为后备。
+ *   4. **同一地址 patch 多次时第二次拒收**（除非先 revert）。允许版本号
+ *      自增便于前端识别。
+ *   5. **trampoline 自身要在 unload 时还原 + 释放**：通过 stack 维护一个
+ *      还原列表，unload 路径调一次 free。
+ */
+
+#define SI_MAX_PATCHES        32
+#define SI_MAX_PATCH_BYTES    256
+#define SI_TRAMPOLINE_BYTES   4096
+
+typedef struct {
+    ULONGLONG target;          /* 用户给的绝对地址 */
+    ULONGLONG original_rva;    /* patch 进 trampoline 后回到原地址+5 时用的 rva */
+    ULONGLONG trampoline;      /* shellcode 区基址 */
+    size_t    trampoline_off;  /* shellcode 起始相对基址的偏移 */
+    size_t    trampoline_size; /* shellcode 字节数 */
+    unsigned char orig_bytes[16];
+    size_t    orig_size;
+    ULONGLONG version;         /* 自增 */
+    int       used;
+} si_patch_t;
+
+static si_patch_t g_patches[SI_MAX_PATCHES];
+static ULONGLONG g_patch_seq = 0;
+static int       g_patch_used_trampoline = 0;
+
+/* 选一段近址 RWX。失败回退任意空闲页。 */
+static ULONGLONG alloc_trampoline_page(ULONGLONG near_here)
 {
-    const si_json *ja = *(const si_json *const *)a;
-    const si_json *jb = *(const si_json *const *)b;
-    const char *na = si_json_get_str(ja, "name", "");
-    const char *nb = si_json_get_str(jb, "name", "");
-    if (!na[0] && !nb[0])
-        return (int)(si_json_get_int(ja, "ord", 0)
-                  - si_json_get_int(jb, "ord", 0));
-    if (!na[0]) return  1;
-    if (!nb[0]) return -1;
-    return strcmp(na, nb);
+    ULONGLONG p = 0;
+    /* 优先：near_here 上方 1MB 内对齐地址，让用户段在 32-bit offset 范围 */
+    {
+        SYSTEM_INFO sys;
+        GetSystemInfo(&sys);
+        ULONGLONG target = near_here & ~(ULONGLONG)0xFFF;
+        ULONGLONG hi = target + (1ULL << 20);
+        ULONGLONG lo = (target > (1ULL << 20)) ? target - (1ULL << 20) : 0;
+        for (p = hi; ; p += 0x1000) {
+            if (p >= (ULONGLONG)0x7FFFFFFEFFFFULL) break;   /* cap */
+            void *got = VirtualAlloc((LPVOID)(uintptr_t)p,
+                                     SI_TRAMPOLINE_BYTES,
+                                     MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_EXECUTE_READWRITE);
+            if (got) return (ULONGLONG)(uintptr_t)got;
+            if (p == 0) break;
+        }
+        for (p = (lo < hi) ? lo : 0; p > 0 && p < hi; p += 0x1000) {
+            void *got = VirtualAlloc((LPVOID)(uintptr_t)p,
+                                     SI_TRAMPOLINE_BYTES,
+                                     MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_EXECUTE_READWRITE);
+            if (got) return (ULONGLONG)(uintptr_t)got;
+        }
+        (void)sys;
+    }
+    return 0;
+}
+
+/* 写一段 E9 <rel32> JMP；返回写入字节数（5）。 */
+static size_t emit_jmp_rel32(unsigned char *buf, ULONGLONG from, ULONGLONG to)
+{
+    LONG off = (LONG)(to - (from + 5));
+    buf[0] = 0xE9;
+    *(LONG *)(buf + 1) = off;
+    return 5;
+}
+
+/* 写一段绝对跳转（用作 backup）：mov r10, imm64; jmp r10, 14 字节。 */
+static size_t emit_jmp_abs(unsigned char *buf, ULONGLONG to)
+{
+    /* 49 BA <imm64> = REX.W + 0xBA, 然后 41 FF E2 = jmp r10 */
+    buf[0] = 0x49; buf[1] = 0xBA;
+    *(ULONGLONG *)(buf + 2) = to;
+    buf[10] = 0x41; buf[11] = 0xFF; buf[12] = 0xE2;
+    return 13;
+}
+
+static int find_patch_slot_for_target(ULONGLONG target, int create)
+{
+    int i, free_at = -1;
+    for (i = 0; i < SI_MAX_PATCHES; i++) {
+        if (g_patches[i].used && g_patches[i].target == target) return i;
+        if (!g_patches[i].used && free_at < 0) free_at = i;
+    }
+    if (!create) return -1;
+    if (free_at < 0) return -1;
+    return free_at;
+}
+
+static si_json *patch_to_json(si_patch_t *p)
+{
+    si_json *o;
+    char hex[64];
+    int  i;
+    o = si_json_new();
+    if (!o) return NULL;
+    si_json_set_int(o, "address",  (long long)p->target);
+    si_json_set_int(o, "trampoline", (long long)p->trampoline);
+    si_json_set_int(o, "size", (long long)p->orig_size);
+    si_json_set_int(o, "version", (long long)p->version);
+    /* 原字节 hex */
+    for (i = 0; i < (int)p->orig_size && i * 2 + 2 < (int)sizeof(hex); i++) {
+        snprintf(hex + i * 2, 3, "%02X", p->orig_bytes[i]);
+    }
+    hex[(int)p->orig_size * 2] = 0;
+    si_json_set_str(o, "original", hex);
+    return o;
+}
+
+static void revert_one(si_patch_t *p)
+{
+    if (!p->used) return;
+    (void)WriteProcessMemory(GetCurrentProcess(),
+                              (LPVOID)(uintptr_t)p->target,
+                              p->orig_bytes, p->orig_size, NULL);
+    FlushInstructionCache(GetCurrentProcess(),
+                          (LPCVOID)(uintptr_t)p->target, p->orig_size);
+    if (p->trampoline) {
+        VirtualFree((LPVOID)(uintptr_t)p->trampoline, 0, MEM_RELEASE);
+    }
+    memset(p, 0, sizeof(*p));
+}
+
+static int do_patch_inject(ULONGLONG target, const unsigned char *code,
+                           size_t code_size, char *err, size_t errsz)
+{
+    int slot;
+    ULONGLONG tr;
+    unsigned char tramp[SI_TRAMPOLINE_BYTES] = {0};
+    size_t tr_used = 0;
+    size_t code_off;
+    int patched = 0;
+    ULONGLONG jmp_back_at;
+
+    if (code_size == 0 || code_size > 1024 || target == 0) {
+        snprintf(err, errsz, "参数无效");
+        return 0;
+    }
+    slot = find_patch_slot_for_target(target, 1);
+    if (slot < 0) {
+        snprintf(err, errsz, "已 patch 上限 (%d) 或地址冲突", SI_MAX_PATCHES);
+        return 0;
+    }
+
+    /* 备份原 5 字节 */
+    ReadProcessMemory(GetCurrentProcess(),
+                      (LPCVOID)(uintptr_t)target,
+                      g_patches[slot].orig_bytes, 5,
+                      (SIZE_T *)&g_patches[slot].orig_size);
+    if (g_patches[slot].orig_size == 0) {
+        snprintf(err, errsz, "无法读目标 5 字节（地址无效？）");
+        memset(&g_patches[slot], 0, sizeof(g_patches[slot]));
+        return 0;
+    }
+    g_patches[slot].orig_size = 5;
+
+    tr = alloc_trampoline_page(target);
+    if (tr == 0) {
+        snprintf(err, errsz, "申请 trampoline 页失败");
+        memset(&g_patches[slot], 0, sizeof(g_patches[slot]));
+        return 0;
+    }
+    g_patches[slot].trampoline = tr;
+
+    /* trampoline 布局：
+     *   bytes 0..code_size-1           = 用户的 shellcode
+     *   bytes code_size..code_size+4   = E9 rel32 跳回 target+5
+     */
+    code_off = (g_patch_used_trampoline + 0xF) & ~(size_t)0xF;
+    if (code_off + code_size + 5 > SI_TRAMPOLINE_BYTES) {
+        snprintf(err, errsz, "trampoline 段 4KB 装不下");
+        revert_one(&g_patches[slot]);
+        return 0;
+    }
+    memcpy(tramp, code, code_size);
+    tr_used = code_size;
+    jmp_back_at = tr + code_off + tr_used;
+    tr_used += emit_jmp_rel32(tramp + tr_used, jmp_back_at,
+                               target + 5);
+
+    /* 真正落 trampoline */
+    {
+        SIZE_T put = 0;
+        WriteProcessMemory(GetCurrentProcess(),
+                           (LPVOID)(uintptr_t)(tr + code_off),
+                           tramp, tr_used, &put);
+        if (put != tr_used) {
+            snprintf(err, errsz, "写 trampoline 失败 (0x%lX)",
+                     (unsigned long)GetLastError());
+            revert_one(&g_patches[slot]);
+            return 0;
+        }
+        g_patches[slot].trampoline_off = code_off;
+        g_patches[slot].trampoline_size = tr_used;
+    }
+    g_patch_used_trampoline = (int)(code_off + tr_used);
+
+    /* 在目标写 E9 rel32 跳到 trampoline */
+    {
+        unsigned char jmpbuf[16];
+        ULONGLONG from = target;
+        ULONGLONG to   = tr + code_off;
+        size_t wrote;
+        LONG off = (LONG)(to - (from + 5));
+        if (off == (LONG)(to - (from + 5))) {
+            jmpbuf[0] = 0xE9;
+            *(LONG *)(jmpbuf + 1) = off;
+            wrote = 5;
+        } else {
+            wrote = emit_jmp_abs(jmpbuf, to);
+        }
+        if (!mem_write_bytes((void *)(uintptr_t)target, jmpbuf, wrote,
+                             &patched, err, errsz)) {
+            revert_one(&g_patches[slot]);
+            return 0;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(),
+                          (LPCVOID)(uintptr_t)target, 5);
+    g_patches[slot].used = 1;
+    g_patches[slot].target = target;
+    g_patches[slot].version = ++g_patch_seq;
+    return 1;
 }
 
 /* ------------------------- 指令分发 ------------------------- */
@@ -1905,6 +2132,72 @@ static void agent_handle(const char *text)
     } else if (strcmp(type, "resources") == 0) {
         dump_resources(out);
         si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "patch_inject") == 0) {
+        long long addr = si_json_get_int(msg, "address", 0);
+        const char *hex = si_json_get_str(msg, "hex", "");
+        size_t   n     = strlen(hex) / 2;
+        if (!addr || n == 0 || n > 1024) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "参数无效（address / hex）");
+        } else {
+            unsigned char *b = si_hex_to_bytes(hex, NULL);
+            char err[320] = {0};
+            if (!b) {
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", "bad hex");
+            } else if (do_patch_inject((ULONGLONG)addr, b, n,
+                                       err, sizeof(err))) {
+                si_json_set_int(out, "address", addr);
+                si_json_set_int(out, "version",
+                                (long long)g_patch_seq);
+                si_json_set_bool(out, "ok", 1);
+            } else {
+                si_json_set_bool(out, "ok", 0);
+                si_json_set_str(out, "error", err[0] ? err : "patch 失败");
+            }
+            free(b);
+        }
+
+    } else if (strcmp(type, "patch_list") == 0) {
+        si_json *arr = si_json_new_array();
+        int i;
+        if (!arr) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "alloc");
+        } else {
+            for (i = 0; i < SI_MAX_PATCHES; i++) {
+                if (g_patches[i].used) {
+                    si_json *o = patch_to_json(&g_patches[i]);
+                    if (o) si_json_array_push(arr, o);
+                }
+            }
+            si_json_set_arr(out, "patches", arr);
+            si_json_set_int(out, "count", (long long)(int)
+                            (sizeof(g_patches) / sizeof(g_patches[0])));
+            si_json_set_bool(out, "ok", 1);
+        }
+
+    } else if (strcmp(type, "patch_revert") == 0) {
+        long long addr = si_json_get_int(msg, "address", 0);
+        int slot = find_patch_slot_for_target(
+            (ULONGLONG)addr, 0);
+        if (!addr || slot < 0) {
+            si_json_set_bool(out, "ok", 0);
+            si_json_set_str(out, "error", "未找到对应 patch");
+        } else {
+            revert_one(&g_patches[slot]);
+            si_json_set_int(out, "address", addr);
+            si_json_set_bool(out, "ok", 1);
+        }
+
+    } else if (strcmp(type, "patch_clear") == 0) {
+        int i;
+        for (i = 0; i < SI_MAX_PATCHES; i++)
+            revert_one(&g_patches[i]);
+        g_patch_used_trampoline = 0;
+        si_json_set_bool(out, "ok", 1);
+        si_json_set_str(out, "message", "all reverted");
 
     } else if (strcmp(type, "terminate") == 0) {
         si_json_set_bool(out, "ok", 1);

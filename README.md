@@ -33,6 +33,11 @@ PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不�
 | 内存搜索 | 支持 `4D 5A ?? ??` 通配的十六进制模式扫描，可批量在多进程内搜索 |
 | 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
 | 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
+| 崩溃转储 | DLL 在 `DllMain` 里装 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler`，目标进程 ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE 时自动写 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` 与同名 `.json` 元数据 sidecar；控制器在 `on_detach` 时按"水位线"扫目录，把新文件合成 `event:crash` 推到事件队列，CLI/前端都能消费 |
+| 事件流 | DLL / 控制器都能主动推 `type=event:*` 帧（包括崩溃转储、patch 落地等）—— 不参与 id 匹配，专为「通知但不期望响应」设计；CLI `events` 子命令支持 `--follow` 持续轮询 |
+| 模块导出表 + 符号解析 | `info` 命令附每模块的前 N 条导出，自写 PE 解析不依赖 dbghelp；`exports` 命令按 base / name 查单个模块；`superinject.symbols` 在控制器侧做 `module+0x123` / `module!symbol+0x42` 反查 |
+| 线程级冻结 | `threads` 列目标进程所有线程（含 tid / 状态 / WaitReason / 当前 SuspendCount / 线程名 GetThreadDescription），`thread_suspend` / `thread_resume` 单条挂起 / 恢复；`NtSuspendThread` + `NtQueryInformationThread(ThreadBasicInformation)` 取 SuspendCount |
+| 代码 patch (trampoline) | `patch_inject` 在目标地址写 5 字节 `E9 rel32` 跳到新申请的一段 RWX 跳板，shellcode 末尾再 `E9 rel32` 跳回原地址+5；`patch_list` 列出当前进程里所有 patch（含原字节 hex / trampoline 基址 / version），`patch_revert` 还原单个、`patch_clear` 一次性还原全部；上限 32 条 / 进程 |
 | 自动更新 | 后台检查 GitHub Release（含预发布版本），有新版时询问是否下载安装 |
 | 界面 | 单页应用、**整页可滚动**、六个功能区按视口高度分配空间；外观跟随系统（浅色 / 深色）的 macOS 风格 |
 | 单文件交付 | 打包产物**只有 `SuperInject.exe` 一个文件**（无 `_internal` 目录），内置 DLL 与前端资源都在 exe 内 |

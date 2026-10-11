@@ -224,6 +224,23 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp = sub.add_parser("thread-resume", help="只恢复一个线程")
     sp.add_argument("--pid", type=int, required=True)
     sp.add_argument("--tid", type=int, required=True)
+
+    sp = sub.add_parser("patch-inject", help="在目标地址注入一段 shellcode")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--address", required=True,
+                    help="绝对地址（0x 前缀）")
+    sp.add_argument("--hex", required=True, help="shellcode 十六进制串")
+
+    sp = sub.add_parser("patch-list", help="列出当前进程内的代码 patch")
+    sp.add_argument("--pid", type=int, required=True)
+
+    sp = sub.add_parser("patch-revert", help="还原某个 patch")
+    sp.add_argument("--pid", type=int, required=True)
+    sp.add_argument("--address", required=True,
+                    help="被 patch 的原地址（0x 前缀）")
+
+    sp = sub.add_parser("patch-clear", help="还原全部 patch")
+    sp.add_argument("--pid", type=int, required=True)
     sp = sub.add_parser("ping", help="连通性自检")
     add_pid_positional(sp)
     sp = sub.add_parser("unload", help="卸载注入的 DLL")
@@ -666,6 +683,33 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
                 "pid": int(args.pid), "tid": int(args.tid),
                 **({k: v for k, v in resp.items()
                     if k in {"prev_suspend_count", "suspend_count"}})}
+    if sub == "patch-inject":
+        from .ipc import parse_int as _parse_int
+        addr = _parse_int(str(args.address))
+        resp = _ensure_controller().patch_inject(
+            int(args.pid), addr, str(args.hex))
+        return {"ok": bool(resp.get("ok")), "kind": "patch-inject",
+                "pid": int(args.pid), "address": addr,
+                "version": int(resp.get("version", 0)),
+                "error": resp.get("error", "")}
+    if sub == "patch-list":
+        resp = _ensure_controller().patch_list(int(args.pid))
+        return {"ok": bool(resp.get("ok")), "kind": "patch-list",
+                "pid": int(args.pid),
+                "patches": resp.get("patches", []),
+                "count": int(resp.get("count", 0))}
+    if sub == "patch-revert":
+        from .ipc import parse_int as _parse_int
+        addr = _parse_int(str(args.address))
+        resp = _ensure_controller().patch_revert(int(args.pid), addr)
+        return {"ok": bool(resp.get("ok")), "kind": "patch-revert",
+                "pid": int(args.pid), "address": addr,
+                "error": resp.get("error", "")}
+    if sub == "patch-clear":
+        resp = _ensure_controller().patch_clear(int(args.pid))
+        return {"ok": bool(resp.get("ok")), "kind": "patch-clear",
+                "pid": int(args.pid),
+                "message": resp.get("message", "")}
     if sub == "unload":
         return {"ok": True, "kind": "unload",
                 "results": _ensure_controller().unload(_normalize_pids(args))}

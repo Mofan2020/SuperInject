@@ -337,3 +337,70 @@ CI 的 ``native-msvc`` 现在跑 ``strategy.matrix.arch: [x64, x86]``，分别�
   + ``test_preflight_allows_arch_mismatch_when_dll_available``（可用时放行）。
 * ``tests/test_dll_and_update.py`` 全部更新为 ``lambda *a, **kw: ...`` 兼容
   ``embedded_bytes(arch)`` 的新签名。
+
+## 十二、v1.2.0：调试能力扩展（崩溃转储 / 事件流 / 符号 / 线程 / trampoline）
+
+需求原文：「SuperInject 持续扩展功能，提供更强的开发调试能力」—— 四个方向
+同时上：
+
+1. **崩溃转储（minidump）** —— DLL 在 `DllMain` 装 `SetUnhandledExceptionFilter`
+   + `AddVectoredExceptionHandler`，拦截 `EXCEPTION_ACCESS_VIOLATION /
+   STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION
+   / GUARD_PAGE / INVALID_HANDLE` 时落 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp`
+   （走 `MiniDumpWriteDump`）+ 同名 `.json` sidecar（元数据）。
+   "协议上不需要 DLL 崩溃后还能回话"——所以控制器在 `on_detach` 时按 attach
+   时记录的"水位线"扫 `dump-*.dmp`，新文件合成 `event:crash` 推到事件流。
+
+2. **事件流** —— `ipc.AgentServer` 加 `on_event` 通路：DLL 主动推 `type=event:*`
+   帧不参与 id 匹配，否则会被误清空 waiter。`Controller._on_event` 把消息转
+   存 + 触发订阅回调 `on_event`；CRUD 接口 `list_events(pid=None, name=None,
+   clear=False)`。
+
+3. **模块符号解析** —— 自写轻量 PE 解析（`pe_parse_image` +
+   `collect_module_exports`，覆盖 PE32/PE32+），单模块最多 256 条、按名字去重；
+   `info` 命令附每模块的导出，`exports` 命令按 base / name 单查。
+   `superinject.symbols` 提供 `build_module_index / resolve_address /
+   format_address`（输出 `module!symbol+0x42`）/`lookup_export`（GUI 模糊搜索）。
+   不依赖 dbghelp / symsrv。
+
+4. **线程级冻结** —— `threads` 列目标进程全部线程（`Thread32First/Next` +
+   `GetThreadDescription` 拿名字 + `NtQueryInformationThread(ThreadBasicInformation)`
+   拿 SuspendCount）。`thread_suspend` / `thread_resume` 单条挂起/恢复
+   （`OpenThread THREAD_SUSPEND_RESUME` + `NtSuspend/ResumeThread`）。
+
+5. **代码 patch (trampoline)** —— 4 个新指令 `patch_inject`/`patch_list`/
+   `patch_revert`/`patch_clear`：在目标地址写 5 字节 `E9 rel32` 跳到刚
+   `VirtualAlloc` 的 RWX 跳板，shellcode 末尾 `E9 rel32` 跳回原地址+5；
+   原 5 字节备份，写回即还原。上限 32 条/进程。
+
+### 12.1 协议变更
+
+* `ipc.AgentServer.on_event(cb)` 新增；回调签名 `(pid:int, msg:dict) -> None`。
+* `Controller.on_event(cb)` 同步；列表 `list_events(pid, name, clear)`。
+* 新 IP 命令（全部 require-DLL-on-target）：`events / dumps / threads /
+  thread_suspend / thread_resume / exports / patch_inject / patch_list /
+  patch_revert / patch_clear`。
+
+### 12.2 改动文件
+
+* `native/agent.c`：约 700 行新增（崩溃转储、VEH/SEH handler、内存 trampoline、
+  线程枚举、单线程挂起、PE 导出解析）。
+* `superinject/ipc.py`：`on_event` 通路 + `_dispatch` 区分 `event:*` 帧。
+* `superinject/controller.py`：`_on_event` / `list_events` / `on_event` /
+  合成 crash 事件（detach 时扫 dump 目录）；`exports`/`threads`/
+  `thread_suspend`/`thread_resume`/`patch_inject/list/revert/clear`。
+* `superinject/symbols.py` 新模块（离线单测 5 通过）。
+* `superinject/cli.py`：`exports/threads/thread-suspend/thread-resume/
+  patch-inject/patch-list/patch-revert/patch-clear/events/dumps` 10 个子命令。
+* `superinject/version.py` 与 `native/agent.c` 里 `SI_VERSION` 都 bump 到 1.2.0。
+* `build/build_native.py` 和 `.github/workflows/ci.yml` 加 `dbghelp.lib` /
+  `-ldbghelp`。
+* `tests/test_ipc_socket.py` + `test_controller.py` + `test_cli.py` +
+  `test_symbols.py` 新增共 8 个测试。
+
+### 12.3 验证证据
+
+* macOS 端：197 单测全过；ruff clean。
+* Windows 端：CI 编译 DLL（MinGW 或 MSVC）→ 集成测试会一并跑 patch 注入：
+  本机需要实测才能确认。
+* v1.2.0 未经星空喵手测确认前按"全项目硬规矩"只发 Pre-release，不升正式版。

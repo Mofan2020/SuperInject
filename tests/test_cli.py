@@ -440,6 +440,93 @@ def test_threads_returns_error_on_fail(monkeypatch, capsys):
     assert data["error"] == "DLL 未注入"
 
 
+# ----------------------------------------------------------- 代码 patch
+
+def test_patch_inject_list_revert_clear(monkeypatch, capsys):
+    """patch-inject / patch-list / patch-revert / patch-clear 端到端。"""
+    inject_seen = {}
+    list_seen = []
+    revert_seen = []
+    clear_seen = []
+
+    class FakeCtrl:
+        def patch_inject(self, pid, address, hex_code):
+            inject_seen["args"] = (pid, address, hex_code)
+            return {"ok": True, "version": 7, "address": address}
+
+        def patch_list(self, pid):
+            list_seen.append(pid)
+            return {"ok": True,
+                    "count": 32,
+                    "patches": [{
+                        "address": 0x401000, "version": 7,
+                        "trampoline": 0x7FFE1234, "size": 5,
+                        "original": "9090909090"}]}
+
+        def patch_revert(self, pid, address):
+            revert_seen.append((pid, address))
+            return {"ok": True, "address": address}
+
+        def patch_clear(self, pid):
+            clear_seen.append(pid)
+            return {"ok": True, "message": "all reverted"}
+
+    ctrl = FakeCtrl()
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: ctrl)
+
+    rc = cli.run(["-c", "-y", "--json", "patch-inject",
+                  "--pid", "9999", "--address", "0x401000",
+                  "--hex", "9090"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "patch-inject"
+    assert data["version"] == 7
+    # 空白 + "?" 都已规整为 hex（"9090"）
+    assert inject_seen["args"] == (9999, 0x401000, "9090")
+
+    rc = cli.run(["-c", "-y", "--json", "patch-list", "--pid", "9999"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "patch-list"
+    assert data["patches"][0]["address"] == 0x401000
+    assert data["count"] == 32
+    assert list_seen == [9999]
+
+    rc = cli.run(["-c", "-y", "--json", "patch-revert",
+                  "--pid", "9999", "--address", "0x401000"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "patch-revert"
+    assert data["ok"] is True
+    assert revert_seen == [(9999, 0x401000)]
+
+    rc = cli.run(["-c", "-y", "--json", "patch-clear", "--pid", "9999"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kind"] == "patch-clear"
+    assert data["message"] == "all reverted"
+    assert clear_seen == [9999]
+
+
+def test_patch_inject_rejects_short_hex(monkeypatch, capsys):
+    """空的 hex 应直接报错（不在协议层就走 OK=Fail 路径返回 rc=2）。"""
+    class FakeCtrl:
+        def patch_inject(self, pid, address, hex_code):
+            raise AssertionError("unexpected call: empty hex should be rejected")
+
+    monkeypatch.setattr(cli, "_skip_elevation", lambda: True)
+    monkeypatch.setattr(cli, "winapi", type("W", (), {"IS_WINDOWS": True}))
+    monkeypatch.setattr(cli, "_ensure_controller", lambda dll_path=None: FakeCtrl())
+    rc = cli.run(["-c", "-y", "--json", "patch-inject",
+                  "--pid", "9999", "--address", "0x401000",
+                  "--hex", ""])
+    assert rc == 2   # argparse 自己 exit 2：--hex 不能为空
+    # argparse 报错走 stderr，不走 payload.json，是分号水流。
+    # 不强行检查输出格式，只要 rc=2 即可。
+
+
 # ----------------------------------------------------------- events / dumps
 
 def test_events_lists_in_memory_queue(monkeypatch, capsys):

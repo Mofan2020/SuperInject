@@ -597,6 +597,32 @@ class Controller:
         return (self.thread_suspend(pid, tid) if suspended
                 else self.thread_resume(pid, tid))
 
+    # ---------------------------------------------------------- 代码 patch
+
+    def patch_inject(self, pid: int, address: int, hex_code: str) -> dict:
+        """在目标地址注入一段 shellcode：申请 trampoline 页 → 写 5 字节跳转 →
+        备份原 5 字节 → 跳过 shellcode + 末尾回跳。
+        """
+        return self.server.request(pid, {
+            "type": "patch_inject",
+            "address": int(address),
+            "hex": hex_code.replace(" ", "").replace("?", "00"),
+        }, timeout=15)
+
+    def patch_list(self, pid: int) -> dict:
+        return self.server.request(pid, {"type": "patch_list"}, timeout=10)
+
+    def patch_revert(self, pid: int, address: int) -> dict:
+        """还原某个 patch：把原 5 字节写回、释放 trampoline。"""
+        return self.server.request(pid, {
+            "type": "patch_revert",
+            "address": int(address),
+        }, timeout=10)
+
+    def patch_clear(self, pid: int) -> dict:
+        """还原所有 patch。"""
+        return self.server.request(pid, {"type": "patch_clear"}, timeout=10)
+
     # ---------------------------------------------------------- 内存
 
     def mem_search(self, pids: List[int], pattern: str, max_results: int = 256

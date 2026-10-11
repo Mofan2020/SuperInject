@@ -173,13 +173,13 @@ def test_fetch_latest_skips_drafts_and_uses_prerelease(monkeypatch):
     """只有预发布版本时也要能发现更新（/releases/latest 这时会 404）。"""
     payload = [
         {"tag_name": "v9.9.9", "draft": True, "assets": []},
-        {"tag_name": "v1.2.0", "prerelease": True, "assets": [],
-         "published_at": "2026-09-27T00:00:00Z"},
+        {"tag_name": "v1.3.0", "prerelease": True, "assets": [],
+                     "published_at": "2026-09-27T00:00:00Z"},
     ]
     monkeypatch.setattr(updater.urllib.request, "urlopen",
                         lambda req, timeout=None: FakeResponse(json.dumps(payload).encode()))
     rel = updater.fetch_latest()
-    assert rel.version == "1.2.0" and rel.prerelease is True and rel.has_newer
+    assert rel.version == "1.3.0" and rel.prerelease is True and rel.has_newer
 
 
 def test_fetch_latest_missing_tag_is_skipped(monkeypatch):
