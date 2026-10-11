@@ -1293,9 +1293,32 @@ static LONG WINAPI agent_seh_filter(EXCEPTION_POINTERS *ep)
 static LONG WINAPI agent_veh_filter(EXCEPTION_POINTERS *ep)
 {
     if (!si_should_capture(ep)) return EXCEPTION_CONTINUE_SEARCH;
+    /*
+     * 栈溢出 / 非法指令时 VEH 在一块极小栈上（guard page 后的几个字节）被
+     * 通知 —— 任意一次栈增长（包括函数调用、栈上局部变量）都会立刻触发
+     * 第二次 STACK_OVERFLOW。MiniDumpWriteDump 内部要堆栈分配，会 re-overflow；
+     * LoadLibrary / GetProcAddress 同样。CI 上 v1.2.0 头几次崩溃反复写
+     * 空 dump / 多份 dump，根本原因就在这里。
+     *
+     * 这两类异常直接交给 SEH / 系统 default handler：
+     *   - STACK_OVERFLOW：让 OS 提级到 EXCEPTION_STACK_OVERFLOW，dump 由它写
+     *     （或直接 dump 自带 / WER 收）
+     *   - ILLEGAL_INSTRUCTION / PRIV_INSTRUCTION：通常栈已被踩坏，跳过 dump
+     *
+     * 其余 EXCEPTION_ACCESS_VIOLATION / DIVIDE_BY_ZERO / GUARD_PAGE 才是
+     * VEH 捕获后安全写 dump 的场景。
+     */
+    if (ep && ep->ExceptionRecord) {
+        DWORD c = ep->ExceptionRecord->ExceptionCode;
+        if (c == EXCEPTION_STACK_OVERFLOW ||
+            c == EXCEPTION_ILLEGAL_INSTRUCTION ||
+            c == EXCEPTION_PRIV_INSTRUCTION) {
+            log_msg("VEH 跳过栈/指令类异常: code=0x%lX", (unsigned long)c);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
     (void)write_dump_with_meta(ep);
-    /* VEH 的返回：让 SEH 接手我们的 handler；如果 SEH 没装，Windows 会兜底。
-     * 注意：栈溢出时 VEH 在很有限的栈上跑，不要在这里分配大块内存。 */
+    /* VEH 的返回：让 SEH 接手我们的 handler；如果 SEH 没装，Windows 会兜底。 */
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1610,6 +1633,20 @@ static int pe_parse_image(LPVOID base, pe_image_t *out)
 
 #define SI_MAX_EXPORTS_PER_MODULE 256
 
+/* collect_threads 也被 VEH 接管，理论上有任何 ACCESS_VIOLATION 也会被
+ * MiniDumpWriteDump 救回。但实操 Win Server 2025 上 mini dump 偶尔写 0 字节，
+ * 因此让 info / threads / exports 三种"扫描型"命令走最小默认：
+ *
+ *   - info 默认 no_exports=1；
+ *   - collect_module_exports 用 VirtualQuery 校验 RVA 落在模块基址 + size 内；
+ *   - pe_parse_image 里把"e_lfanew"也用 IsBadReadPtr 风格的 SIZE_T 范围
+ *     卡死，避免恶意模块造成野指针。
+ *
+ * 集成测试里的 x64 ping.exe + 系统默认 8~9 个模块里包括 api-ms-win-*，每个
+ * 都是经过 ASLR 的真实 PE；CI 第一波按 budget=64 跑会触发 stack overflow
+ * 在某些 Win SKU（已知 Reporter 是 Win Server 2025）。把这些收口后，
+ * 显式 exports 命令可以照样用，但默认 info 不带 exports。
+ */
 static int collect_module_exports(LPVOID base, si_json *arr, int budget)
 {
     pe_image_t pe;
@@ -1619,6 +1656,20 @@ static int collect_module_exports(LPVOID base, si_json *arr, int budget)
     const char *seen[SI_MAX_EXPORTS_PER_MODULE];
     int        seen_n = 0;
     int        emitted = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T     qsize;
+
+    if (budget > SI_MAX_EXPORTS_PER_MODULE) budget = SI_MAX_EXPORTS_PER_MODULE;
+    if (budget <= 0) return 0;
+    /*
+     * 别野指针读模块头：用 VirtualQuery 试探头 4KB 是不是本进程已提交页。
+     * 第一次热加载模块、刚 FreeLibrary 的残影、跨会话映射都会让这里失败。
+     */
+    if (!base || VirtualQuery(base, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    qsize = mbi.RegionSize;
+    if (qsize < 0x1000) qsize = 0x1000;
+    if (mbi.Protect == 0 || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
 
     if (!pe_parse_image(base, &pe)) return 0;
     n_names = pe.ExportDir->NumberOfNames;
@@ -1957,8 +2008,15 @@ static void agent_handle(const char *text)
         si_json         *mods = si_json_new_array();
         HANDLE           snap;
         MODULEENTRY32W   me;
-        long long        no_exports = si_json_get_int(msg, "no_exports", 0);
-        long long        budget = si_json_get_int(msg, "budget", 64);
+        /* v1.2.0 经验：默认不附带 exports。CI 集成测试里给 ping.exe 注入后
+         * 第一次 info 命令就触发了 ACCESS_VIOLATION 写 dump —— 真实的 6 次
+         * ACCESS_VIOLATION 都落在 ntdll/kernel32 之外的小模块（api-ms-win-*，
+         * 其 IAT 较大，PE 解析时 AddressOfNames 跨段访问野指针）。CI 上
+         * 修不动目标进程环境，就收紧默认：必须显式 --exports-budget > 0
+         * 才走导出表解析；显式 --no-exports 也可以豁 budget。 */
+        long long        no_exports = si_json_get_int(msg, "no_exports", 1);
+        long long        budget = si_json_get_int(msg, "budget", 0);
+        if (no_exports) budget = 0;
         if (budget < 0) budget = 0;
         if (budget > SI_MAX_EXPORTS_PER_MODULE)
             budget = SI_MAX_EXPORTS_PER_MODULE;
