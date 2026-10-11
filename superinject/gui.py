@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from . import dll_manager, elevate, updater, winapi
+from . import dll_manager, elevate, mcp_consent, updater, winapi
 from .controller import Controller
 from .fileserver import PreviewServer
 from .version import APP_NAME, PROJECT_URL, __version__
@@ -311,6 +311,91 @@ class Api:
 
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True, "message": "已开始下载更新，请稍候…"}
+
+    # -------------------------------------------------- MCP 授权（v1.3.0 P5）
+
+    def submit_consent(self, payload: dict) -> dict:
+        """接前端授权表单 → 构造签名会话并落盘。
+
+        表单字段（``consent.html`` / 主窗口模态框回传）：
+
+        * ``pids``：逗号分隔 PID 白名单；
+        * ``names``：逗号分隔进程名通配（大小写不敏感）；
+        * ``capabilities``：能力分档列表（``read`` / ``write`` / ``dangerous``）；
+        * ``ttl_seconds``：有效期秒数（缺省 30 分钟）。
+
+        成功返回 ``{ok, summary, expires_at, path}``；任何校验 / 落盘失败返回
+        ``{ok: False, error}`` 且**不落盘**（落盘在 ``save_consent`` 里是原子写，
+        校验失败根本走不到那步）。
+        """
+        try:
+            session = mcp_consent.session_from_form(payload or {})
+        except mcp_consent.ConsentError as exc:
+            return {"ok": False, "error": str(exc)}
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"表单格式错误: {exc}"}
+        if not session.pid_allowlist and not session.name_glob:
+            return {"ok": False,
+                    "error": "PID 白名单与进程名通配不能同时为空（否则放行一切目标）"}
+        try:
+            path = mcp_consent.save_consent(session)
+        except OSError as exc:
+            return {"ok": False, "error": f"授权落盘失败: {exc}"}
+        return {
+            "ok": True,
+            "summary": session.targets_summary(),
+            "expires_at": session.expires_at,
+            "path": str(path),
+        }
+
+    def mcp_status(self) -> dict:
+        """MCP 授权 + server 的当前状态（前端状态栏用）。
+
+        consent 三态：``none``（无授权文件）/ ``valid``（有效）/ ``expired``
+        （文件在但已过期或签名对不上）。``server`` 恒为 ``running=False``：
+        GUI 进程里没有 stdio 给 MCP 用，真正的 Agent 是从外部拉起
+        ``SuperInject.exe mcp``，靠这份 consent 文件复用授权。
+        """
+        session = mcp_consent.load_consent()
+        valid = session is not None and mcp_consent.is_valid(session)
+        if session is None:
+            state = "none"
+        elif valid:
+            state = "valid"
+        else:
+            state = "expired"
+        consent = {
+            "state": state,
+            "valid": valid,
+            "summary": session.targets_summary() if session else "",
+            "expires_at": float(session.expires_at) if session else 0.0,
+            "created_at": float(session.created_at) if session else 0.0,
+            "capabilities": sorted(session.capabilities) if session else [],
+            "pid_allowlist": sorted(session.pid_allowlist) if session else [],
+            "name_glob": list(session.name_glob) if session else [],
+        }
+        return {
+            "consent": consent,
+            "server": {"running": False, "transport": "stdio",
+                       "note": "Agent 从外部以 `SuperInject.exe mcp` 拉起，复用本授权"},
+        }
+
+    def mcp_config_snippet(self) -> str:
+        """复用 ``cli.mcp_config_snippet()``：Agent 端 ``mcpServers`` 配置片段。"""
+        from .cli import mcp_config_snippet as _snippet
+
+        return _snippet()
+
+    def revoke_consent(self) -> dict:
+        """删除本地 consent 文件（清授权）。文件本就不存在也算成功。"""
+        path = mcp_consent.consent_path()
+        try:
+            if path.exists():
+                path.unlink()
+                return {"ok": True, "removed": True, "path": str(path)}
+        except OSError as exc:
+            return {"ok": False, "error": f"删除授权失败: {exc}"}
+        return {"ok": True, "removed": False, "path": str(path)}
 
     # -------------------------------------------------- 收尾
 

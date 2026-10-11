@@ -882,6 +882,188 @@
     }
   });
 
+  // ---------------------------------------------------------- MCP 授权（v1.3.0 P5）
+  //
+  // GUI 的职责是「授权 + 复制配置」，**不是**在本进程里起 server —— 真正的
+  // MCP server 由外部 Agent 以 stdio 拉起 `SuperInject.exe mcp`，读取同一份
+  // consent 文件复用授权。状态全部来自后端 mcp_status()。
+  state.mcp = { consent: { state: "none" }, server: {} };
+
+  const MCP_STATE_META = {
+    none: ["未授权", "off"],
+    valid: ["已授权", "on"],
+    expired: ["已过期", "warn"],
+  };
+
+  function fmtLocalTime(ts) {
+    const n = Number(ts);
+    if (!n) return "—";
+    try { return new Date(n * 1000).toLocaleString(); } catch (_) { return "—"; }
+  }
+
+  async function refreshMcpStatus() {
+    const st = await call("mcp_status");
+    if (!st || !st.consent) return;
+    state.mcp = st;
+    renderMcpStatus();
+  }
+
+  function renderMcpStatus() {
+    const c = (state.mcp && state.mcp.consent) || { state: "none" };
+    const meta = MCP_STATE_META[c.state] || MCP_STATE_META.none;
+    const badge = $("#badge-mcp");
+    if (badge) {
+      badge.textContent = "MCP " + meta[0];
+      badge.className = "badge " +
+        (c.state === "valid" ? "ok" : c.state === "expired" ? "warn" : "");
+    }
+    const dot = $("#mcp-state-dot");
+    if (dot) dot.className = "mcp-dot " + meta[1];
+    const txt = $("#mcp-state-text");
+    if (txt) txt.textContent = meta[0];
+    const detail = $("#mcp-detail");
+    if (detail) {
+      if (c.state === "valid") {
+        detail.innerHTML =
+          "白名单：<b>" + escapeHtml(c.summary || "") + "</b><br>" +
+          "能力：<b>" + escapeHtml((c.capabilities || []).join(", ") || "-") + "</b> · " +
+          "到期：<b>" + escapeHtml(fmtLocalTime(c.expires_at)) + "</b>";
+      } else if (c.state === "expired") {
+        detail.innerHTML = "上次授权已于 <b>" + escapeHtml(fmtLocalTime(c.expires_at)) +
+          "</b> 过期（白名单：" + escapeHtml(c.summary || "-") + "）。需要重新授权。";
+      } else {
+        detail.textContent =
+          "尚未授权任何目标。点「授权…」勾选 PID 白名单 / 进程名通配与能力分档。";
+      }
+    }
+    const revoke = $("#btn-mcp-revoke");
+    if (revoke) revoke.disabled = c.state !== "valid";
+  }
+
+  function collectConsentForm() {
+    const caps = ["read"];
+    if ($("#consent-cap-write").checked) caps.push("write");
+    if ($("#consent-cap-dangerous").checked) caps.push("dangerous");
+    return {
+      pids: $("#consent-pids").value,
+      names: $("#consent-names").value,
+      capabilities: caps,
+      ttl_seconds: parseInt($("#consent-ttl").value, 10) || 1800,
+    };
+  }
+
+  function setConsentStatus(msg, cls) {
+    const el = $("#consent-status");
+    el.textContent = msg || "";
+    el.className = "consent-status" + (cls ? " " + cls : "");
+  }
+
+  function openConsentModal() {
+    const c = (state.mcp && state.mcp.consent) || {};
+    if (c.pid_allowlist && c.pid_allowlist.length) {
+      $("#consent-pids").value = c.pid_allowlist.join(",");
+    }
+    if (c.name_glob && c.name_glob.length) {
+      $("#consent-names").value = c.name_glob.join(",");
+    }
+    const caps = c.capabilities || [];
+    $("#consent-cap-write").checked = caps.indexOf("write") >= 0;
+    $("#consent-cap-dangerous").checked = caps.indexOf("dangerous") >= 0;
+    setConsentStatus("");
+    $("#consent-modal").classList.remove("hidden");
+  }
+
+  function closeConsentModal() {
+    $("#consent-modal").classList.add("hidden");
+  }
+
+  async function submitConsent() {
+    const payload = collectConsentForm();
+    if (!payload.capabilities.length) {
+      return setConsentStatus("至少勾选一项能力分档", "err");
+    }
+    if (!payload.pids.trim() && !payload.names.trim()) {
+      return setConsentStatus("PID 白名单与进程名通配不能同时为空", "err");
+    }
+    setConsentStatus("提交中…");
+    let res;
+    try {
+      res = await call("submit_consent", payload);
+    } catch (e) {
+      return setConsentStatus("授权失败：" + e, "err");
+    }
+    if (res && res.ok) {
+      setConsentStatus("已授权：" + (res.summary || ""), "ok");
+      log("MCP 已授权：" + (res.summary || ""), "ok");
+      await refreshMcpStatus();
+      setTimeout(closeConsentModal, 400);
+    } else {
+      setConsentStatus("授权失败：" + ((res && res.error) || "未知错误"), "err");
+    }
+  }
+
+  async function revokeConsent() {
+    if (!await confirmBox("撤销 MCP 授权",
+      "将删除本地授权文件；已连接的 Agent 会按旧会话运行到过期。确定？")) return;
+    const res = await call("revoke_consent");
+    if (res && res.ok) {
+      log("MCP 授权已撤销", "ok");
+      await refreshMcpStatus();
+    } else {
+      log("撤销失败: " + ((res && res.error) || "未知错误"), "err");
+    }
+  }
+
+  async function copyMcpConfig() {
+    const text = await call("mcp_config_snippet");
+    if (typeof text !== "string" || !text) {
+      log("获取 MCP 配置失败", "err");
+      return;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand && document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      log("已复制 Agent 配置（贴进 claude_desktop_config.json / mcp.json）", "ok");
+    } catch (e) {
+      log("复制失败: " + e, "err");
+    }
+  }
+
+  (function initMcpPanel() {
+    const open = $("#btn-mcp-consent");
+    if (open) open.addEventListener("click", openConsentModal);
+    const revoke = $("#btn-mcp-revoke");
+    if (revoke) revoke.addEventListener("click", revokeConsent);
+    const copy = $("#btn-mcp-copy");
+    if (copy) copy.addEventListener("click", copyMcpConfig);
+    const cancel = $("#consent-cancel");
+    if (cancel) cancel.addEventListener("click", closeConsentModal);
+    const submit = $("#consent-submit");
+    if (submit) submit.addEventListener("click", submitConsent);
+    const badge = $("#badge-mcp");
+    if (badge) badge.addEventListener("click", () => {
+      const target = document.getElementById("panel-mcp");
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    const seg = document.querySelector('button.nav-seg[data-target="panel-mcp"]');
+    if (seg) seg.addEventListener("click", refreshMcpStatus);
+  })();
+
+  // 供后端 mcp_consent._open_consent_modal（parent.evaluate_js）调用。
+  window.SIConsent = {
+    open: openConsentModal,
+    close: closeConsentModal,
+    submit: submitConsent,
+  };
+
   // ---------------------------------------------------------- 分区导航
   // 整页滚动后用一个分段控件在功能区之间跳转；滚动时自动高亮当前区。
   (function initNav() {
@@ -1010,6 +1192,7 @@
       log("初始化失败: " + e, "err");
     }
     refresh();
+    refreshMcpStatus();
   }
 
   // 只启动一次：pywebview 有时既已注入 api，又会再派发 pywebviewready，

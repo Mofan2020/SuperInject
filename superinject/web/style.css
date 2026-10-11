@@ -356,6 +356,38 @@ td.path { color: var(--label-2); font-size: 11.5px; word-break: break-all; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes rise { from { opacity: 0; transform: scale(.97) translateY(6px); } to { opacity: 1; transform: none; } }
 
+/* ---------------------------------------------------------- MCP 授权面板 */
+.mcp-body { padding: 13px 14px; display: flex; flex-direction: column; gap: 10px; }
+.mcp-state { display: flex; align-items: center; gap: 8px; }
+.mcp-dot { width: 10px; height: 10px; border-radius: 999px; flex: none; background: var(--label-3); }
+.mcp-dot.off { background: var(--label-3); }
+.mcp-dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.mcp-dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.mcp-state-text { font-size: 13px; font-weight: 600; }
+.mcp-detail { font-size: 12.5px; color: var(--label-2); line-height: 1.6; }
+.mcp-detail b { color: var(--label); font-weight: 600; }
+.mcp-note { margin-top: 2px; line-height: 1.6; }
+.mcp-note code, .panel-head code, .modal-box code {
+  font-family: "SF Mono", ui-monospace, Consolas, monospace;
+  font-size: 11.5px; padding: 1px 5px; border-radius: 5px;
+  background: var(--field); color: var(--label);
+}
+
+.consent-box { width: min(560px, 100%); }
+.consent-field { margin-bottom: 14px; }
+.consent-field > label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 12.5px; }
+.consent-field input[type="text"], .consent-field select {
+  width: 100%; padding: 7px 10px; background: var(--field);
+}
+.consent-field .hint { margin-top: 4px; }
+.consent-caps { display: flex; flex-direction: column; gap: 8px; }
+.consent-cap { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; cursor: pointer; }
+.consent-cap input { margin-top: 3px; }
+.consent-cap small { display: block; color: var(--label-2); font-size: 11.5px; }
+.consent-status { margin-top: 4px; font-size: 12.5px; min-height: 18px; }
+.consent-status.err { color: var(--danger); }
+.consent-status.ok { color: var(--ok); }
+
 .muted { color: var(--label-2); font-size: 12px; }
 .hidden { display: none !important; }
 

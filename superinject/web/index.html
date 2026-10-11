@@ -28,6 +28,7 @@
       <span id="badge-dll" class="badge">DLL 校验中…</span>
       <span id="badge-arch" class="badge">–</span>
       <span id="badge-ver" class="badge">v–</span>
+      <span id="badge-mcp" class="badge" title="MCP 授权状态">MCP –</span>
       <button id="btn-refresh" class="ghost">刷新进程</button>
     </div>
   </header>
@@ -40,6 +41,7 @@
     <button class="nav-seg" data-target="panel-mem">内存</button>
     <button class="nav-seg" data-target="panel-snap">快照</button>
     <button class="nav-seg" data-target="panel-bp">断点</button>
+    <button class="nav-seg" data-target="panel-mcp">MCP</button>
     <button class="nav-seg" data-target="panel-log">日志</button>
   </nav>
 </div>
@@ -244,6 +246,29 @@
     </details>
   </section>
 
+  <!-- v1.3.0 P5：MCP 授权面板（授权 + 复制 Agent 配置；不在此进程内起 server） -->
+  <section class="panel" id="panel-mcp">
+    <div class="panel-head"><h2>MCP 授权</h2>
+      <span class="hint">核发一份本地授权会话，供外部 Agent 以 <code>SuperInject.exe mcp</code> 复用；本进程不起内嵌 server</span>
+      <span class="grow"></span>
+      <button id="btn-mcp-consent" class="primary">授权…</button>
+      <button id="btn-mcp-revoke" class="warn" disabled>撤销授权</button>
+      <button id="btn-mcp-copy" class="ghost">复制 Agent 配置</button>
+    </div>
+    <div class="mcp-body">
+      <div class="mcp-state">
+        <span id="mcp-state-dot" class="mcp-dot off"></span>
+        <span id="mcp-state-text" class="mcp-state-text">未授权</span>
+      </div>
+      <div id="mcp-detail" class="mcp-detail">尚未授权任何目标。点「授权…」勾选 PID 白名单 / 进程名通配与能力分档。</div>
+      <div class="mcp-note muted">
+        说明：真正的 MCP server 由外部 Agent 进程按
+        <code>SuperInject.exe mcp</code> 拉起（stdio 传输），它读取这份授权文件来复用会话；
+        GUI 进程内没有 stdio，所以这里只负责<strong>授权</strong>与<strong>复制配置</strong>。
+      </div>
+    </div>
+  </section>
+
   <section class="panel" id="panel-log">
     <div class="panel-head"><h2>日志 / 结果</h2>
       <span class="grow"></span>
@@ -272,6 +297,54 @@
     <div class="row end">
       <button id="modal-cancel" class="ghost">取消</button>
       <button id="modal-ok" class="danger">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- v1.3.0 P5：MCP 授权模态框（内容与 web/consent.html 的表单结构一致） -->
+<div id="consent-modal" class="modal hidden">
+  <div class="modal-box consent-box">
+    <h3>MCP 授权</h3>
+    <p class="muted">授权 AI Agent 通过 MCP 访问本机调试能力。会话有效期结束或文件被改动即失效。</p>
+
+    <div class="consent-field">
+      <label>能力分档</label>
+      <div class="consent-caps">
+        <label class="consent-cap"><input type="checkbox" id="consent-cap-read" checked disabled />
+          <span>read<small>列举进程 / 读取内存 / 快照 / 事件 —— 自动授权</small></span></label>
+        <label class="consent-cap"><input type="checkbox" id="consent-cap-write" />
+          <span>write<small>写内存 / 冻结 / patch / 断点 / 卸载 —— 改变目标状态</small></span></label>
+        <label class="consent-cap"><input type="checkbox" id="consent-cap-dangerous" />
+          <span>dangerous<small>终止目标进程 —— 不可撤销</small></span></label>
+      </div>
+    </div>
+
+    <div class="consent-field">
+      <label for="consent-pids">PID 白名单</label>
+      <input type="text" id="consent-pids" placeholder="1234,5678（留空则只按进程名匹配）" />
+      <div class="hint muted">逗号分隔。命中的 PID 直接放行。</div>
+    </div>
+
+    <div class="consent-field">
+      <label for="consent-names">进程名通配符</label>
+      <input type="text" id="consent-names" placeholder="notepad*,mytool.exe" />
+      <div class="hint muted">逗号分隔，大小写不敏感。与 PID 白名单是「或」的关系。</div>
+    </div>
+
+    <div class="consent-field">
+      <label for="consent-ttl">有效期</label>
+      <select id="consent-ttl">
+        <option value="900">15 分钟</option>
+        <option value="1800" selected>30 分钟</option>
+        <option value="3600">60 分钟</option>
+        <option value="7200">120 分钟</option>
+      </select>
+    </div>
+
+    <div id="consent-status" class="consent-status"></div>
+    <div class="row end">
+      <button id="consent-cancel" class="ghost">取消</button>
+      <button id="consent-submit" class="primary">授权</button>
     </div>
   </div>
 </div>

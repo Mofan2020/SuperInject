@@ -771,12 +771,15 @@ GUI 一键启停（P5）、无 UAC launcher（P6）、自动写 Agent 端配置�
    `No matching distribution found`（旧 pip / 索引受限环境会命中）。而 SDK 只是优化路径，
    裸实现已验证完整可用。放进必需依赖会让「装不上一个可选包」直接变成「功能不可用 +
    CI 全红」。所以改为 optional extra，并在 pyproject 注释里写明原因。
-2. **GUI 授权弹窗只留了接线口，没有在本阶段接通**。
-   `request_consent_gui(parent)` 在 `parent is None` 时**直接返回 None**（不弹窗），
-   而 CLI 侧调用时 parent 恒为 None —— 所以 `SuperInject.exe mcp`（不带
-   `--consent-stdin`、且本地没有有效授权）会**拒绝启动并提示**，而不是弹窗。
-   这是刻意的阶段性状态：真正的弹窗属于 P5（GUI 一键启动）的范围，本阶段先把
-   「没有授权就不许跑」这条底线立住。README 已按实际行为描述，等 P5 接上弹窗后再更新。
+2. **GUI 授权弹窗当时只留了接线口**（**已在 P5 接通，见第十八章**）。
+   P4 阶段 `request_consent_gui(parent)` 在 `parent is None` 时**直接返回 None**
+   （不弹窗），而 CLI 侧调用时 parent 恒为 None —— 所以 `SuperInject.exe mcp`
+   （不带 `--consent-stdin`、且本地没有有效授权）会**拒绝启动并提示**，而不是弹窗。
+   P5 把真正的弹窗做到了 GUI 内部：主窗口用 `#consent-modal` 呈现表单，用户提交后
+   前端调 `Api.submit_consent()` 落盘签名会话；GUI 与外部 `SuperInject.exe mcp`
+   共享同一份 consent 文件，因此外部 Agent 复用授权即可。CLI 侧 `parent` 仍恒为
+   None（外部拉起时没有 GUI 窗口可弹），所以 CLI 依旧走「复用有效授权 / 提示用
+   `--consent-stdin`」这条路径 —— 分工见 18.1。
 
 ### 17.4 改动文件
 
@@ -820,3 +823,81 @@ GUI 一键启停（P5）、无 UAC launcher（P6）、自动写 Agent 端配置�
 * **多 Agent 并发**：server 假设单客户端；并发会话未设计。
 * **授权中途撤销的实时通知**：改白名单后已连接的 Agent 仍按旧会话运行到过期。
 * **不做密钥级防护**：见 SECURITY.md 的「防误用不是防破解」一节。
+
+## 十八、v1.3.0 P5：GUI 授权面板 + MCP 状态栏
+
+把 P4 的「GUI 授权弹窗只留了接线口」真正接通：用户能在主窗口里授权 MCP 会话、
+看到授权状态、撤销授权、复制 Agent 端配置。**不做** P6 的命名管道 launcher。
+
+### 18.1 设计与分工（GUI 只授权，不起 server）
+
+关键判断：**不要做成「GUI 里启动内嵌 server」**。GUI 进程没有可用的
+stdin/stdout 给 stdio 传输用；真正的 MCP server 是由**外部 Agent 进程**以
+`SuperInject.exe mcp` 拉起的。因此 GUI 与 CLI 共享**同一份 consent 文件**：
+
+* GUI 负责：**核发授权**（写 consent 文件）+ **复制 Agent 配置** + 显示状态。
+* 外部 `SuperInject.exe mcp` 负责：**读取该文件复用授权**，跑 stdio server。
+
+GUI 顶部状态栏与 `MCP` 分区都从后端 `Api.mcp_status()` 取状态，三态：
+`none`（无授权文件）/ `valid`（有效）/ `expired`（文件在但已过期或签名对不上）。
+`server.running` **恒为 False** —— UI 文案明确写出「真正的 server 由外部拉起」，
+避免用户误以为 GUI 里已经跑了一个 server。
+
+授权表单走主窗口内的 `#consent-modal`（内容与 `web/consent.html` 一致），
+**不**用 pywebview 开新窗口（各版本 API 差异大，新窗口这条路不稳）。提交时前端
+先做基本校验（capabilities 至少一项、pids 与 names 不能都空），再调
+`Api.submit_consent(payload)`；后端用 `mcp_consent.session_from_form()` 构造
+签名会话并原子落盘。`window.SIConsent.open()` 仍保留 —— 后端
+`mcp_consent._open_consent_modal()` 走 `parent.evaluate_js("window.SIConsent.open()")`
+时能直接打开同一个模态框。
+
+### 18.2 改动文件
+
+* `superinject/gui.py`：`Api` 新增四个方法 —— `submit_consent`（表单 → 会话 →
+  落盘，返回 `{ok, summary, expires_at, path}` 或 `{ok: False, error}`）、
+  `mcp_status`（三态 + 白名单摘要 + 能力 + 过期时间 + server 信息）、
+  `mcp_config_snippet`（复用 `cli.mcp_config_snippet()`）、`revoke_consent`
+  （删 consent 文件）。**校验失败 / 落盘失败一律不落盘**。
+* `superinject/web/index.html`：顶部 `.checks` 加 `#badge-mcp` 状态徽标；
+  新增 `panel-mcp` 分区 + 导航段「MCP」；新增 `#consent-modal` 授权模态框。
+* `superinject/web/app.js`：MCP 面板逻辑（状态渲染 / 打开模态框 / 表单校验 /
+  提交 / 撤销 / 复制配置）+ `window.SIConsent` 桥；`boot()` 里拉一次状态。
+* `superinject/web/style.css`：MCP 面板 / 状态点 / 授权模态框样式（`code` 内联样式）。
+* `tests/test_mcp_gui.py`（新）：13 例，见 18.3。
+* `tests/ui/mock_bridge.js`（补 4 个 mock）、`tests/ui/render_check.py`
+  （`PANELS` + 交互）。
+* `README.md` / `docs/notes.md`：GUI 授权流程 + 本章。
+
+### 18.3 验证证据
+
+* `tests/test_mcp_gui.py`（13 例，跨平台 / macOS 可跑）：
+  - `submit_consent` 正常路径 → 会话**真落盘** + `mcp_consent.is_valid` 为真；
+    只给进程名通配（不给 PID）也放行；
+  - 非法 payload（capabilities 空 / 未知分档 / pids 与 names 都空 / 坏 PID /
+    非对象）→ 返回 `{ok: False, error}` 且**文件不存在**（真不落盘）；
+  - `mcp_status` 三态：无文件 `none` / 提交后 `valid`（含能力、白名单、过期时间）/
+    写入过期会话后 `expired`（仍能显示上一份白名单）；
+  - `revoke_consent` 删文件后状态回到 `none`；文件不存在时也算成功；
+  - `mcp_config_snippet` 返回能 `json.loads` 的合法 JSON 且含 `mcpServers`。
+  - consent 落盘路径全程用 `SUPERINJECT_CONSENT_PATH` 指向 `tmp_path`，不污染真实目录。
+* `python3 tests/ui/render_check.py` → 全绿。新增 7 项断言都**依赖 mock 真的被调用**：
+  徽标文案（`MCP 已授权`）、模态框按 `mcp_status` 回填 `1234,5678`、提交后模态框
+  自动关闭（走 `submit_consent` ok 分支）、复制配置让日志新增一行、撤销走到
+  `revoke_consent`。
+* **负向测试**：把 `mock_bridge.js` 的 `mcp_status` 改名为 `mcp_status_BROKEN` →
+  `render_check.py` 立刻报「MCP 状态徽标反映 mock 状态（MCP –）」+
+  「模态框按 mcp_status 回填 PID 白名单（）」并以 **exit=1** 结束；恢复后重新全绿。
+  证明这几条断言不是摆设。
+* `pytest tests -q --ignore=tests/test_integration_windows.py` → **293 passed / 5 skipped**
+  （P4 后 280 + 新增 13）；`ruff check superinject build tests run_superinject.py` → clean。
+
+### 18.4 未做的部分
+
+* **不做命名管道 launcher**（P6）：GUI 不代 Agent 起 server，也不做「无 UAC launcher」
+  绕权限。本阶段只把授权与配置这条链打通。
+* **不做自动写 Agent 端配置文件**（P7）：`mcp_config_snippet` 只把片段复制到剪贴板，
+  由用户自己贴进 `claude_desktop_config.json` / `mcp.json`。
+* **不把 `mcp` 加回必需依赖**：仍留 `[project.optional-dependencies]`（P4 的决定）。
+* **未做授权到期的实时倒计时**：状态只在 `boot()` / 点「MCP」导航 / 提交 / 撤销时刷新，
+  没有后台定时器轮询；过期中的会话在下次刷新时才显示为「已过期」。
+* **未做多窗口授权同步**：单窗口场景；多窗口并发下的状态同步未设计。

@@ -167,6 +167,30 @@
                            removed_hw: 0, removed_veh: 1 }),
     bp_clear: (pid) => ({ ok: true, pid, cleared_hw: 1, cleared_veh: 1 }),
     list_events: (pid, name, clear) => (name === "breakpoint" ? bpEvents(pid) : []),
+
+    // ---- MCP 授权（v1.3.0 P5）：让 MCP 面板状态渲染 + 模态框提交路径被走到 ----
+    // 字段与 gui.Api.mcp_status() 对齐：consent.state ∈ none/valid/expired。
+    mcp_status: () => ({
+      consent: {
+        state: "valid", valid: true,
+        summary: "pids=1234,5678 names=notepad* capabilities=read,write",
+        expires_at: Date.now() / 1000 + 1800, created_at: Date.now() / 1000,
+        capabilities: ["read", "write"],
+        pid_allowlist: [1234, 5678], name_glob: ["notepad*"],
+      },
+      server: { running: false, transport: "stdio" },
+    }),
+    submit_consent: (payload) => ({
+      ok: true,
+      summary: "pids=" + ((payload && payload.pids) || "-") +
+               " capabilities=" + ((payload && payload.capabilities) || []).join(","),
+      expires_at: Date.now() / 1000 + 1800,
+      path: "C:" + BS + "Users" + BS + "test" + BS + "mcp_consent.json",
+    }),
+    revoke_consent: () => ({ ok: true, removed: true }),
+    mcp_config_snippet: () => JSON.stringify({
+      mcpServers: { superinject: { command: "SuperInject.exe", args: ["mcp"], env: {} } },
+    }, null, 2),
   };
 
   window.pywebview = { api };

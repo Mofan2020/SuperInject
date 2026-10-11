@@ -8,7 +8,7 @@
 
 * 页面整体可滚动（内容高度 > 视口高度）；
 * 没有横向溢出（内容宽度 <= 视口宽度）；
-* 六个功能区都能滚到视口内、标题不被吸顶栏挡住；
+* 各功能区都能滚到视口内、标题不被吸顶栏挡住；
 * 进程表/资源墙/日志各自有内部滚动（说明空间分配生效，不是无限长页面）。
 
 用法：
@@ -32,7 +32,8 @@ MOCK = Path(__file__).resolve().parent / "mock_bridge.js"
 VIEWPORTS = [(1280, 800, "default", "light"), (1024, 640, "min", "light"),
              (760, 520, "tiny", "light"), (1280, 800, "dark", "dark")]
 PANELS = ["panel-procs", "panel-inject", "panel-control",
-          "panel-res", "panel-mem", "panel-snap", "panel-bp", "panel-log"]
+          "panel-res", "panel-mem", "panel-snap", "panel-bp",
+          "panel-mcp", "panel-log"]
 
 FAILURES: list[str] = []
 
@@ -88,7 +89,8 @@ def run_viewport(page, width: int, height: int, label: str,
                .replace(")", "").split(",")[:3]]
         check(sum(rgb) > 500, f"浅色外观生效（背景 {metrics['bodyBg']}）")
 
-    check(metrics["panels"] == len(PANELS), f"六个功能区齐全（{metrics['panels']}/6）")
+    check(metrics["panels"] == len(PANELS),
+          f"功能区齐全（{metrics['panels']}/{len(PANELS)}）")
     check(metrics["navSegs"] == len(PANELS), "分区导航分段齐全")
     check(metrics["rows"] > 100, f"进程表渲染出 {metrics['rows']} 行")
     check(metrics["scrollH"] > metrics["clientH"] + 20,
@@ -240,6 +242,55 @@ def run_interactions(page, shots_dir: Path | None) -> None:
     bp_rows = page.evaluate(
         "() => document.querySelectorAll('#bp-table tbody tr').length")
     check(bp_rows >= 2, f"断点列表渲染（{bp_rows} 行）")
+
+    # v1.3.0 P5：MCP 授权面板 + 授权模态框。
+    # 这些断言都依赖 mock_bridge.js 的 mcp_status / submit_consent /
+    # mcp_config_snippet / revoke_consent 真的被调用：徽标文案、模态框回填、
+    # 提交后自动关闭、日志新增行 —— 任意一个 mock 缺失都会让对应断言变红
+    # （同 P1 快照那次漏 mock 的教训）。
+    page.click('button.nav-seg[data-target="panel-mcp"]')
+    page.wait_for_timeout(200)
+    mcp_badge = page.inner_text("#badge-mcp")
+    check("已授权" in mcp_badge, f"MCP 状态徽标反映 mock 状态（{mcp_badge}）")
+
+    page.click("#btn-mcp-consent")
+    page.wait_for_selector("#consent-modal:not(.hidden)", timeout=5000)
+    fields = page.evaluate("""() => ({
+        pids: !!document.querySelector('#consent-pids'),
+        names: !!document.querySelector('#consent-names'),
+        caps: document.querySelectorAll('.consent-cap input[type=checkbox]').length,
+        submit: !!document.querySelector('#consent-submit'),
+        prefilled: document.querySelector('#consent-pids').value,
+    })""")
+    check(fields["pids"] and fields["names"], "授权模态框含 PID / 进程名字段")
+    check(fields["caps"] >= 3, f"授权模态框含能力分档勾选框（{fields['caps']} 项）")
+    check(fields["submit"], "授权模态框含提交按钮")
+    check(fields["prefilled"] == "1234,5678",
+          f"模态框按 mcp_status 回填 PID 白名单（{fields['prefilled']}）")
+
+    # 真提交一次 → submit_consent 走 ok 分支 → 模态框自动关闭
+    page.click("#consent-submit")
+    page.wait_for_function(
+        "() => document.getElementById('consent-modal').classList.contains('hidden')",
+        timeout=5000)
+    check(True, "提交授权后模态框自动关闭（submit_consent 走 ok 分支）")
+
+    # 复制 Agent 配置 → mcp_config_snippet（日志会多一行）
+    before_lines = page.evaluate("() => document.getElementById('log').children.length")
+    page.click("#btn-mcp-copy")
+    page.wait_for_function(
+        f"() => document.getElementById('log').children.length > {before_lines}",
+        timeout=5000)
+    check("复制" in page.inner_text("#log"), "复制 Agent 配置走到了 mcp_config_snippet")
+
+    # 撤销授权 → confirmBox → 确定 → revoke_consent
+    page.click("#btn-mcp-revoke")
+    page.wait_for_selector("#modal:not(.hidden)", timeout=5000)
+    page.click("#modal-ok")
+    page.wait_for_function(
+        "() => document.getElementById('log').textContent.includes('已撤销')",
+        timeout=5000)
+    check("已撤销" in page.inner_text("#log"), "撤销授权走到了 revoke_consent")
 
 
 def main() -> int:
