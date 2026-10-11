@@ -32,7 +32,7 @@ MOCK = Path(__file__).resolve().parent / "mock_bridge.js"
 VIEWPORTS = [(1280, 800, "default", "light"), (1024, 640, "min", "light"),
              (760, 520, "tiny", "light"), (1280, 800, "dark", "dark")]
 PANELS = ["panel-procs", "panel-inject", "panel-control",
-          "panel-res", "panel-mem", "panel-snap", "panel-log"]
+          "panel-res", "panel-mem", "panel-snap", "panel-bp", "panel-log"]
 
 FAILURES: list[str] = []
 

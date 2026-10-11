@@ -60,6 +60,28 @@
              items, resource_count: 4, mapped_count: 2 } };
   }
 
+  // 一条 x64 断点命中事件：带完整寄存器 + 16 项栈快照，
+  // 供 P3 的「展开寄存器 / 展开栈」面板真实渲染（render_check 会走到这段）。
+  function bpEvents(pid) {
+    const ip = 140698000 + 0x1234;     // mock ping.exe 基址 + 偏移
+    const sp = 0x7FF0001000;
+    const regs = {
+      rip: ip, rsp: sp, rbp: sp + 0x80, rflags: 0x202,
+      rax: 0x1, rbx: 0x2, rcx: 0x3, rdx: 0x4, rsi: 0x5, rdi: 0x6,
+      r8: 0x8, r9: 0x9, r10: 0x10, r11: 0x11, r12: 0x12, r13: 0x13,
+      r14: 0x14, r15: 0x15, cs: 0x33, ss: 0x2B,
+    };
+    const stack = Array.from({ length: 16 }, (_, i) => ({
+      i, addr: sp + i * 8, value: 0xDEAD0000 + i,
+    }));
+    return [{
+      pid, seq: 1, ts_ms: Date.now(), type: "event:breakpoint",
+      addr: ip, tid: 4242, slot: -1, kind: "veh",
+      fault_addr: ip + 1, hit_count: 3, bp_type: 0, bp_len: 1,
+      regs, stack,
+    }];
+  }
+
   const api = {
     bootstrap: () => ({
       app: "SuperInject", version: "1.0.2",
@@ -99,6 +121,27 @@
                          path: `C:${BS}Tools${BS}SuperInjectAgent.dll` }),
     check_update: () => ({ ok: true, has_newer: false, latest: "1.0.2" }),
     apply_update: () => ({ ok: true }),
+
+    // ---- 硬件断点（v1.3.0 P2/P3）：让断点面板 + 命中事件流的渲染路径被走到 ----
+    bp_set: (pid, target, tid, bp_type, size) => ({
+      ok: true, pid, address: 140698000, slot: -1, kind: "veh",
+      type: bp_type || "exec", len: size || 1, resolved_symbol: null,
+    }),
+    bp_list: (pid) => ({
+      ok: true, pid,
+      bps: [
+        { addr: 140698000, slot: -1, kind: "veh", tid: 0,
+          type: "exec", len: 1, hit_count: 3 },
+        { addr: 140699120, slot: 0, kind: "hw", tid: 4242,
+          type: "write", len: 4, hit_count: 1 },
+      ],
+      hw_slots_used: 1, hw_slots_total: 4,
+      veh_slots_used: 1, veh_slots_total: 32,
+    }),
+    bp_remove: (pid) => ({ ok: true, pid, address: 140698000,
+                           removed_hw: 0, removed_veh: 1 }),
+    bp_clear: (pid) => ({ ok: true, pid, cleared_hw: 1, cleared_veh: 1 }),
+    list_events: (pid, name, clear) => (name === "breakpoint" ? bpEvents(pid) : []),
   };
 
   window.pywebview = { api };

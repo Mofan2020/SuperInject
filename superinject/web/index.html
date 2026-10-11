@@ -39,6 +39,7 @@
     <button class="nav-seg" data-target="panel-res">资源</button>
     <button class="nav-seg" data-target="panel-mem">内存</button>
     <button class="nav-seg" data-target="panel-snap">快照</button>
+    <button class="nav-seg" data-target="panel-bp">断点</button>
     <button class="nav-seg" data-target="panel-log">日志</button>
   </nav>
 </div>
@@ -234,7 +235,7 @@
       <tbody></tbody>
     </table>
     <details class="bp-events">
-      <summary>命中事件流（点开查看 / "复制 payload" 给 Agent 看）</summary>
+      <summary>命中事件流（点开查看 · 每条可展开寄存器 / 栈快照 / 原始 payload）</summary>
       <div class="bp-events-bar">
         <button id="btn-bp-copy" class="ghost" disabled>复制最新一条 payload</button>
         <button id="btn-bp-clear-events" class="ghost">清空</button>

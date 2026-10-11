@@ -594,3 +594,107 @@ v1.3.0 调试能力的第二段。P1 已经把"对得上 1 字节改动"的快�
   路径考虑全（P3 之后单独走 P3.5 计划）。
 * **未做 CONSOLE 子命令 `bp-trace` 长跑模式**：长跑需要 controller 端对
   命中做 ring-buffer + flush；同样放 P4 / MCP 阶段。
+
+## 十五、v1.3.0：断点寄存器 / 栈捕获（P3 调试核心补全）
+
+P2 把"看得到运行到那一步"的断点接上了，但命中事件的现场是空的 —— `regs`
+是空对象、`stack` 是空数组，光知道"命中了"，不知道**命中那一刻各寄存器是
+什么值、栈上是什么**。P3 就把这两个字段填成真内容：`regs` 来自 VEH 路径
+直接给我们的真 `CONTEXT`（不需要再 `GetThreadContext`），`stack` 从
+RSP/ESP 起读 16 个 QWORD/DWORD。**协议 schema 一个字段名都没动** —— P2 定
+的字段名是硬约束（`test_breakpoint_event_payload_schema_construction`），
+P3 只填值。
+
+### 15.1 协议变更
+
+**DLL 侧（`native/agent.c`）**：
+
+* `si_send_breakpoint_event` 签名从 `(bp, fault_addr, tid)` 扩为
+  `(bp, fault_addr, tid, ctx)`。唯一调用点 `si_veh_breakpoint_dispatch(ep)`
+  把 `ep->ContextRecord` 传进来 —— **VEH 路径下这块就是被冻结目标线程的
+  真 CONTEXT**，不用再拉一次线程上下文。
+
+* `regs` 字段内容（`si_emit_regs`）：
+  - x64：`rip` / `rsp` / `rbp` / `rflags` + `rax..rdi` + `r8..r15`
+    （14 个 GPR）+ `cs` / `ss`；
+  - x86：`eip` / `esp` / `ebp` / `eflags` + `eax..edi`（6 个 GPR）
+    + `cs` / `ss`；
+  - `ctx == NULL` 时仍为空对象（schema 不变）。
+
+* `stack` 字段内容（`si_emit_stack`）：
+  - 从 `RSP`（x86 为 `ESP`）起读 16 个 `ULONG_PTR` / `DWORD`；
+  - 每项 `{i, addr, value}`（`i` 0..15，`addr` 该项地址，`value` 读到的值）；
+  - **安全**：读之前先 `VirtualQuery` 校验该地址所在页 `MEM_COMMIT` 且不带
+    `PAGE_NOACCESS` / `PAGE_GUARD`；不满足 → `stack: []`，**命中事件照推**，
+    不让断点路径因栈坏而崩。
+
+* **不改**的字段：`type` / `addr` / `pid` / `tid` / `slot` / `kind` /
+  `fault_addr` / `hit_count` / `bp_type` / `bp_len` —— 全部原样。
+
+**Controller 侧（`superinject/controller.py`）**：
+
+* **无改动**。v1.2.0 的 `_on_event` 本来就是"把除 `id` / `type` 外的键
+  原样并入事件 dict"，`regs` / `stack` 自然透传给 `list_events` 订阅方
+  （GUI / CLI / 未来 MCP）。
+
+**前端（`superinject/web/`）**：
+
+* 命中事件流每条事件新增两个折叠面板：
+  - **展开寄存器**：按 GPR 分组，每行 2 个寄存器 + 值（十六进制）；
+    架构判断与 DLL 侧一致 —— 有 `rip` 即 x64、有 `eip` 即 x86，两者皆缺
+    则不显示该面板；
+  - **展开栈**：`addr  value` 两列，前 16 项；
+  - 原始 payload 改为折叠（默认收起，方便整条贴给 Agent）。
+* `index.html`：命中事件流的 summary 更新；导航补上「断点」分段
+  （P2 加了 `panel-bp` 却没进导航，`ui-layout` 的 panel 计数与导航数
+  因此对不上 —— P3 一并补齐）。
+
+### 15.2 改动文件
+
+* `native/agent.c`：`si_send_breakpoint_event` 扩参 + 新增 `si_emit_regs` /
+  `si_emit_stack`（约 110 行）；`si_veh_breakpoint_dispatch` 传
+  `ep->ContextRecord` 并改由 `bp_ctx` 引用；VEH 单步的 IP 回跳从无条件
+  `ctx->Rip` 改为按位宽分派（x86 用 `Eip`）—— x86 DLL 才能编过。
+* `superinject/web/app.js`：`hexVal` / `bpArchOf` / `renderRegsHtml` /
+  `renderStackHtml` + `refreshBpEvents` 渲染三个折叠面板（约 90 行新增）。
+* `superinject/web/style.css`：寄存器网格 / 栈列表 / 折叠面板样式（约 45 行）。
+* `superinject/web/index.html`：事件流 summary 文案 + 导航补「断点」。
+* `tests/test_breakpoint.py`（增量）：新增 5 条 P3 用例（regs 非空、
+  stack 16 项、x86 / x64 架构字段、RSP 无效 → `stack=[]` 不崩）。
+* `tests/test_integration_windows.py`（增量）：`test_hw_breakpoint_on_ping`
+  增断言 —— 命中事件 `regs.rip` 落在 ping 模块地址范围内、`stack` ≥ 1 项
+  且每项含 `{i, addr, value}`。
+* `tests/ui/render_check.py` + `tests/ui/mock_bridge.js`：把 `panel-bp`
+  纳入布局检查的 panel 列表；假后端补 `bp_*` / `list_events`（含一条
+  带完整寄存器 + 16 项栈的 x64 命中事件），让 P3 的前端渲染路径在
+  `ui-layout` 里被真跑一遍。
+
+### 15.3 验证证据
+
+* **DLL 编译零新 warning**：x64 MinGW `-Wall -Wextra` 仍是 v1.2.0 既存的
+  5 条 `-Wcast-function-type`（`write_dump_with_meta` / `NtSuspendThread` /
+  `NtResumeThread` / `NtQueryInformationThread` / `GetThreadDescription`），
+  P3 没有引入新 warning。x86 从"编不过（`ctx->Rip` 在 x86 CONTEXT 不存在）"
+  变为**能编过**（0 error），warning 类别也没新增。
+* **单测**：223 → **228 passed**（+5），5 skip（Windows-only），`ruff check`
+  clean。
+* **前端渲染**：`python tests/ui/render_check.py` 全绿（含 `panel-bp`
+  纳入检查、页面无 JS 报错）。另用 Playwright 探针实测：选进程后命中的
+  x64 事件渲染出 20 个寄存器（rip/rsp/rbp/rflags/14×GPR/cs/ss，每行 2 个
+  = 10 行）+ 16 项栈；x86 事件渲染出 12 个寄存器（eip/esp/ebp/eflags/6×GPR
+  /cs/ss，6 行）+ 16 项栈（4 字节步长）；展开后页面无横向溢出。
+* **DLL 体积**：188KB → 190KB（+1.5KB，寄存器 / 栈填值路径）。
+
+### 15.4 未做的部分
+
+* **未做 FPU / MMX / XMM / AVX（SIMD）寄存器**：`CONTEXT_FULL` 里
+  `FloatSave`（x86）/ `FltSave`（x64）能拿到 x87/SSE 状态，但那是一大块
+  128 位 + 变长向量（AVX-512 要到 `XSave` 区），序列化成 JSON 又大又慢，
+  且绝大多数"断点看现场"只需要通用寄存器 + 栈。**明确不做**：v1.3.0 的
+  `regs` 只覆盖 GPR + IP/SP/BP/FLAGS + segments。
+* **未做栈的符号化回溯**：`stack` 是"从 RSP 起 16 个机器字"的**原始内存**，
+  不是走 `.pdata` / RBP 链的**调用栈回溯**。回溯要把每个地址映射回模块 +
+  解析 unwind 信息，放后续（MCP 客户端拿到原始 regs/stack 后自行处理）。
+* **未做栈深度可配**：固定 16 项。需要更多时后续加 `--stack-depth`。
+* **未做数据断点命中时的原子动作**：同 14.5 —— 命中时改寄存器 / 跳转
+  这类"自定义动作"不在 P3。

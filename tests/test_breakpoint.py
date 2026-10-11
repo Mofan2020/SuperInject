@@ -15,6 +15,10 @@
 6. Controller.breakpoint_list 在 ok 时结构齐全。
 7. Controller.breakpoint_remove 通过 addr 唯一定位 + 报告 removed_hw/veh。
 8. Controller.breakpoint_clear 清空 + 报告 cleared_hw/veh。
+9. P3 事件 payload 内容（``regs`` / ``stack``）：DLL 端 ``si_emit_regs`` /
+   ``si_emit_stack`` 不可在本机（macOS）跑，于是用一份与 agent.c 逐字段对齐
+   的 Python 镜像验证协议契约 —— x64 出 rip/rsp/rbp/r8-r15，x86 出
+   eip/esp/ebp/eax-edi，栈恒 16 项；RSP 不可读时 stack=[] 且事件照推。
 """
 
 from __future__ import annotations
@@ -336,3 +340,185 @@ def test_controller_bp_clear_reports_cleared_counts(monkeypatch):
     assert out["ok"] is True
     assert out["cleared_hw"] == 2
     assert out["cleared_veh"] == 5
+
+
+# ------------------------------- 6. P3 事件 payload：regs / stack 内容（mock）
+
+
+# 与 agent.c 的 si_emit_regs 逐字段对齐的镜像。CONTEXT 在 VEH 路径下由
+# ep->ContextRecord 直接给出，P3 只是把它拆成 JSON —— 这里用同样顺序把
+# 一份「伪 CONTEXT dict」拆开，验证字段名 / 集合与 C 端一致。
+_X64_GPRS = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+_X86_GPRS = ["eax", "ebx", "ecx", "edx", "esi", "edi"]
+
+
+def _mock_context(arch: str, *, sp: int = 0x7FF000001000) -> dict:
+    """造一份「像 CONTEXT 一样」的 dict（x64 或 x86）。"""
+    ctx: dict = {"arch": arch, "sp": sp, "cs": 0x33, "ss": 0x2B}
+    if arch == "x64":
+        ctx["rip"] = 0x7FF6_1234_5678
+        ctx["rsp"] = sp
+        ctx["rbp"] = sp + 0x80
+        ctx["rflags"] = 0x202
+        for i, name in enumerate(_X64_GPRS):
+            ctx[name] = 0xAA00 + i          # 每个寄存器给可区分的值
+    else:
+        ctx["eip"] = 0x0040_1000
+        ctx["esp"] = sp
+        ctx["ebp"] = sp + 0x40
+        ctx["eflags"] = 0x202
+        for i, name in enumerate(_X86_GPRS):
+            ctx[name] = 0xBB00 + i
+    return ctx
+
+
+def _mock_stack_mem(arch: str, sp: int, n: int = 16) -> dict:
+    """造 n 个 QWORD/DWORD 的「可读内存」：addr -> value。"""
+    width = 8 if arch == "x64" else 4
+    return {sp + i * width: 0xDEAD_0000 + i for i in range(n)}
+
+
+def _simulate_regs(arch: str, ctx: dict | None) -> dict:
+    """镜像 agent.c::si_emit_regs —— ctx 为 None / 空时返回 {}。"""
+    if not ctx:
+        return {}
+    regs: dict = {}
+    if arch == "x64":
+        regs["rip"] = ctx["rip"]
+        regs["rsp"] = ctx["rsp"]
+        regs["rbp"] = ctx["rbp"]
+        regs["rflags"] = ctx["rflags"]
+        for name in _X64_GPRS:
+            regs[name] = ctx[name]
+        regs["cs"] = ctx["cs"]
+        regs["ss"] = ctx["ss"]
+    else:
+        regs["eip"] = ctx["eip"]
+        regs["esp"] = ctx["esp"]
+        regs["ebp"] = ctx["ebp"]
+        regs["eflags"] = ctx["eflags"]
+        for name in _X86_GPRS:
+            regs[name] = ctx[name]
+        regs["cs"] = ctx["cs"]
+        regs["ss"] = ctx["ss"]
+    return regs
+
+
+def _simulate_stack(arch: str, ctx: dict | None, mem: dict | None,
+                    readable: bool = True) -> list:
+    """镜像 agent.c::si_emit_stack —— 返回 16 项 {i, addr, value}；RSP 为 0 /
+    页不可读 / 内存缺项时返回 []。"""
+    if not ctx:
+        return []
+    sp = ctx["rsp"] if arch == "x64" else ctx["esp"]
+    if not sp or not readable or mem is None:
+        return []
+    width = 8 if arch == "x64" else 4
+    out = []
+    for i in range(16):
+        addr = sp + i * width
+        out.append({"i": i, "addr": addr, "value": mem[addr]})
+    return out
+
+
+def _simulate_breakpoint_event(arch: str, ctx: dict | None,
+                               mem: dict | None = None, *,
+                               readable: bool = True,
+                               slot: int = -1) -> dict:
+    """完整镜像 si_send_breakpoint_event 的字段构造（不改 schema，只填内容）。"""
+    return {
+        "type": "event:breakpoint",
+        "addr": 0x7FF6_1234_5678 if arch == "x64" else 0x0040_1000,
+        "pid": 4242,
+        "tid": 111,
+        "slot": slot,
+        "kind": "veh" if slot < 0 else "hw",
+        "fault_addr": 0x7FF6_1234_5679 if arch == "x64" else 0x0040_1001,
+        "hit_count": 1,
+        "bp_type": 0,
+        "bp_len": 1,
+        "regs": _simulate_regs(arch, ctx),
+        "stack": _simulate_stack(arch, ctx, mem, readable=readable),
+    }
+
+
+def test_breakpoint_payload_regs_populated():
+    """VEH 命中 → regs 非空且含关键寄存器（x64）。"""
+    ctx = _mock_context("x64")
+    evt = _simulate_breakpoint_event("x64", ctx, _mock_stack_mem("x64", ctx["rsp"]))
+    regs = evt["regs"]
+    assert isinstance(regs, dict) and regs, "regs 必须是非空对象"
+    for key in ("rip", "rsp", "rbp", "rflags", "cs", "ss"):
+        assert key in regs, f"缺关键寄存器 {key}"
+    # rsp 必须与 CONTEXT 一致（栈快照的起点就是它）
+    assert regs["rsp"] == ctx["rsp"]
+    assert regs["rip"] == ctx["rip"]
+
+
+def test_breakpoint_payload_stack_populated():
+    """RSP 指向可读内存 → stack 恰 16 项，addr/value 与内存一致（x64 8B 步长）。"""
+    ctx = _mock_context("x64", sp=0x7FF000001000)
+    mem = _mock_stack_mem("x64", ctx["rsp"])
+    evt = _simulate_breakpoint_event("x64", ctx, mem)
+    stack = evt["stack"]
+    assert isinstance(stack, list) and len(stack) == 16
+    for i, item in enumerate(stack):
+        assert item["i"] == i
+        assert item["addr"] == ctx["rsp"] + i * 8
+        assert item["value"] == mem[ctx["rsp"] + i * 8]
+
+
+def test_breakpoint_payload_arch_x86():
+    """x86 CONTEXT → eip/esp/ebp/eax-edi，且不含 rip/rsp/rbp。"""
+    ctx = _mock_context("x86", sp=0x0012FF00)
+    evt = _simulate_breakpoint_event("x86", ctx, _mock_stack_mem("x86", ctx["esp"]))
+    regs = evt["regs"]
+    for key in ("eip", "esp", "ebp", "eflags"):
+        assert key in regs, f"x86 缺 {key}"
+    for name in _X86_GPRS:
+        assert name in regs
+    # x64 专属名字不得出现（前端靠这个判断架构）
+    for absent in ("rip", "rsp", "rbp", "r8", "r15"):
+        assert absent not in regs, f"x86 payload 不该含 {absent}"
+    # 栈按 4 字节步长
+    assert evt["stack"][1]["addr"] == ctx["esp"] + 4
+
+
+def test_breakpoint_payload_arch_x64():
+    """x64 CONTEXT → rip/rsp/rbp + r8-r15 全在。"""
+    ctx = _mock_context("x64")
+    evt = _simulate_breakpoint_event("x64", ctx, _mock_stack_mem("x64", ctx["rsp"]))
+    regs = evt["regs"]
+    assert "rip" in regs and "rsp" in regs and "rbp" in regs
+    for i in range(8, 16):
+        assert f"r{i}" in regs, f"x64 缺 r{i}"
+    for name in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi"):
+        assert name in regs
+    # x86 专属名字不得出现
+    for absent in ("eip", "esp", "ebp"):
+        assert absent not in regs
+
+
+def test_breakpoint_payload_stack_invalid_rsp():
+    """RSP = 0 / 页不可读 → stack=[]，但事件仍正常成型（不崩、字段齐全）。"""
+    # 1) RSP = 0
+    ctx_zero = _mock_context("x64", sp=0)
+    ctx_zero["rsp"] = 0
+    evt = _simulate_breakpoint_event("x64", ctx_zero, None)
+    assert evt["stack"] == []
+    # 事件仍然完整：regs 存在、其他字段不变
+    assert evt["regs"]["rsp"] == 0
+    assert evt["type"] == "event:breakpoint"
+    assert "hit_count" in evt and "fault_addr" in evt
+
+    # 2) 页不可读（VirtualQuery 判定保护位 → 不读）
+    ctx = _mock_context("x64")
+    evt2 = _simulate_breakpoint_event("x64", ctx, None, readable=False)
+    assert evt2["stack"] == []
+    assert evt2["regs"], "栈不可读不该影响 regs 捕获"
+
+    # 3) 整个 CONTEXT 缺失（ctx=None，理论上 VEH 总给，但兜底不该崩）
+    evt3 = _simulate_breakpoint_event("x64", None, None)
+    assert evt3["regs"] == {} and evt3["stack"] == []
+    assert evt3["type"] == "event:breakpoint"

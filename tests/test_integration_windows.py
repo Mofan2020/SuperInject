@@ -570,6 +570,31 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
     assert _wait_until(got_hit, timeout=25.0, interval=0.5), \
         "在 25 秒内未收到断点命中事件"
 
+    # 5.5 P3：命中事件必须带完整寄存器 + 栈快照
+    def got_rich_event():
+        evts = c.list_events(pid=pid, name="breakpoint") or []
+        for e in evts:
+            if int(e.get("addr", -1)) == addr and e.get("regs"):
+                return e
+        return None
+
+    evt = _wait_until(got_rich_event, timeout=25.0, interval=0.5)
+    assert evt, "在 25 秒内未收到带 regs 的断点命中事件"
+    regs = evt["regs"]
+    # 架构判断与前端一致：x64 有 rip，x86 有 eip
+    ip_key = "rip" if "rip" in regs else ("eip" if "eip" in regs else None)
+    assert ip_key, f"regs 既无 rip 也无 eip：{sorted(regs)[:8]}"
+    ip = int(regs[ip_key])
+    base = int(ping_mod["base"])
+    size = int(ping_mod.get("size", 0)) or 0x100000
+    assert base <= ip < base + size, \
+        f"{ip_key}=0x{ip:x} 不在 ping 模块 [0x{base:x}, 0x{base + size:x}) 内"
+    # 栈快照：至少 1 项（RSP 页可读时是 16 项，每项 {i, addr, value}）
+    stack = evt.get("stack")
+    assert isinstance(stack, list) and len(stack) >= 1, f"stack 快照为空：{stack}"
+    assert {"i", "addr", "value"} <= set(stack[0].keys()), \
+        f"stack 项字段不全：{stack[0]}"
+
     # 6. 清理
     clear = c.server.request(pid, {"type": "bp_clear"}, timeout=10)
     assert clear.get("ok"), clear

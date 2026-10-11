@@ -622,3 +622,50 @@ td.path { color: var(--label-2); font-size: 11.5px; word-break: break-all; }
   max-height: 160px;
   overflow-y: auto;
 }
+
+/* ---- P3：命中事件的寄存器 / 栈折叠面板 ---- */
+.bp-evt details { margin-top: 4px; }
+.bp-evt details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--label-2);
+  user-select: none;
+}
+.bp-evt details[open] > summary { color: var(--label-1); }
+
+.rg-grid,
+.st-list {
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  background: rgba(0,0,0,.18);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.rg-row {
+  display: flex;
+  gap: 8px;
+}
+.rg-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rg-name {
+  color: var(--label-3);
+  display: inline-block;
+  min-width: 44px;
+}
+.rg-val { color: var(--ok); }
+
+.st-list { max-height: 200px; overflow-y: auto; }
+.st-row { display: flex; gap: 10px; }
+.st-addr {
+  color: var(--label-3);
+  flex: 0 0 auto;
+}
+.st-val { color: var(--ok); }

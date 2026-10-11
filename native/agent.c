@@ -1462,14 +1462,117 @@ static int si_should_capture(EXCEPTION_POINTERS *ep)
  *      处理器过这条指令 → 单步命中后再把 0xCC 重写回去（避免 hot loop）。
  */
 
+/*
+ * P3：把 CONTEXT 全集拆成 regs 对象 + 栈数组。VEH 路径下 ep->ContextRecord
+ * 直接给的是真 CONTEXT（被冻结的目标线程那一刻的快照）—— 不用再
+ * GetThreadContext 拉一次。
+ *
+ * 安全：栈读先 VirtualQuery 检查首地址所在页是否可读；不可读就
+ * stack=[]（命中事件照推，不让 bp 路径因栈坏而崩）。即使中途某一
+ * 项发生 EXCEPTION_ACCESS_VIOLATION，v1.2.0 的崩溃 VEH 也会接住
+ * 转储，不会让目标进程无故挂死。
+ */
+static void si_emit_regs(si_json *evt, CONTEXT *ctx)
+{
+    si_json *regs = si_json_new();
+    if (!regs) return;
+    if (ctx) {
+#if defined(_M_X64) || defined(__x86_64__)
+        /* 通用 + segments（CONTEXT_FULL 在 Windows SDK winnt.h 已经把 flags
+         * 完整展开；这里手工读字段避开 flags 不匹配的隐患 —— VEH 路径给
+         * 我们的总是本机位宽对应的 ContextRecord）。 */
+        si_json_set_int(regs, "rip",    (long long)ctx->Rip);
+        si_json_set_int(regs, "rsp",    (long long)ctx->Rsp);
+        si_json_set_int(regs, "rbp",    (long long)ctx->Rbp);
+        si_json_set_int(regs, "rflags", (long long)ctx->EFlags);
+        static const char *reg_names[] = {
+            "rax","rbx","rcx","rdx","rsi","rdi","r8","r9",
+            "r10","r11","r12","r13","r14","r15"};
+        DWORD64 *qwords[] = {
+            &ctx->Rax,&ctx->Rbx,&ctx->Rcx,&ctx->Rdx,&ctx->Rsi,&ctx->Rdi,
+            &ctx->R8,&ctx->R9,&ctx->R10,&ctx->R11,&ctx->R12,&ctx->R13,
+            &ctx->R14,&ctx->R15};
+        int i;
+        for (i = 0; i < 14; i++) {
+            si_json_set_int(regs, reg_names[i], (long long)*qwords[i]);
+        }
+        si_json_set_int(regs, "cs", (long long)ctx->SegCs);
+        si_json_set_int(regs, "ss", (long long)ctx->SegSs);
+#else
+        si_json_set_int(regs, "eip",    (long long)ctx->Eip);
+        si_json_set_int(regs, "esp",    (long long)ctx->Esp);
+        si_json_set_int(regs, "ebp",    (long long)ctx->Ebp);
+        si_json_set_int(regs, "eflags", (long long)ctx->EFlags);
+        static const char *reg_names[] = {
+            "eax","ebx","ecx","edx","esi","edi"};
+        DWORD *dwords[] = {
+            &ctx->Eax,&ctx->Ebx,&ctx->Ecx,&ctx->Edx,&ctx->Esi,&ctx->Edi};
+        int i;
+        for (i = 0; i < 6; i++) {
+            si_json_set_int(regs, reg_names[i], (long long)*dwords[i]);
+        }
+        si_json_set_int(regs, "cs", (long long)ctx->SegCs);
+        si_json_set_int(regs, "ss", (long long)ctx->SegSs);
+#endif
+    }
+    si_json_set_obj(evt, "regs", regs);
+}
+
+static void si_emit_stack(si_json *evt, CONTEXT *ctx)
+{
+    si_json *stack = si_json_new_array();
+    if (!stack) return;
+    if (ctx) {
+        ULONG_PTR base = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+        base = ctx->Rsp;
+#else
+        base = ctx->Esp;
+#endif
+        if (base) {
+            /* 先看 RSP 所在页是否可读 —— 不可读就别冒险去 deref。
+             * 用 VirtualQuery 检查首地址：State 必须是 MEM_COMMIT，且
+             * 不带 PAGE_NOACCESS / PAGE_GUARD 这类保护。                           */
+            MEMORY_BASIC_INFORMATION mbi;
+            memset(&mbi, 0, sizeof(mbi));
+            if (VirtualQuery((LPCVOID)base, &mbi, sizeof(mbi)) &&
+                mbi.State == MEM_COMMIT &&
+                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+#if defined(_M_X64) || defined(__x86_64__)
+                ULONG_PTR *p = (ULONG_PTR *)base;
+                int i;
+                for (i = 0; i < 16; i++) {
+                    si_json *e = si_json_new();
+                    si_json_set_int(e, "i",     i);
+                    si_json_set_int(e, "addr",  (long long)(ULONG_PTR)((unsigned char *)p + i * 8));
+                    si_json_set_int(e, "value", (long long)p[i]);
+                    si_json_array_push(stack, e);
+                }
+#else
+                DWORD *p = (DWORD *)base;
+                int i;
+                for (i = 0; i < 16; i++) {
+                    si_json *e = si_json_new();
+                    si_json_set_int(e, "i",     i);
+                    si_json_set_int(e, "addr",  (long long)(ULONG_PTR)((unsigned char *)p + i * 4));
+                    si_json_set_int(e, "value", (long long)p[i]);
+                    si_json_array_push(stack, e);
+                }
+#endif
+            }
+        }
+    }
+    si_json_set_arr(evt, "stack", stack);
+}
+
 static long si_send_breakpoint_event(si_breakpoint_t *bp, ULONG_PTR fault_addr,
-                                      DWORD tid)
+                                      DWORD tid, CONTEXT *ctx)
 {
     si_json *evt = si_json_new();
     if (!evt) return 0;
     bp->hit_count++;
     /*
-     * 协议字段约定（v1.3.0 P2）：
+     * 协议字段约定（v1.3.0 P3 终版）：
      *   type        — 固定 "event:breakpoint"
      *   addr        — 断点地址
      *   pid / tid   — 触发线程
@@ -1477,10 +1580,14 @@ static long si_send_breakpoint_event(si_breakpoint_t *bp, ULONG_PTR fault_addr,
      *   kind        — "hw" 或 "veh"（GDB "breakpoint vs watchpoint" 思路）
      *   fault_addr  — 实际触发时的 ExceptionAddress（VEH 路径下与 addr 略差）
      *   hit_count   — 命中次数（递增）
-     *   regs        — 占位对象，P3 阶段补全（CONTEXT_FULL）
-     *   stack       — 占位数组，P3 阶段补全（16 个 QWORD）
+     *   bp_type / bp_len — 用户指定的断点类型 / 长度
+     *   regs        — CONTEXT_FULL 寄存器快照（x64: rip/rsp/rbp/r8-r15/cs/ss；
+     *                 x86: eip/esp/ebp/eax-edi/cs/ss；ctx 为 NULL 时为空 obj）
+     *   stack       — 从 RSP/ESP 起 16 个 QWORD/DWORD，每项
+     *                 {i, addr, value}；不可读时为空 arr，事件照推
      *
-     * 占位字段从一开始就要在协议里存在，避免 P3 接入时再改 schema。
+     * 字段名 schema 在 P2 已固化 —— test_breakpoint_event_payload_schema_construction
+     * 是硬约束，P3 只填值不重新设计。
      */
     si_json_set_str(evt, "type", "event:breakpoint");
     si_json_set_int(evt, "addr", (long long)bp->addr);
@@ -1492,9 +1599,11 @@ static long si_send_breakpoint_event(si_breakpoint_t *bp, ULONG_PTR fault_addr,
     si_json_set_int(evt, "hit_count", (long long)bp->hit_count);
     si_json_set_int(evt, "bp_type", (long long)bp->type);
     si_json_set_int(evt, "bp_len",  (long long)bp->len);
-    /* P3 占位：regs / stack 字段先为空 obj / 空 arr。 */
-    si_json_set_obj(evt, "regs",  si_json_new());
-    si_json_set_arr(evt, "stack", si_json_new_array());
+    /* P3：regs / stack 用真 CONTEXT 填值（VEH 路径下 ep->ContextRecord 即可，
+     * 无须再 GetThreadContext）。非 VEH / ctx 为 NULL 时仍是空 obj / 空 arr
+     * —— 协议 schema 不变。                                                       */
+    si_emit_regs(evt,  ctx);
+    si_emit_stack(evt, ctx);
     send_json(evt);
     si_json_free(evt);
     return 1;
@@ -1580,19 +1689,21 @@ static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
     }
     if (!bp) return EXCEPTION_CONTINUE_SEARCH;
     DWORD tid = GetCurrentThreadId();
-    si_send_breakpoint_event(bp, fault, tid);
+    CONTEXT *bp_ctx = ep->ContextRecord;
+    si_send_breakpoint_event(bp, fault, tid, bp_ctx);
     /* 单步跳过去 —— 把 0xCC 还原回原字节，并把 Eip 跳到 orig 地址；
      * 用 TRAP_FLAG 会再触发 SINGLE_STEP，我们在 crt_main_dispatch 里再
      * 装回去。 */
     si_veh_unpatch(idx);
-    CONTEXT *ctx = ep->ContextRecord;
-    /* RIP 回到 orig；flags 加 TF（x86/x64 都是 bit 8）。 */
-    ctx->Rip = (DWORD64)orig;  /* x64 上 RunByOther 也能改 RIP */
+    /* IP 回到 orig；flags 加 TF（x86/x64 都是 bit 8）。
+     * x86 的 CONTEXT 只有 Eip、x64 只有 Rip —— 必须按位宽分别赋值，
+     * 否则另一架构编译不过（CI 的 x86 job 用 /WX）。 */
 #if defined(_M_X64) || defined(__x86_64__)
-    ctx->EFlags |= 0x100;       /* TRAP_FLAG */
+    bp_ctx->Rip    = (DWORD64)orig;
 #else
-    ctx->EFlags |= 0x100;
+    bp_ctx->Eip    = (DWORD)orig;
 #endif
+    bp_ctx->EFlags |= 0x100;       /* TRAP_FLAG */
     /* 标记本 idx 需要 SINGLE_STEP 命中后重装 0xCC：用一个全局槽记。 */
     /* idx 复用 g_veh_bps 里的 NULL 槽 + 计数字段。下面直接用 g_veh_bps[i]
      * 的 type 字段做"待重装"标记，简化 — — type |= 0x80 意味着 pending。 */
@@ -2686,7 +2797,9 @@ static int si_bp_set_hw(int slot, DWORD tid, ULONG_PTR addr, int type, int len)
     HANDLE  th = NULL;
     CONTEXT ctx;
     DWORD   dr7;
-    DWORD   dr6;
+#if defined(_M_X64) || defined(__x86_64__)
+    DWORD   dr6;      /* 只有 x64 分支读 DR6（x86 直接 &= 清 ctx.Dr6） */
+#endif
     BOOL    ok;
     /* OpenThread 也只用于我们自己的进程。PROCESS_VM_OPERATION 已够，
      * 但我们要改 context —— 用 THREAD_GET_CONTEXT + SET_CONTEXT 即可。 */

@@ -581,6 +581,70 @@
     return "0x" + Number(a).toString(16).padStart(8, "0");
   }
 
+  // ---- P3：断点命中事件的寄存器 / 栈渲染（折叠面板）--------------------
+  //
+  // 架构判断与 DLL 侧一致：有 rip 即 x64、有 eip 即 x86；两者都缺则不显示
+  // 寄存器面板（stack 字段为 [] 时同理不显示栈面板）。
+  function hexVal(v) {
+    if (v === undefined || v === null) return "0x0";
+    try {
+      return "0x" + BigInt(v).toString(16).toUpperCase();
+    } catch (_) {
+      const n = Number(v);
+      return Number.isFinite(n) ? "0x" + n.toString(16).toUpperCase() : String(v);
+    }
+  }
+
+  function bpArchOf(regs) {
+    if (!regs || typeof regs !== "object") return "";
+    if (Object.prototype.hasOwnProperty.call(regs, "rip")) return "x64";
+    if (Object.prototype.hasOwnProperty.call(regs, "eip")) return "x86";
+    return "";
+  }
+
+  // 展示顺序：IP / SP / BP / FLAGS 在前，再 GPR，最后 segments。x64 14 个
+  // GPR；x86 6 个。每行 2 个寄存器 + 值。
+  const BP_REG_ORDER = {
+    x64: ["rip", "rsp", "rbp", "rflags",
+          "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+          "cs", "ss"],
+    x86: ["eip", "esp", "ebp", "eflags",
+          "eax", "ebx", "ecx", "edx", "esi", "edi",
+          "cs", "ss"],
+  };
+
+  function renderRegsHtml(regs) {
+    const arch = bpArchOf(regs);
+    if (!arch) return "";
+    const order = BP_REG_ORDER[arch];
+    const rows = [];
+    for (let i = 0; i < order.length; i += 2) {
+      const cells = [];
+      for (let j = 0; j < 2; j++) {
+        const name = order[i + j];
+        if (!name) { cells.push('<span class="rg-cell muted-cell"></span>'); continue; }
+        const has = Object.prototype.hasOwnProperty.call(regs, name);
+        const val = has ? hexVal(regs[name]) : "—";
+        cells.push(`<span class="rg-cell"><span class="rg-name">${escapeHtml(name)}</span>` +
+                   `<span class="rg-val">${escapeHtml(val)}</span></span>`);
+      }
+      rows.push(`<div class="rg-row">${cells.join("")}</div>`);
+    }
+    return rows.join("");
+  }
+
+  function renderStackHtml(stack) {
+    const arr = Array.isArray(stack) ? stack.slice(0, 16) : [];
+    if (!arr.length) return "";
+    return arr.map((it) => {
+      const addr = hexVal(it && it.addr !== undefined ? it.addr : 0);
+      const val = hexVal(it && it.value !== undefined ? it.value : 0);
+      return `<div class="st-row"><span class="st-addr">${escapeHtml(addr)}</span>` +
+             `<span class="st-val">${escapeHtml(val)}</span></div>`;
+    }).join("");
+  }
+
   function renderBps() {
     const tb = $("#bp-table tbody");
     tb.innerHTML = "";
@@ -694,14 +758,43 @@
       const row = document.createElement("div");
       row.className = "bp-evt";
       const t = new Date(e.ts_ms || Date.now()).toLocaleTimeString();
+      const arch = bpArchOf(e.regs);
       row.innerHTML =
         `<div class="meta">#${state.bpEvents.length - idx} ${t} · ` +
         `addr <b>${shortAddr(e.addr)}</b> · tid <b>${e.tid || 0}</b> · ` +
-        `hit <b>${e.hit_count || 0}</b> · kind <b>${e.kind || (e.slot >= 0 ? "hw" : "veh")}</b></div>`;
+        `hit <b>${e.hit_count || 0}</b> · kind <b>${e.kind || (e.slot >= 0 ? "hw" : "veh")}</b>` +
+        (arch ? ` · arch <b>${escapeHtml(arch)}</b>` : "") + `</div>`;
+
+      // P3：寄存器折叠面板（有 rip/eip 才显示）
+      const regsHtml = renderRegsHtml(e.regs);
+      if (regsHtml) {
+        const d = document.createElement("details");
+        d.className = "bp-evt-regs";
+        d.innerHTML = `<summary>展开寄存器（${escapeHtml(arch)}）</summary>` +
+                      `<div class="rg-grid">${regsHtml}</div>`;
+        row.appendChild(d);
+      }
+
+      // P3：栈折叠面板（前 16 项，addr  value 两列）
+      const stackHtml = renderStackHtml(e.stack);
+      if (stackHtml) {
+        const n = Math.min(Array.isArray(e.stack) ? e.stack.length : 0, 16);
+        const d = document.createElement("details");
+        d.className = "bp-evt-stack";
+        d.innerHTML = `<summary>展开栈（前 ${n} 项）</summary>` +
+                      `<div class="st-list">${stackHtml}</div>`;
+        row.appendChild(d);
+      }
+
+      // 原始 payload（折叠，方便整条贴给 Agent）
+      const wrap = document.createElement("details");
+      wrap.className = "bp-evt-raw";
+      wrap.innerHTML = `<summary>原始 payload</summary>`;
       const pre = document.createElement("pre");
       pre.className = "bp-evt-payload";
       pre.textContent = JSON.stringify(e, null, 2);
-      row.appendChild(pre);
+      wrap.appendChild(pre);
+      row.appendChild(wrap);
       box.appendChild(row);
     });
     $("#btn-bp-copy").disabled = !state.bpEvents.length;
