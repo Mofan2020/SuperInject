@@ -79,7 +79,9 @@ def build_mingw(*, want_x86: bool) -> bool:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = DLL_X86 if want_x86 else DLL
     cmd = [
-        cc, "-shared", "-O2", "-Wall", "-Wextra", "-DUNICODE", "-D_UNICODE",
+        cc, "-shared", "-O2", "-Wall", "-Wextra", "-Werror",
+        "-Wno-cast-function-type",  # FARPROC cast 是 GetProcAddress 的标准用法
+        "-DUNICODE", "-D_UNICODE",
         "-lmingw32", "-static-libgcc",
         *[str(s) for s in SOURCES],
         "-o", str(out),

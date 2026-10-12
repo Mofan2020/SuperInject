@@ -80,6 +80,15 @@ static int si_is_elevated(void)
 
 #define SI_VERSION "1.3.0"
 
+/* 跨编译器：GCC/Clang 走 __attribute__，MSVC 用空宏（MSVC 没这个关键字，
+ * 早先的 si_bp_lookup_*_by_addr 因为带这个 P2 留下的尾巴让 MSVC 直接红）。
+ * 这俩函数只在测试桩里被引用过，标记为 unused 只是为了让 -Werror 别误报。 */
+#if defined(_MSC_VER)
+#  define SI_ATTR_UNUSED
+#else
+#  define SI_ATTR_UNUSED __attribute__((unused))
+#endif
+
 /* 资源导出上限，避免被调试进程里几十万个小文件拖死 */
 #define SI_MAX_SEEN          256
 #define SI_MAX_RESOURCES     512
@@ -1405,7 +1414,7 @@ static int write_dump_with_meta(EXCEPTION_POINTERS *ep)
     if (fp) {
         const char *reason = si_exception_name(ep ? ep->ExceptionRecord->ExceptionCode : 0);
         DWORD code   = ep ? ep->ExceptionRecord->ExceptionCode : 0;
-        ULONG64 addr = ep ? (ULONG64)ep->ExceptionRecord->ExceptionAddress : 0;
+        ULONG64 addr = ep ? (ULONG64)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress : 0;
         DWORD flags  = ep ? ep->ExceptionRecord->ExceptionFlags : 0;
         DWORD tid    = GetCurrentThreadId();
         DWORD pid    = g_pid;
@@ -2764,7 +2773,7 @@ static int si_bp_find_free_veh(void)
 }
 
 /* 按 addr + tid 找记录，返回下标，找不到 -1。P2 测试用例会引用——保留。 */
-__attribute__((unused))
+SI_ATTR_UNUSED
 static int si_bp_lookup_hw_by_addr(DWORD tid, ULONG_PTR addr)
 {
     int i;
@@ -2778,7 +2787,7 @@ static int si_bp_lookup_hw_by_addr(DWORD tid, ULONG_PTR addr)
     return -1;
 }
 
-__attribute__((unused))
+SI_ATTR_UNUSED
 static int si_bp_lookup_veh_by_addr(ULONG_PTR addr)
 {
     int i;

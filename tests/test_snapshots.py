@@ -55,9 +55,13 @@ def test_snapshot_root_posix_layout(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    # 跨平台：Windows 上 Path.home() 等价于 Path(USERPROFILE)，str 出来是
+    # 反斜杠；这里把 actual 与 tmp_path 都规整成 posix 分隔再比对 —— 否则
+    # "C:\\... in C:/..." 这类跨平台子串断言必假失败。
     actual = str(snapshot_root(is_windows=False)).replace("\\", "/")
+    tmp = str(tmp_path).replace("\\", "/")
     assert actual.endswith("/.local/share/SuperInject/snapshots")
-    assert str(tmp_path) in actual
+    assert tmp in actual, f"HOME 没生效: tmp={tmp!r} actual={actual!r}"
 
 
 def test_snapshot_root_windows_layout(monkeypatch, tmp_path):
