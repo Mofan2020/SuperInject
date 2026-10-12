@@ -44,6 +44,11 @@ RECV_CHUNK = 1 << 16
 READ_TIMEOUT = 0.2          # socket 后端读超时（秒），保证 stop 能及时打断
 LAUNCHER_GRACE = 0.4        # stdin EOF 后给在途响应留的排空时间（秒）
 
+# CPython 在 Windows 上不暴露 socket.AF_UNIX（尽管 Windows 10+ 内核支持
+# AF_UNIX），所以 SocketPipeBackend 必须能在没有它的情况下工作 —— 否则
+# windows runner 上会直接 AttributeError。
+_HAS_AF_UNIX = hasattr(socket, "AF_UNIX")
+
 
 # --------------------------------------------------------------------------- 后端抽象
 
@@ -85,10 +90,19 @@ class PipeBackend:
 
 
 class SocketPipeBackend(PipeBackend):
-    """用 AF_UNIX stream socket 模拟命名管道（POSIX，供测试与本地开发）。
+    """用 socket 模拟命名管道（供测试与本地开发，跨平台）。
 
-    ``name`` 被哈希成一个确定性的 socket 路径（名字相同 → 路径相同），这样
-    server 与 client 用同一个 ``name`` 就能对上，而无需传递真实路径。
+    ``name`` 被哈希成一个确定性的地址（名字相同 → 地址相同），这样 server 与
+    client 用同一个 ``name`` 就能对上，而无需传递真实地址。
+
+    两种底层：
+
+    * POSIX 有 ``socket.AF_UNIX`` → 用 AF_UNIX stream socket，地址是文件路径；
+    * Windows 的 ``socket`` 模块**没有 AF_UNIX**（Windows 10+ 内核支持，
+      但 CPython 在 Windows 上不暴露该常量）→ 退回 ``127.0.0.1`` 上的 TCP
+      loopback，端口不固定，所以把端口写进一个按 ``name`` 推导的端口文件，
+      客户端读它拿端口。这样「同名可推导」的语义在两种底层下都成立，
+      同一套测试可以在任意平台跑。
     """
 
     def __init__(self, base_dir: Optional[os.PathLike | str] = None):
@@ -98,13 +112,20 @@ class SocketPipeBackend(PipeBackend):
         self._path: Optional[str] = None
         self._conns: set = set()
         self._lock = threading.Lock()
+        # 客户端用来解析地址；create_server 时补齐实际端口
+        self._tcp_port: Optional[int] = None
 
     # -------------------------------------------------- 路径映射
 
     def path_for(self, name: str) -> str:
+        """把管道名映射成一个确定性地址。
+
+        POSIX 下是 socket 文件路径；Windows（TCP 回退）下是**端口文件**路径。
+        """
         digest = hashlib.sha256(str(name).encode("utf-8")).hexdigest()[:16]
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        return str(self.base_dir / f".si-mcp-{digest}.sock")
+        suffix = ".sock" if _HAS_AF_UNIX else ".port"
+        return str(self.base_dir / f".si-mcp-{digest}{suffix}")
 
     # -------------------------------------------------- 服务端
 
@@ -114,8 +135,16 @@ class SocketPipeBackend(PipeBackend):
             os.unlink(path)
         except OSError:
             pass
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(path)
+        if _HAS_AF_UNIX:
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(path)
+        else:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            self._tcp_port = srv.getsockname()[1]
+            # 客户端要读这个文件才知道端口 —— 写完再 listen，避免竞态
+            Path(path).write_text(str(self._tcp_port), encoding="utf-8")
         srv.listen(16)
         srv.settimeout(READ_TIMEOUT)
         self._server = srv

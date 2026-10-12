@@ -46,26 +46,42 @@ def _fake_snap(name: str, count: int = 4, byte_total: int = 16384,
     }
 
 
-def test_snapshot_root_default_under_home_dot_local(monkeypatch, tmp_path):
-    """非 Windows 平台（macOS / Linux）走 ``~/.local/share/SuperInject/snapshots``。
+def test_snapshot_root_posix_layout(monkeypatch, tmp_path):
+    """非 Windows 布局：``~/.local/share/SuperInject/snapshots``。
 
-    跨平台：``Path.home()`` 在 macOS 上是 ``/Users/<me>``、在 Windows runner
-    上是 user home；测试桩 ``HOME`` 把它指到 ``tmp_path``，再校验子目录名。
+    用 ``is_windows=False`` 参数指定分支，**不要** patch ``os.name`` ——
+    那会让 pathlib 以为自己在 POSIX 上，于是在 Windows 上去实例化
+    ``PosixPath`` 并抛 ``NotImplementedError``（windows runner 曾因此全红）。
     """
-    import os as _os
-    monkeypatch.setattr(_os, "name", "posix")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
-    actual = str(snapshot_root()).replace("\\", "/")
+    actual = str(snapshot_root(is_windows=False)).replace("\\", "/")
     assert actual.endswith("/.local/share/SuperInject/snapshots")
-    # snapshot_root 不应创建目录，但不应抛错
-    # 显式验证 HOME 真的被读到
     assert str(tmp_path) in actual
 
 
+def test_snapshot_root_windows_layout(monkeypatch, tmp_path):
+    """Windows 布局：``%LOCALAPPDATA%\\SuperInject\\snapshots``。
+
+    这条在 macOS 上同样要能跑 —— 以前只测了 POSIX 分支，Windows 分支
+    从没被任何平台验证过。
+    """
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    actual = snapshot_root(is_windows=True)
+    assert actual == tmp_path / "SuperInject" / "snapshots"
+
+
+def test_snapshot_root_windows_falls_back_without_localappdata(monkeypatch, tmp_path):
+    """``LOCALAPPDATA`` 缺失时回退到 ``~/AppData/Local``。"""
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    actual = snapshot_root(is_windows=True)
+    assert actual.parts[-3:] == ("SuperInject", "snapshots") or \
+        actual.parts[-2:] == ("SuperInject", "snapshots")
+    assert "AppData" in actual.parts
+
+
 def test_snapshot_save_load_delete_roundtrip(monkeypatch, tmp_path):
-    import os as _os
-    monkeypatch.setattr(_os, "name", "posix")
     monkeypatch.setenv("HOME", str(tmp_path))
     store = SnapshotStore(root=tmp_path / "snaps")
     pid = 7777
@@ -90,8 +106,6 @@ def test_snapshot_save_load_delete_roundtrip(monkeypatch, tmp_path):
 
 
 def test_snapshot_list_orders_by_created_at_and_dedupes(monkeypatch, tmp_path):
-    import os as _os
-    monkeypatch.setattr(_os, "name", "posix")
     monkeypatch.setenv("HOME", str(tmp_path))
     store = SnapshotStore(root=tmp_path / "snaps")
     pid = 1234
@@ -110,8 +124,6 @@ def test_snapshot_list_orders_by_created_at_and_dedupes(monkeypatch, tmp_path):
 
 def test_snapshot_atomic_write_no_partial_files(monkeypatch, tmp_path):
     """落盘用临时文件 + os.replace：中途抛错不会留下半截正式文件。"""
-    import os as _os
-    monkeypatch.setattr(_os, "name", "posix")
     monkeypatch.setenv("HOME", str(tmp_path))
     store = SnapshotStore(root=tmp_path / "snaps")
     pid = 4321
@@ -141,8 +153,6 @@ def _patch_ctrl_env(monkeypatch, tmp_path):
     ``Controller._snapshot_store`` 优先看 ``SUPERINJECT_SNAPSHOT_ROOT``
     环境变量，没设置再用 ``snapshot_root()`` 推出的目录。
     """
-    import os as _os
-    monkeypatch.setattr(_os, "name", "posix")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SUPERINJECT_SNAPSHOT_ROOT", str(tmp_path / "snaps"))
 

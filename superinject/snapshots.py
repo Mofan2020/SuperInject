@@ -27,16 +27,23 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
-def snapshot_root() -> Path:
+def snapshot_root(is_windows: Optional[bool] = None) -> Path:
     """当前平台的快照根目录。
 
     Windows 时 ``LOCALAPPDATA`` 直接用；缺省时回退 ``~/AppData/Local``。
     非 Windows 一律 ``~/.local/share/SuperInject/snapshots``。
+
+    ``is_windows`` 只给测试用：让两条分支都能在**任意平台**上被验证。
+    不要改用 ``monkeypatch.setattr(os, "name", "posix")`` 之类的做法 —— 那会
+    骗过 pathlib，让它在 Windows 上去实例化 ``PosixPath`` 并直接抛
+    ``NotImplementedError``（本项目的 windows runner 就是这么红的）。
     """
-    if os.name == "nt":
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if is_windows:
         base = os.environ.get("LOCALAPPDATA", "").strip()
         if not base:
             base = str(Path.home() / "AppData" / "Local")
