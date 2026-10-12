@@ -532,29 +532,32 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
     )
     assert ping_mod, f"未在模块表里找到 ping 模块：{modules}"
 
-    # 2. bp 地址：IcmpSendEcho2 (iphlpapi) 入口 —— ping 持续发包，每次
-    # 都会调用 IcmpSendEcho2，bp 一定能命中。iphlpapi.dll 一定有导出表。
-    iphlp_mod = next(
-        (m for m in modules if m.get("name", "").lower() == "iphlpapi.dll"),
+    # 2. bp 地址：取 ntdll 里的 NtWaitForSingleObject —— ping 每次发包都
+    # 会进 kernel32!WaitForSingleObject → ntdll!NtWaitForSingleObject，频率
+    # 比 IcmpSendEcho 还高（每次等 echo 回复都一次），且 ntdll 是系统
+    # DLL 一定有导出表。VEH 改 IPHLPAPI 的代码段在 Win 11 上可能因
+    # CFG / image-section 限制失败，ntdll 上更稳。
+    ntdll_mod = next(
+        (m for m in modules if m.get("name", "").lower() == "ntdll.dll"),
         None,
     )
-    assert iphlp_mod, f"未找到 iphlpapi.dll 模块：{[m.get('name') for m in modules]}"
+    assert ntdll_mod, f"未找到 ntdll.dll 模块：{[m.get('name') for m in modules]}"
     exp = c.server.request(
-        pid, {"type": "exports", "base": int(iphlp_mod["base"]),
-              "budget": 256}, timeout=15,
+        pid, {"type": "exports", "base": int(ntdll_mod["base"]),
+              "budget": 64}, timeout=15,
     )
     assert exp.get("ok"), exp
     exports = exp.get("exports") or []
     target = next(
         (e for e in exports if str(e.get("name", "")) in
-         {"IcmpSendEcho", "IcmpSendEcho2", "IcmpSendEchoEx", "Icmp6SendEcho2"}),
+         {"NtWaitForSingleObject", "NtWaitForMultipleObjects",
+          "RtlAllocateHeap", "RtlFreeHeap"}),
         None,
     )
     if target is None:
         target = exports[0] if exports else None
-    assert target, "iphlpapi 没有任何导出"
-    addr = int(iphlp_mod["base"]) + int(target.get("rva", 0))
-    target_sym = target
+    assert target, "ntdll 没有任何导出"
+    addr = int(ntdll_mod["base"]) + int(target.get("rva", 0))
 
     # 4. 装载一条 exec 硬件断点
     # agent.c 字段名是 bp_type（"type" 是命令字 bp_set 自己）—— 同一 dict
