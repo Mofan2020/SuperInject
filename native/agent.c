@@ -2942,9 +2942,11 @@ static void si_bp_clear_hw(int slot, DWORD tid)
     case 3: ctx.Dr3 = 0; break;
     default: break;
     }
-    ctx.Dr7 &= ~SI_BP_DR7_ENABLE_BIT(slot);
-    ctx.Dr7 &= ~(0xFu << SI_BP_DR7_RW_SHIFT(slot));
-    ctx.Dr7 &= ~(0x3u << SI_BP_DR7_LEN_SHIFT(slot));
+    /* 同 si_bp_set_hw：ctx.Dr7 在 x64 是 DWORD64，~0xFu 这种 int literal
+     * 会触发 C4319 zero-extend → /WX → error。统一 DWORD64。 */
+    ctx.Dr7 &= ~(DWORD64)SI_BP_DR7_ENABLE_BIT(slot);
+    ctx.Dr7 &= ~((DWORD64)0xFu << SI_BP_DR7_RW_SHIFT(slot));
+    ctx.Dr7 &= ~((DWORD64)0x3u << SI_BP_DR7_LEN_SHIFT(slot));
 #else
     switch (slot) {
     case 0: ctx.Dr0 = 0; break;
