@@ -1626,16 +1626,17 @@ static long si_send_breakpoint_event(si_breakpoint_t *bp, ULONG_PTR fault_addr,
 static int si_veh_lookup_fault(ULONG_PTR fault_addr, ULONG_PTR *orig_addr)
 {
     int i;
-    ULONG_PTR want = fault_addr ? (fault_addr - 1) : 0;   /* INT3 单字节 */
+    /* Intel 文档：当 EXCEPTION_BREAKPOINT 触发时，ExceptionAddress
+     * 指向 INT3 字节本身（与 EXCEPTION_SINGLE_STEP 不同 —— 后者停在
+     * 下一条指令）。所以 want = fault_addr，不要 -1。v1.3.0 P2 写
+     * 成 fault_addr - 1 是因为抄了 EXCEPTION_SINGLE_STEP 的习惯，
+     * 结果：bp_set 后永远 fault 在 addr，patch 槽在 addr - 1，
+     * VEH 永远不命中 → hit_count 始终 0、集成测试 25s 不通过。 */
+    ULONG_PTR want = fault_addr;
     for (i = 0; i < SI_BP_MAX_VEH; i++) {
         if (!g_veh_patch[i].used) continue;
         if (g_veh_patch[i].addr == want) {
             *orig_addr = want;
-            return i;
-        }
-        /* 兼容调用方直接传 orig addr（命中点在一条 INT3 之后）。 */
-        if (g_veh_patch[i].addr == fault_addr) {
-            *orig_addr = fault_addr;
             return i;
         }
     }
