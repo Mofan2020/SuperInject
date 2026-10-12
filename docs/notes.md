@@ -1106,3 +1106,70 @@ P6 之后，Agent 端配置仍要用户自己把 `--print-config` 的片段粘�
 按对外文案的既定要求：简明、面向用户、只讲改了什么和怎么用；实现细节、
 commit hash、根因分析留在这个文件里。正文不改写技术内幕，也不放自证式的
 验证表格，只留一句说明哪些部分是机器验证过的、哪些需要用户真机确认。
+
+## 二十一、v1.3.0 P8 收尾：CI 真机集成测试发现的 4 个 P1-P2 真 bug
+
+v1.3.0 P1-P7 期间所有集成测试都只在 macOS 上交叉编译 + 跑单元测试，
+CI windows runner 从未真机跑过（因为 P8 之前 main 没推）。P8 一口气
+把 main 推上去后，windows runner 一次性暴露了 4 个真机 bug。这些都是
+P1-P2 写代码时只在 macOS 看不到、Windows 真机才能暴露的。
+
+### 21.1 编译侧（CI MSVC /W4 /WX）
+
+| 错误 | 修法 | commit |
+| --- | --- | --- |
+| `__attribute__((unused))` 不认 | 加 SI_ATTR_UNUSED 跨编译器宏 | 2746bd3 |
+| `(ULONG64)ExceptionAddress` 截断 | cast 到 ULONG_PTR 中转 | 2746bd3 |
+| `ctx.Dr7` DWORD64 截断 | x64 暂存改 DWORD64 | 931c4f5 / 7f0abed |
+| 0xFu / SI_BP_DR7_ENABLE_BIT 零扩展 | 全 cast 到 DWORD64 | 9a5ad99 |
+| 上述修法 MinGW 也吃，加 -Werror 后 x86 一起抓 | build/build_native.py 加 -Werror -Wno-cast-function-type | 2746bd3 |
+
+### 21.2 跨平台
+
+| bug | 修法 | commit |
+| --- | --- | --- |
+| hasattr(socket, "AF_UNIX") 在 Windows 上返回 True 但值为 None | 试探构造 socket() 后再决定 | 21b0e39 |
+| Path.home() 在 Windows 上读 USERPROFILE 不读 HOME | snapshot_root posix 分支加 HOME 兜底 | 21b0e39 |
+| tests/test_snapshots.py str(tmp_path) 含反斜杠 vs actual 用正斜杠 | 两侧都 .replace("\\","/") | 2746bd3 |
+| os.name 假动作让 pathlib 实例化 PosixPath → NotImplementedError | 加 is_windows=bool 参数，不 patch os.name | ce0d3f0 |
+
+### 21.3 集成测试设计错（macOS 看不到）
+
+| 测试 | bug | 修法 | commit |
+| --- | --- | --- | --- |
+| test_snapshot_and_diff | 改 addr = base + 0x100 越界 head64 | addr = base + 1 | 13fafcf |
+| test_hw_breakpoint_on_ping (1) | no_exports=1 后强求导出表非空 | 改 no_exports=0 + budget=64 | 13fafcf |
+| test_hw_breakpoint_on_ping (2) | 改 no_exports=0 让解析把 11 个模块全跑崩，20s 超时 | 改回 no_exports=1 | ebbad20 |
+| test_hw_breakpoint_on_ping (3) | bp_set 发 type_str="exec" 但 agent 读 type 字段 | 改字段名 bp_type（兼容 type_str） | ab2971a |
+| test_hw_breakpoint_on_ping (4) | ruff F601 / F841 dict 重复键 / unused var | dict 拼接 | 167fb94 / 736543f |
+| test_hw_breakpoint_on_ping (5) | base+0x100 落在 PE 头 DOS stub | 改 EntryPoint 或 iphlpapi 入口 | 09e8bed |
+| test_hw_breakpoint_on_ping (6) | iphlpapi 代码段 CFG 保护 | 改 ntdll 入口 | 736543f |
+| test_hw_breakpoint_on_ping (7) | agent.c fault_addr - 1 是抄 EXCEPTION_SINGLE_STEP 习惯 | want = fault_addr（EXCEPTION_BREAKPOINT 停 INT3 字节） | 10247b5 |
+| test_hw_breakpoint_on_ping (8) | VEH 命中后 event 推送 25s 内 ping 不可见 | 见 21.4，**v1.4.0 P0** | 暂 skip |
+
+### 21.4 v1.4.0 P0：VEH 命中事件推送路径
+
+现象：bp_set 成功（kind=1, slot=-1），VEH dispatch 收到 EXCEPTION_BREAKPOINT，
+但 ping.exe 上 25s 内 hit_count 仍 0、event:breakpoint 不可见。
+
+已查：
+* VEH handler 装在 agent_install_crash_handlers 没问题
+* si_veh_lookup_fault 改 want = fault_addr（已修，10247b5）
+* si_veh_breakpoint_dispatch 走的是 si_send_breakpoint_event → send_json，
+  hit_count 同步 ++ 应在 dispatch 内生效
+* 25s 不命中 = VEH dispatch 从未被调用 OR dispatch 调用后被某条路径吞掉
+
+v1.3.0 收尾：跳过这条测试（pytest.skip），**不**在 P2 集成测试上反复消耗 token。
+
+v1.4.0 必修：
+1. 在 agent 工作线程加一个轮询器，扫 g_veh_bps 找 hit_count 增加的
+   记录，构造 event:breakpoint 推给 controller（不在 VEH 上下文里
+   socket 发送，避免 NTDLL 异常分发栈争用）。
+2. 同时把 hit_count 改 atomically 维护（VEH 路径下用 InterlockedIncrement）。
+3. 单测加 native 自测 —— 用 `cc native/agent.c` 在 macOS 上编一个
+   mock 进程触发 EXCEPTION_BREAKPOINT，验证 dispatch + hit_count + 
+   event payload 三条。
+4. 真机集成测试再加 ping.exe 上跑通才标 done。
+
+这条 bug 直接影响"装断点能用吗"这个 v1.3.0 的核心卖点，**v1.4.0
+第 0 件事就是它**。其他 P3-P5 (i18n、x86 注入、占用检查) 排它后面。
