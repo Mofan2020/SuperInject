@@ -2807,12 +2807,13 @@ static int si_bp_set_hw(int slot, DWORD tid, ULONG_PTR addr, int type, int len)
     CONTEXT ctx;
 #if defined(_M_X64) || defined(__x86_64__)
     /* x64: ctx.Dr7/Dr6 是 DWORD64；用位宽自适的 DWORD64 暂存，避免
-     * -W4 /WX 视 C4244 截断警告为 error（CI 编译会因此红）。 */
+     * -W4 /WX 视 C4244 截断警告为 error（CI 编译会因此红）。
+     * x86 路径下 Dr7/Dr6 是 DWORD，且 dr6 是直接在 ctx 上 &= 清的，
+     * 没有局部变量，所以这里只在 x64 声明。 */
     DWORD64 dr7;
     DWORD64 dr6;
 #else
     DWORD   dr7;
-    DWORD   dr6;
 #endif
     BOOL    ok;
     /* OpenThread 也只用于我们自己的进程。PROCESS_VM_OPERATION 已够，
