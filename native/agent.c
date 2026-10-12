@@ -1685,6 +1685,11 @@ static void si_veh_unpatch(int idx)
 static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
 {
     ULONG_PTR fault = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+    static int s_logged = 0;
+    if (!s_logged) {
+        s_logged = 1;
+        log_msg("VEH dispatch first hit: fault=0x%p", (void*)fault);
+    }
     ULONG_PTR orig = 0;
     int idx = si_veh_lookup_fault(fault, &orig);
     if (idx < 0) return EXCEPTION_CONTINUE_SEARCH;          /* 不是我们的 BP */
@@ -1698,26 +1703,32 @@ static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
         }
     }
     if (!bp) return EXCEPTION_CONTINUE_SEARCH;
-    DWORD tid = GetCurrentThreadId();
-    CONTEXT *bp_ctx = ep->ContextRecord;
-    si_send_breakpoint_event(bp, fault, tid, bp_ctx);
+
+    /* 关键：VEH 上下文（NTDLL 异常分发栈）极小，调用 send_json 这种
+     * 可能走 socket 阻塞 + 动态分配的函数会立刻触发 STACK_OVERFLOW
+     * 或卡死线程。所以这里只更新 hit_count + 标记 pending event，
+     * 让 agent 工作线程的正常轮询把事件推给 controller。
+     *
+     * v1.3.0 P2 这里直接调 si_send_breakpoint_event —— 实测 ping.exe
+     * 上 25s 不命中。问题在 VEH 内做 socket 发送。 */
+    bp->hit_count++;
+    bp->type |= 0x80;     /* pending 标记：si_veh_single_step_dispatch
+                           * 清掉，但同时 si_drain_pending_events 也查；
+                           * 见 worker 线程的轮询逻辑。 */
+
     /* 单步跳过去 —— 把 0xCC 还原回原字节，并把 Eip 跳到 orig 地址；
-     * 用 TRAP_FLAG 会再触发 SINGLE_STEP，我们在 crt_main_dispatch 里再
-     * 装回去。 */
+     * 用 TRAP_FLAG 会再触发 SINGLE_STEP，我们在 si_veh_single_step_dispatch
+     * 里再装回去。 */
     si_veh_unpatch(idx);
     /* IP 回到 orig；flags 加 TF（x86/x64 都是 bit 8）。
      * x86 的 CONTEXT 只有 Eip、x64 只有 Rip —— 必须按位宽分别赋值，
      * 否则另一架构编译不过（CI 的 x86 job 用 /WX）。 */
 #if defined(_M_X64) || defined(__x86_64__)
-    bp_ctx->Rip    = (DWORD64)orig;
+    ep->ContextRecord->Rip    = (DWORD64)orig;
 #else
-    bp_ctx->Eip    = (DWORD)orig;
+    ep->ContextRecord->Eip    = (DWORD)orig;
 #endif
-    bp_ctx->EFlags |= 0x100;       /* TRAP_FLAG */
-    /* 标记本 idx 需要 SINGLE_STEP 命中后重装 0xCC：用一个全局槽记。 */
-    /* idx 复用 g_veh_bps 里的 NULL 槽 + 计数字段。下面直接用 g_veh_bps[i]
-     * 的 type 字段做"待重装"标记，简化 — — type |= 0x80 意味着 pending。 */
-    bp->type |= 0x80;
+    ep->ContextRecord->EFlags |= 0x100;       /* TRAP_FLAG */
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
