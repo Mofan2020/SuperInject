@@ -2863,17 +2863,20 @@ static int si_bp_set_hw(int slot, DWORD tid, ULONG_PTR addr, int type, int len)
     case 3: ctx.Dr3 = addr; break;
     default: break;
     }
+    /* 0xF / 0xF << 16 / SI_BP_DR7_ENABLE_BIT(slot) 都是 int，赋给 DWORD64
+     * 时 MSVC 报 C4319 'zero extending' 警告 + /WX → error。统一显式
+     * cast 到 DWORD64 让两边位宽匹配；x86 分支沿用 DWORD 不动。 */
     dr7 = ctx.Dr7;
-    dr7 &= ~(0xFu << (16 + 4 * slot));      /* 清 RW/LEN 字段 */
-    dr7 |= ((DWORD)si_dr7_rw_for(type) << SI_BP_DR7_RW_SHIFT(slot));
-    dr7 |= ((DWORD)si_dr7_len_for(type, len) << SI_BP_DR7_LEN_SHIFT(slot));
-    dr7 |= SI_BP_DR7_ENABLE_BIT(slot);      /* 本地启用 L 位 */
+    dr7 &= ~((DWORD64)0xFu << (16 + 4 * slot));      /* 清 RW/LEN 字段 */
+    dr7 |= ((DWORD64)si_dr7_rw_for(type) << SI_BP_DR7_RW_SHIFT(slot));
+    dr7 |= ((DWORD64)si_dr7_len_for(type, len) << SI_BP_DR7_LEN_SHIFT(slot));
+    dr7 |= (DWORD64)SI_BP_DR7_ENABLE_BIT(slot);       /* 本地启用 L 位 */
     /* 顺手清 G 位（避免和别的调试器冲突） */
-    dr7 &= ~((DWORD)1u << (2 * slot + 1));
+    dr7 &= ~((DWORD64)1u << (2 * slot + 1));
     ctx.Dr7 = dr7;
     /* Dr6 用于读"哪条断点命中"，先清空（DR6 是只读 DR6.B0..3） */
     dr6 = ctx.Dr6;
-    dr6 &= ~(0xFu);
+    dr6 &= ~(DWORD64)0xFu;
     ctx.Dr6 = dr6;
 #else
     switch (slot) {
