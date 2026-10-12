@@ -3551,7 +3551,13 @@ static void agent_handle(const char *text)
          */
         long long    addr_ll = si_json_get_int(msg, "address", 0);
         DWORD        tid     = (DWORD)si_json_get_int(msg, "tid", 0);
-        const char  *type_s  = si_json_get_str(msg, "type", "exec");
+        /* 别名为 "bp_type"：外层消息的 "type" 字段是命令字（"bp_set"），
+         * 读 "type" 会拿到 "bp_set" 然后 si_bp_type_to_code("bp_set") = -1
+         * 报 "invalid type"。这是 v1.3.0 P2 留下的协议设计 bug：
+         * bp_set 内部 "type" 字段与外层命令字段同名，self-collision。
+         * 修法：把内部字段改 "bp_type"，旧协议里 "type" 兼容读取。 */
+        const char  *type_s  = si_json_get_str(msg, "bp_type",
+                              si_json_get_str(msg, "type", "exec"));
         int          len     = (int)si_json_get_int(msg, "len", 1);
         int          code    = si_bp_type_to_code(type_s);
         ULONG_PTR    addr    = (ULONG_PTR)addr_ll;

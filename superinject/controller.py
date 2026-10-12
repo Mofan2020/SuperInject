@@ -802,7 +802,11 @@ class Controller:
             "type": "bp_set",
             "address": int(address),
             "tid": int(tid),
-            "type_str": bp_type_s,
+            # 字段名是 bp_type（不是 type_str 也不是 type）—— "type" 是
+            # 外层命令字 "bp_set" 自己；agent.c v1.4.0 起改读 "bp_type"，
+            # 旧 "type_str" 仍兼容（pitfall #24：协议演进保持向后）。
+            "bp_type": bp_type_s,
+            "type_str": bp_type_s,  # 兼容 v1.3.0
             "len": int(size) if size else 1,
         }
         resp = self.server.request(int(pid), msg, timeout=10)

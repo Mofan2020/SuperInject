@@ -536,12 +536,12 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
     addr = int(ping_mod["base"]) + 0x100
 
     # 4. 装载一条 exec 硬件断点
-    # agent.c 字段名是 type（不是 type_str）—— 同一 dict 里不要重名
-    # （ruff F601）。这里用 dict 拼接避免键冲突。
+    # agent.c 字段名是 bp_type（"type" 是命令字 bp_set 自己）—— 同一 dict
+    # 里不要重名（ruff F601）。这里用 dict 拼接避免键冲突。
     bp_msg = {
         "address": addr,
         "tid": 0,                # pid 用 VEH 模拟，比硬件 DR 更稳（ping 多线程）
-        "type": "exec",
+        "bp_type": "exec",
         "len": 1,
     }
     bp_msg["type"] = "bp_set"  # 覆盖 —— 别名法，避开 ruff 重复键
