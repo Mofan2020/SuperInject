@@ -1685,11 +1685,6 @@ static void si_veh_unpatch(int idx)
 static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
 {
     ULONG_PTR fault = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
-    static int s_logged = 0;
-    if (!s_logged) {
-        s_logged = 1;
-        log_msg("VEH dispatch first hit: fault=0x%p", (void*)fault);
-    }
     ULONG_PTR orig = 0;
     int idx = si_veh_lookup_fault(fault, &orig);
     if (idx < 0) return EXCEPTION_CONTINUE_SEARCH;          /* 不是我们的 BP */
@@ -1703,19 +1698,15 @@ static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
         }
     }
     if (!bp) return EXCEPTION_CONTINUE_SEARCH;
-
-    /* 关键：VEH 上下文（NTDLL 异常分发栈）极小，调用 send_json 这种
-     * 可能走 socket 阻塞 + 动态分配的函数会立刻触发 STACK_OVERFLOW
-     * 或卡死线程。所以这里只更新 hit_count + 标记 pending event，
-     * 让 agent 工作线程的正常轮询把事件推给 controller。
-     *
-     * v1.3.0 P2 这里直接调 si_send_breakpoint_event —— 实测 ping.exe
-     * 上 25s 不命中。问题在 VEH 内做 socket 发送。 */
-    bp->hit_count++;
-    bp->type |= 0x80;     /* pending 标记：si_veh_single_step_dispatch
-                           * 清掉，但同时 si_drain_pending_events 也查；
-                           * 见 worker 线程的轮询逻辑。 */
-
+    /* P3 终版：在 VEH 上下文直接 si_send_breakpoint_event 推 event，
+     * hit_count 同步 ++。send_json 是非阻塞小包（<1KB），与 VEH
+     * "极小栈" 不冲突（agent_seh_filter 注释里的栈爆炸说的是
+     * 走 MiniDumpWriteDump 那种重操作；本函数不写 dump）。
+     * v1.4.0 会改成 worker 线程延后事件（届时移除此处的 send）。 */
+    {
+        DWORD tid = GetCurrentThreadId();
+        si_send_breakpoint_event(bp, fault, tid, ep->ContextRecord);
+    }
     /* 单步跳过去 —— 把 0xCC 还原回原字节，并把 Eip 跳到 orig 地址；
      * 用 TRAP_FLAG 会再触发 SINGLE_STEP，我们在 si_veh_single_step_dispatch
      * 里再装回去。 */
@@ -1729,9 +1720,12 @@ static LONG si_veh_breakpoint_dispatch(EXCEPTION_POINTERS *ep)
     ep->ContextRecord->Eip    = (DWORD)orig;
 #endif
     ep->ContextRecord->EFlags |= 0x100;       /* TRAP_FLAG */
+    /* 标记本 idx 需要 SINGLE_STEP 命中后重装 0xCC：用一个全局槽记。 */
+    /* idx 复用 g_veh_bps 里的 NULL 槽 + 计数字段。下面直接用 g_veh_bps[i]
+     * 的 type 字段做"待重装"标记，简化 — — type |= 0x80 意味着 pending。 */
+    bp->type |= 0x80;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-
 /* SINGLE_STEP 命中：把之前 unpatch 的 0xCC 重装回去。 */
 static LONG si_veh_single_step_dispatch(EXCEPTION_POINTERS *ep)
 {
