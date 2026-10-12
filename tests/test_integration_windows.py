@@ -534,14 +534,13 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
 
     # 2. 拿到 module 即可：bp 地址 = base + 0x100（落在主代码上）
     addr = int(ping_mod["base"]) + 0x100
-    target_sym = {"name": "<entry+0x100>", "rva": 0x100}
 
     # 4. 装载一条 exec 硬件断点
     set_resp = c.server.request(pid, {
         "type": "bp_set",
         "address": addr,
         "tid": 0,                # pid 用 VEH 模拟，比硬件 DR 更稳（ping 多线程）
-        "type_str": "exec",
+        "type": "exec",          # agent.c 字段名是 type 不是 type_str
         "len": 1,
     }, timeout=15)
     assert set_resp.get("ok"), f"bp_set 失败：{set_resp}"
