@@ -532,8 +532,29 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
     )
     assert ping_mod, f"未在模块表里找到 ping 模块：{modules}"
 
-    # 2. 拿到 module 即可：bp 地址 = base + 0x100（落在主代码上）
-    addr = int(ping_mod["base"]) + 0x100
+    # 2. bp 地址：IcmpSendEcho2 (iphlpapi) 入口 —— ping 持续发包，每次
+    # 都会调用 IcmpSendEcho2，bp 一定能命中。iphlpapi.dll 一定有导出表。
+    iphlp_mod = next(
+        (m for m in modules if m.get("name", "").lower() == "iphlpapi.dll"),
+        None,
+    )
+    assert iphlp_mod, f"未找到 iphlpapi.dll 模块：{[m.get('name') for m in modules]}"
+    exp = c.server.request(
+        pid, {"type": "exports", "base": int(iphlp_mod["base"]),
+              "budget": 256}, timeout=15,
+    )
+    assert exp.get("ok"), exp
+    exports = exp.get("exports") or []
+    target = next(
+        (e for e in exports if str(e.get("name", "")) in
+         {"IcmpSendEcho", "IcmpSendEcho2", "IcmpSendEchoEx", "Icmp6SendEcho2"}),
+        None,
+    )
+    if target is None:
+        target = exports[0] if exports else None
+    assert target, "iphlpapi 没有任何导出"
+    addr = int(iphlp_mod["base"]) + int(target.get("rva", 0))
+    target_sym = target
 
     # 4. 装载一条 exec 硬件断点
     # agent.c 字段名是 bp_type（"type" 是命令字 bp_set 自己）—— 同一 dict
