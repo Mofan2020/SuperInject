@@ -44,10 +44,21 @@ RECV_CHUNK = 1 << 16
 READ_TIMEOUT = 0.2          # socket 后端读超时（秒），保证 stop 能及时打断
 LAUNCHER_GRACE = 0.4        # stdin EOF 后给在途响应留的排空时间（秒）
 
-# CPython 在 Windows 上不暴露 socket.AF_UNIX（尽管 Windows 10+ 内核支持
-# AF_UNIX），所以 SocketPipeBackend 必须能在没有它的情况下工作 —— 否则
-# windows runner 上会直接 AttributeError。
-_HAS_AF_UNIX = hasattr(socket, "AF_UNIX")
+# CPython 在 Windows 上对 socket.AF_UNIX 的处理：3.9 起 hasattr 返回 True 但
+# 取出来是 None（或 0），socket.socket(AF_UNIX, ...) 直接 AttributeError 或
+# TypeError。所以**不能**只信 hasattr —— 必须真把值取出来非 None 才能用。
+# 这条踩过两次：第一次用 hasattr 让 windows runner 全红；第二次把值取出后
+# 还是不行，因为某些 Windows + Python 版本里 getattr 返回的是 Enum 单例
+# 但 socket() 构造抛 ValueError。所以这里加一道 try/except 兜底，让
+# SocketPipeBackend 在 Windows 上**一定**走 TCP 回退路径。
+try:
+    _AF_UNIX = getattr(socket, "AF_UNIX", None)
+    if _AF_UNIX is not None:
+        # 试探构造一次 —— 这是 truthy 检验，唯一可靠
+        socket.socket(_AF_UNIX, socket.SOCK_STREAM).close()
+    _HAS_AF_UNIX = _AF_UNIX is not None
+except (AttributeError, OSError, ValueError):
+    _HAS_AF_UNIX = False
 
 
 # --------------------------------------------------------------------------- 后端抽象
@@ -214,13 +225,36 @@ class SocketPipeBackend(PipeBackend):
 
     def connect(self, name: str) -> socket.socket:
         path = self.path_for(name)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        try:
-            sock.connect(path)
-        except OSError as exc:
-            sock.close()
-            raise ConnectionError(f"无法连接命名管道 {path}: {exc}") from exc
+        if _HAS_AF_UNIX:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            try:
+                sock.connect(path)
+            except OSError as exc:
+                sock.close()
+                raise ConnectionError(f"无法连接命名管道 {path}: {exc}") from exc
+        else:
+            # TCP 路径：从 .port 文件读端口（由 create_server 写入）。
+            # 重试是给「server 刚 listen、文件可能还在 OS 写缓冲里」留的窗口，
+            # 实际几乎不会触发；2 次 50ms 总开销可忽略。
+            port = None
+            for _ in range(2):
+                try:
+                    port = int(Path(path).read_text(encoding="utf-8").strip())
+                    break
+                except (FileNotFoundError, ValueError):
+                    time.sleep(0.05)
+            if port is None:
+                raise ConnectionError(
+                    f"无法连接命名管道 {name}：端口文件 {path} 不可读"
+                )
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            try:
+                sock.connect(("127.0.0.1", port))
+            except OSError as exc:
+                sock.close()
+                raise ConnectionError(f"无法连接命名管道 {name} (127.0.0.1:{port}): {exc}") from exc
         sock.settimeout(None)
         return sock
 

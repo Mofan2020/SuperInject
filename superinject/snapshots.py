@@ -34,7 +34,10 @@ def snapshot_root(is_windows: Optional[bool] = None) -> Path:
     """当前平台的快照根目录。
 
     Windows 时 ``LOCALAPPDATA`` 直接用；缺省时回退 ``~/AppData/Local``。
-    非 Windows 一律 ``~/.local/share/SuperInject/snapshots``。
+    非 Windows 一律 ``$HOME/.local/share/SuperInject/snapshots``（``HOME`` 缺
+    省时回退 :func:`pathlib.Path.home`，Windows 上**也**认 ``HOME`` 兜底
+    —— 这条对测试是必须的：``Path.home()`` 在 Windows 上读 ``USERPROFILE``，
+    不认 ``HOME``，没有这条兜底 ``is_windows=False`` 的跨平台测试就站不住）。
 
     ``is_windows`` 只给测试用：让两条分支都能在**任意平台**上被验证。
     不要改用 ``monkeypatch.setattr(os, "name", "posix")`` 之类的做法 —— 那会
@@ -48,7 +51,8 @@ def snapshot_root(is_windows: Optional[bool] = None) -> Path:
         if not base:
             base = str(Path.home() / "AppData" / "Local")
         return Path(base) / "SuperInject" / "snapshots"
-    return Path.home() / ".local" / "share" / "SuperInject" / "snapshots"
+    home = os.environ.get("HOME") or str(Path.home())
+    return Path(home) / ".local" / "share" / "SuperInject" / "snapshots"
 
 
 @dataclass
