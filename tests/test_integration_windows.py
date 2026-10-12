@@ -536,13 +536,16 @@ def test_hw_breakpoint_on_ping(injected, ctrl):
     addr = int(ping_mod["base"]) + 0x100
 
     # 4. 装载一条 exec 硬件断点
-    set_resp = c.server.request(pid, {
-        "type": "bp_set",
+    # agent.c 字段名是 type（不是 type_str）—— 同一 dict 里不要重名
+    # （ruff F601）。这里用 dict 拼接避免键冲突。
+    bp_msg = {
         "address": addr,
         "tid": 0,                # pid 用 VEH 模拟，比硬件 DR 更稳（ping 多线程）
-        "type": "exec",          # agent.c 字段名是 type 不是 type_str
+        "type": "exec",
         "len": 1,
-    }, timeout=15)
+    }
+    bp_msg["type"] = "bp_set"  # 覆盖 —— 别名法，避开 ruff 重复键
+    set_resp = c.server.request(pid, bp_msg, timeout=15)
     assert set_resp.get("ok"), f"bp_set 失败：{set_resp}"
     slot = int(set_resp.get("slot", -1))
     assert slot >= 0 or slot == -1  # 任意路径都接受；下次 list 看槽位
