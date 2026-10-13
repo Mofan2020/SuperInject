@@ -55,6 +55,77 @@ def test_resolve_keeps_every_pid_of_same_name(stub_winapi, monkeypatch):
     assert c.resolve_targets([], ["chrome.exe"]) == [10, 11]
 
 
+def test_list_processes_filters_by_name_substr(stub_winapi):
+    """list_processes(name_substr=...) 只返回名字含子串的进程。"""
+    c = Controller()
+    out = c.list_processes(name_substr="chrome")
+    assert [i["pid"] for i in out] == [200]
+
+
+def test_list_processes_filters_by_path_substr(stub_winapi):
+    """list_processes(path_substr=...) 是按**进程映像路径**找进程的核心入口。
+
+    stub 给出 path = "C:\\<pid>.exe"，所以 "C:\\200.exe" 命中 PID 200，
+    "notepad" 不命中（stub path 里没有这些字串 —— path 过滤只看路径，
+    不看名字）。
+    """
+    c = Controller()
+    out = c.list_processes(path_substr=r"C:\200.exe")
+    assert [i["pid"] for i in out] == [200]
+    out2 = c.list_processes(path_substr="notepad")
+    assert out2 == []                # path 过滤只看路径，不看名字
+
+
+def test_list_processes_filters_by_arch(stub_winapi, monkeypatch):
+    """list_processes(arch="x64"/"x86") 按位数过滤。"""
+    monkeypatch.setattr(ctl_mod.winapi, "is_wow64",
+                        lambda pid: pid == 100)     # 100 是 x86, 200/300 是 x64
+    c = Controller()
+    out_x86 = c.list_processes(arch="x86")
+    out_x64 = c.list_processes(arch="x64")
+    assert [i["pid"] for i in out_x86] == [100]
+    assert sorted(i["pid"] for i in out_x64) == [200, 300]
+    # 透出 arch 字段
+    for i in out_x86:
+        assert i["arch"] == "x86"
+
+
+def test_find_in_dir_returns_only_processes_under_parent(stub_winapi):
+    """find_in_dir 按父目录子串找进程：避免 path 子串误匹配。
+
+    stub 的 path 是 "C:\\<pid>.exe"，父目录全是 "C:\\"。
+    子串 "C:\\" 应当命中所有 3 个 PID；
+    子串 "D:\\" 一个都不命中。
+    """
+    c = Controller()
+    out = c.find_in_dir("C:" + chr(92))   # 末尾反斜杠（"C:\\" 写法 raw string
+                                            # 不允许末尾带 \\）
+    assert {i["pid"] for i in out} == {100, 200, 300}
+    out_none = c.find_in_dir("D:" + chr(92))
+    assert out_none == []
+
+
+def test_resolve_targets_accepts_paths(stub_winapi):
+    """resolve_targets(paths=...) 接路径子串列表。
+
+    stub path 形如 "C:\\<pid>.exe"（Windows 真实路径）。这里用
+    进程名做子串更稳：stub path 包含数字 pid，所以 "C:\\200.exe"
+    中的 "200" 真在 path 里（不会误中 100 / 300，因为它们含 100
+    / 300 不含 "200"）。用反斜杠字面要小心 Python 字符串转义：
+    raw string r"C:\\200.exe" 才能正确表达 1 个反斜杠。
+    """
+    c = Controller()
+    out = c.resolve_targets([], [], paths=[r"C:\200.exe"])
+    p200 = ctl_mod.winapi.process_path(200)
+    p300 = ctl_mod.winapi.process_path(300)
+    q = r"C:\200.exe"
+    debug = "out=%r q=%r p200=%r p300=%r" % (out, q, p200, p300)
+    assert out == [200], debug
+    # 不应误中 100 / 300
+    out2 = c.resolve_targets([], [], paths=[r"C:\300.exe"])
+    assert out2 == [300]
+
+
 # ------------------------------------------------------------------ 注入检查
 
 def test_preflight_blocks_critical_process(stub_winapi, monkeypatch):

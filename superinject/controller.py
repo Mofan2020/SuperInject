@@ -223,14 +223,26 @@ class Controller:
 
     # ---------------------------------------------------------- 进程
 
-    def list_processes(self) -> List[dict]:
-        """列出全部进程（含 pid / 名称 / 路径 / 内存 / 注入状态）。"""
+    def list_processes(self, name_substr: str = "", path_substr: str = "",
+                        arch: str = "", only_injected: bool = False) -> List[dict]:
+        """列出全部进程（含 pid / 名称 / 路径 / 内存 / 注入状态）。
+
+        过滤条件（全部可空，空=不过滤）：
+          name_substr   — 进程名子串（不区分大小写）
+          path_substr   — 进程完整路径子串（不区分大小写）—— 按映像路径查找
+          arch          — 进程位数（"x64" / "x86" / ""）
+          only_injected  — 只返回已注入的进程
+        """
         items: List[dict] = []
         try:
             raw = winapi.enum_processes()
         except Exception as exc:  # pragma: no cover
             log.exception("枚举进程失败")
             return [{"error": str(exc)}]
+
+        name_q = name_substr.strip().lower()
+        path_q = path_substr.strip().lower()
+        arch_q = arch.strip().lower() if arch else ""
 
         for pid, name in raw:
             try:
@@ -241,33 +253,86 @@ class Controller:
                 mem = winapi.process_memory_mb(pid)
             except Exception:
                 mem = 0.0
-            items.append({
+            if name_q and name_q not in str(name).lower():
+                continue
+            if path_q and path_q not in str(path).lower():
+                continue
+            item = {
                 "pid": pid,
                 "name": name,
                 "path": path,
                 "mem_mb": mem,
                 "injected": self.server.is_attached(pid),
                 "frozen": pid in self._frozen,
-            })
+            }
+            if arch_q:
+                try:
+                    wow = winapi.is_wow64(pid)
+                except Exception:
+                    wow = False
+                item_arch = "x86" if wow else "x64"
+                item["arch"] = item_arch
+                if arch_q != item_arch:
+                    continue
+            if only_injected and not item["injected"]:
+                continue
+            items.append(item)
         items.sort(key=lambda x: x["name"].lower())
         return items
 
-    def resolve_targets(self, pids: Iterable[int], names: Iterable[str] = ()
-                        ) -> List[int]:
-        """把 PID 列表和进程名列表解析成一组实际存在的 PID。
+    def find_in_dir(self, parent_substr: str) -> List[dict]:
+        """按进程映像所在**目录**找进程：父目录路径含 ``parent_substr``。
 
-        同名进程（多标签浏览器等）全部保留，并尽量保持用户给出的顺序。
+        跟 ``list_processes(path_substr=)`` 的区别：后者匹配路径任意子串，
+        本函数严格要求 path 上一级目录名包含目标子串，避免
+        "C:/Windows/System32/foo.exe" 误匹配 path 子串 "32/foo" 这种。
+        """
+        q = parent_substr.strip().lower()
+        if not q:
+            return []
+        from pathlib import PureWindowsPath
+        out: List[dict] = []
+        for it in self.list_processes():
+            p = it.get("path", "")
+            if not p:
+                continue
+            parent = str(PureWindowsPath(p).parent).lower().replace("\\", "/")
+            if q.replace("\\", "/") in parent:
+                out.append(it)
+        return out
+
+    def resolve_targets(self, pids: Iterable[int], names: Iterable[str] = (),
+                        paths: Iterable[str] = ()
+                        ) -> List[int]:
+        """把 PID 列表、进程名列表、路径子串列表解析成一组实际存在的 PID。
+
+        同名/同路径的进程（多标签浏览器等）全部保留，并尽量保持用户给
+        出的顺序。``paths`` 是路径子串匹配，跟 GUI 进程表过滤一致。
         """
         out: List[int] = []
         want_names = [n.strip().lower() for n in names if str(n).strip()]
-        if want_names:
+        want_paths = [p.strip().lower() for p in paths if str(p).strip()]
+        if want_names or want_paths:
             lookup: Dict[str, List[int]] = {}
+            path_lookup: Dict[str, List[int]] = {}
             for pid, name in winapi.enum_processes():
                 lookup.setdefault(name.lower(), []).append(pid)
+                try:
+                    p = winapi.process_path(pid)
+                except Exception:
+                    p = ""
+                if p:
+                    path_lookup.setdefault(p.lower(), []).append(pid)
             for n in want_names:
                 for pid in lookup.get(n, []):
                     if pid not in out:
                         out.append(pid)
+            for path_q in want_paths:
+                for p_l, hit_pids in path_lookup.items():
+                    if path_q in p_l:
+                        for pid in hit_pids:
+                            if pid not in out:
+                                out.append(pid)
         for p in pids:
             try:
                 pid = int(p)

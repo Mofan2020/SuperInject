@@ -121,8 +121,20 @@ class Api:
             "status": self.controller.status(),
         }
 
-    def list_processes(self) -> list:
-        return self.controller.list_processes()
+    def list_processes(self, name: str = "", path: str = "", arch: str = "",
+                        only_injected: bool = False) -> list:
+        """进程列表。name / path 是子串过滤（不区分大小写）；arch 是
+        "x64" / "x86" / 空；only_injected 只返回已注入的。"""
+        return self.controller.list_processes(
+            name_substr=str(name or ""),
+            path_substr=str(path or ""),
+            arch=str(arch or ""),
+            only_injected=bool(only_injected),
+        )
+
+    def find_in_dir(self, parent: str) -> list:
+        """按进程映像所在目录子串查进程。"""
+        return self.controller.find_in_dir(str(parent or ""))
 
     # -------------------------------------------------- 注入
 
@@ -130,8 +142,10 @@ class Api:
         """注入检查：返回每个 PID 是否可注入及其原因。"""
         return self.controller.preflight([int(p) for p in pids])
 
-    def inject(self, pids: list, dll_path: str = "") -> list:
-        return self.controller.inject([int(p) for p in pids], dll_path or None)
+    def inject(self, pids: list, dll_path: str = "", arch: str = "") -> list:
+        """注入入口：arch 可选 "" / "x64" / "x86"，空串走 controller 默认（按目标自动选）。"""
+        return self.controller.inject(
+            [int(p) for p in pids], dll_path or None, arch=str(arch or ""))
 
     # -------------------------------------------------- 控制
 

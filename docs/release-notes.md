@@ -1,3 +1,37 @@
+
+v1.3.1 hotfix
+============
+
+按 image 路径查进程
+--------------------
+
+* CLI / GUI / MCP 三层都加上了按进程映像路径过滤。CLI 用
+  ``SuperInject list --path "C:\\Windows\\System32"``；GUI 进程表
+  面板加了一个 "按映像路径搜索" 输入框（与原有的按名搜索并列）；
+  MCP 工具 ``list_processes`` 也新增 ``path`` / ``arch`` 参数。
+* 新增按父目录查找：``controller.find_in_dir(parent)``，匹配
+  ``C:\\Windows\\System32`` 这种父目录时不会误中含同样子串的
+  文件名。
+* 进程列表也可以按位数过滤：x64 / x86。
+
+x86 架构进程注入（GUI 入口补齐）
+--------------------------------
+
+v1.3.0 已经在 DLL 层编了 x86 版本，并且 ``test_x86_injection_on_syswow64_ping``
+在 Windows runner 上跑通了。这次把 GUI 入口补齐：进程面板加了
+"位数" 下拉，注入按钮按用户选的目标位数走；CLI / MCP 之前的
+``--arch`` / ``arch`` 参数已经接好。
+
+修复
+----
+
+* 控制器里 ``resolve_targets`` 在 macOS 上的单元测试一直 fail，
+  最后定位是内层循环 ``for p_l, pids in path_lookup.items()`` 跟
+  函数参数 ``pids`` 同名，导致外层 ``for p in pids`` 看到的是
+  shadow 之后的值（最后一项的 pid 列表）。修法是重命名为
+  ``hit_pids``。详细在 docs/notes.md 第二十二章。
+
+
 ## 本版新增
 
 - 内存快照 / diff：给进程内存拍快照，之后对比两份找出哪些内存页变了，改动一两个字节也能定位。

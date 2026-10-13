@@ -50,7 +50,16 @@
   <section class="panel" id="panel-procs">
     <div class="panel-head">
       <h2>进程</h2>
-      <input id="search" type="search" placeholder="按名称 / PID 搜索…" autocomplete="off" />
+      <input id="search" type="search" placeholder="按名称 / PID 搜索…"
+             title="按进程名或 PID 过滤（前端本地）" autocomplete="off" />
+      <input id="path-search" type="search" placeholder="按映像路径搜索…"
+             title="按进程完整路径子串过滤，例如 C:\Windows\System32 或 Google"
+             autocomplete="off" style="width:240px" />
+      <select id="arch-select" title="按进程位数过滤（前端不过滤，刷新时透传给 controller）">
+        <option value="">全部位数</option>
+        <option value="x64">仅 x64</option>
+        <option value="x86">仅 x86</option>
+      </select>
       <label class="chk"><input type="checkbox" id="sel-all" /> 全选</label>
       <label class="chk"><input type="checkbox" id="only-injected" /> 仅已注入</label>
       <span class="grow"></span>

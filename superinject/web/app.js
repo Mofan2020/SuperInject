@@ -3,7 +3,9 @@
   "use strict";
 
   const $ = (s) => document.querySelector(s);
-  const state = { procs: [], sel: new Set(), filter: "", onlyInjected: false };
+  // filter 现在是 {name, path} 两段独立过滤；不互相覆盖（与 controller API 对齐）
+  const state = { procs: [], sel: new Set(), filter: { name: "", path: "" },
+                  arch: "", onlyInjected: false };
 
   function api() {
     return window.pywebview && window.pywebview.api;
@@ -43,11 +45,14 @@
   function render() {
     const tb = $("#proc-table tbody");
     tb.innerHTML = "";
-    const q = state.filter.toLowerCase();
+    const q_name = (state.filter.name || "").toLowerCase();
+    const q_path = (state.filter.path || "").toLowerCase();
     const rows = state.procs.filter((p) => {
       if (state.onlyInjected && !p.injected) return false;
-      if (!q) return true;
-      return String(p.name).toLowerCase().includes(q) || String(p.pid) === q;
+      if (q_name && !String(p.name).toLowerCase().includes(q_name)
+          && String(p.pid) !== q_name) return false;
+      if (q_path && !String(p.path || "").toLowerCase().includes(q_path)) return false;
+      return true;
     });
     rows.forEach((p) => {
       const tr = document.createElement("tr");
@@ -89,7 +94,11 @@
 
   async function refresh() {
     log("正在获取进程列表…");
-    const list = await call("list_processes");
+    // 把 name / path / arch / only_injected 透传给 controller，源头过滤。
+    // 留一份客户端 state.procs 缓存（用于搜索框微调 / 选中状态保留），
+    // 但默认应当让 server 决定可见集合，否则 PID 跨进程枚举会失真。
+    const list = await call("list_processes",
+      state.filter.name, state.filter.path, state.arch, state.onlyInjected);
     if (!Array.isArray(list)) return;
     state.procs = list.filter((p) => p.pid);
     const alive = new Set(state.procs.map((p) => p.pid));
@@ -324,7 +333,9 @@
     if (!ok) return;
 
     log(`开始注入 ${okPids.join(", ")}…`);
-    const res = await call("inject", okPids);
+    // arch 取 GUI 上用户选的那一档：""=按目标自动；"x64" / "x86"=强制
+    const arch = (state.arch || $("#arch-select") && $("#arch-select").value) || "";
+    const res = await call("inject", okPids, arch);
     let okCount = 0;
     (res || []).forEach((r) => {
       if (r.ok) {
@@ -349,12 +360,20 @@
   // ---------------------------------------------------------- 其它交互
   $("#btn-refresh").addEventListener("click", refresh);
   $("#search").addEventListener("input", (e) => {
-    state.filter = e.target.value.trim();
+    state.filter.name = e.target.value.trim();
     render();
+  });
+  $("#path-search").addEventListener("input", (e) => {
+    state.filter.path = e.target.value.trim();
+    render();
+  });
+  $("#arch-select").addEventListener("change", (e) => {
+    state.arch = e.target.value;
+    refresh();           // arch 走 controller 源头过滤，需重新拉
   });
   $("#only-injected").addEventListener("change", (e) => {
     state.onlyInjected = e.target.checked;
-    render();
+    refresh();
   });
   $("#sel-all").addEventListener("change", (e) => {
     if (e.target.checked) state.procs.forEach((p) => state.sel.add(p.pid));

@@ -1173,3 +1173,66 @@ v1.4.0 必修：
 
 这条 bug 直接影响"装断点能用吗"这个 v1.3.0 的核心卖点，**v1.4.0
 第 0 件事就是它**。其他 P3-P5 (i18n、x86 注入、占用检查) 排它后面。
+
+## 二十二、v1.3.1 hotfix：按 image 路径查进程 + x86 注入 GUI 入口
+
+### 22.1 修了一个 30 分钟没看穿的 controller bug
+
+写 `resolve_targets(pids, names=(), paths=())` 时，内层循环用了
+`for p_l, pids in path_lookup.items():` —— **pids 跟函数参数同名，
+shadowing**。结果：
+
+```python
+def resolve_targets(self, pids=...):
+    ...
+    for p_l, pids in path_lookup.items():   # <-- pids 被 shadow
+        ...
+    for p in pids:                          # <-- 这里的 pids 是
+        ...                                  #     path_lookup 的最后一项
+```
+
+`path_lookup = {'c:\\100.exe': [100], ..., 'c:\\300.exe': [300]}`，
+内层 for 跑 3 次 `pids` 被赋成 `[100]`、`[200]`、`[300]`。最外层
+`for p in pids:` 实际看的是 shadow 后的 `pids` = `[300]`，**只跑 1 次 p=300**，
+于是 `out.append(300)` 被错误加进结果。
+
+测试 `c.resolve_targets([],[], paths=[r"C:\\200.exe"])` 期望返回 [200]，
+实际返回 [200, 300]，但函数内 NOENV DBG print 的 `out=[200]`（因为 shadow
+之后 `for p in pids` 才把它改了，DBG 在 if 块末尾、不在 for 后）。**id 不变
+都是 4408465088 但内容从 [200] 变 [200, 300]** —— 让我一度怀疑 Python 语义。
+
+修法：内层循环用 `for p_l, hit_pids in path_lookup.items():`，消除 shadow。
+
+教训：**`Iterable[int] = ()` 默认值用 `()`，但函数参数同名 shadowing
+是真实风险**。代码评审时遇到内层 for 用同名变量一定要 rename。
+
+### 22.2 v1.3.1 hotfix 的实际改动
+
+按用户原话"x86 注入 + 按 image 路径查进程"在 v1.3.0 收尾时漏做，
+这一版补齐：
+
+* `controller.list_processes(name_substr, path_substr, arch, only_injected)`
+  —— 源头过滤，源头走 winapi 拿到 path 后才过滤，避免 cli/mcp 二次
+  拉全量。`path_substr` 就是用户要的"按 image 路径查"。
+* `controller.find_in_dir(parent_substr)` —— 按父目录子串查，
+  不会误匹配 "C:/Windows/System32/foo.exe" 里 "32/foo" 这种。
+* `controller.resolve_targets(pids, names, paths)` —— 加 `paths=` 形参。
+* `cli.py list` 把 `--path` / `--name` 透传给 controller（之前本地二次
+  filter）。
+* `mcp_router.py list_processes` tool schema 加 `arch` / `only_injected`，
+  description 里写明 "path 是按 image 路径查进程的主入口"。
+* `gui.py` 加 `find_in_dir`、给 `inject` 接 `arch=` 参数。
+* GUI 前端加 #path-search 输入框 + #arch-select 下拉；inject 按钮用
+  state.arch。
+* tests/test_controller.py 加 5 个新用例。
+
+### 22.3 没做也没承认的
+
+* **x86 注入 GUI 入口** —— 已加（arch-select 下拉 + inject 按钮传 arch），
+  但真机集成的"点下拉选 x86 然后点注入"流程**仍是 CI 没真测过**，
+  因为 PyWebView 的真 GUI 必须人手动点。`test_x86_injection_on_syswow64_ping`
+  在 v1.3.0 已经过，这次没动 —— 那条测的是 CLI `--arch x86` 路径。
+* **没动 v1.3.0 P2 硬件断点 VEH 事件推送**（notes 第二十一章 P0）——
+  留给 v1.4.0。
+* **没动 i18n / 资源 source 区分 / 占用检查 / glob 模式匹配** —— 用户
+  没说，v1.4.0 P1-P3 排队。

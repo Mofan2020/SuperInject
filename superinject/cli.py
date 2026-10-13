@@ -395,6 +395,13 @@ def _normalize_pids(args) -> List[int]:
 
 
 def _filter_processes(items, args) -> list:
+    """CLI 层过 list_processes 输出：name / path / pid / only_injected。
+
+    说明：v1.3.0 之后 controller.list_processes 自己已经接 name_substr /
+    path_substr / arch / only_injected，所以本函数只在 controller 不可
+    用时（比如 GUI 拉过本地缓存）才起作用；正常 CLI 路径应当把
+    args 透传给 controller 让它直接在源头过滤，流量更小。
+    """
     name = (getattr(args, "name", "") or "").strip().lower()
     path = (getattr(args, "path", "") or "").strip().lower()
     pids = set(getattr(args, "pid", []) or [])
@@ -895,8 +902,18 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
     if sub in ("list", "preflight"):
         ctrl = _ensure_controller()
         if sub == "list":
-            items = ctrl.list_processes()
-            items = _filter_processes(items, args)
+            # 把过滤透传给 controller，源头过滤更省流量；
+            # controller 不可用时再退回本地 _filter_processes。
+            try:
+                items = ctrl.list_processes(
+                    name_substr=str(getattr(args, "name", "") or ""),
+                    path_substr=str(getattr(args, "path", "") or ""),
+                    only_injected=bool(getattr(args, "injected_only", False)),
+                )
+            except TypeError:
+                # 兼容老 controller（v1.3.0 之前）—— 退回全量 + 本地过滤
+                items = ctrl.list_processes()
+                items = _filter_processes(items, args)
             return items
         pids = _normalize_pids(args)
         if not pids:

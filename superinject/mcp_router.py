@@ -97,20 +97,31 @@ def _default_proc_name(pid: int) -> str:
 
 
 def _h_list_processes(ctrl: "Controller", args: Dict[str, Any]) -> Any:
-    items = ctrl.list_processes()
-    name = str(args.get("name") or "").strip().lower()
-    path = str(args.get("path") or "").strip().lower()
-    wanted = set(_arg_pids(args))
-    out = []
-    for it in items:
-        if name and name not in str(it.get("name", "")).lower():
-            continue
-        if path and path not in str(it.get("path", "")).lower():
-            continue
-        if wanted and int(it.get("pid", 0)) not in wanted:
-            continue
-        out.append(it)
-    return out
+    """按 path/name/pid 过滤进程列表。透传给 controller，源头过滤
+    （不再在 MCP 层做二次过滤 —— 之前是 controller API 太薄）。"""
+    name = str(args.get("name") or "").strip()
+    path = str(args.get("path") or "").strip()
+    try:
+        return ctrl.list_processes(
+            name_substr=name,
+            path_substr=path,
+            arch=str(args.get("arch") or ""),
+            only_injected=bool(args.get("only_injected", False)),
+        )
+    except TypeError:
+        # 兼容老 controller（v1.3.0 之前 API 无 path_substr/arch）
+        items = ctrl.list_processes()
+        wanted = set(_arg_pids(args))
+        out = []
+        for it in items:
+            if name and name.lower() not in str(it.get("name", "")).lower():
+                continue
+            if path and path.lower() not in str(it.get("path", "")).lower():
+                continue
+            if wanted and int(it.get("pid", 0)) not in wanted:
+                continue
+            out.append(it)
+        return out
 
 
 def _h_preflight(ctrl: "Controller", args: Dict[str, Any]) -> Any:
@@ -316,10 +327,18 @@ _TOOLS: Tuple[ToolSpec, ...] = (
     ToolSpec(
         "list_processes",
         "List processes on the host, optionally filtered by name substring, "
-        "path substring, or pid. Read-only; no side effects. Does not require "
-        "the injector (target DLL) to be loaded.",
+        "path substring (case-insensitive — the **primary way to find a "
+        "process by its image path**, e.g. by an .exe location or a parent "
+        "directory), architecture (x64 / x86), or pid. Read-only; no side "
+        "effects. Does not require the injector (target DLL) to be loaded.",
         _schema({"name": {"type": "string"},
-                 "path": {"type": "string"},
+                 "path": {"type": "string",
+                           "description": "Case-insensitive substring of the "
+                                          "process image path, e.g. "
+                                          "'Program Files\\\\Google' or "
+                                          "'C:\\\\Windows\\\\System32'."},
+                 "arch": {"type": "string", "enum": ["x64", "x86"]},
+                 "only_injected": {"type": "boolean"},
                  "pid": _PID, "pids": _PIDS}),
         "read", _h_list_processes,
     ),
