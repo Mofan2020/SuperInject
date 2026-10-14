@@ -1262,13 +1262,20 @@
 
   function showUpdate(info) {
     $("#up-ver").textContent = info.version;
-    $("#up-notes").textContent = (info.notes || "").slice(0, 800) || "无更新说明";
+    const notes = (info.notes || "").slice(0, 800) || "无更新说明";
+    const box = $("#up-notes");
+    box.textContent = notes;
+    box.scrollTop = 0;
+    $("#up-install").disabled = false;
+    $("#up-progress").classList.add("hidden");
+    $("#up-progress").textContent = "";
     $("#update-modal").classList.remove("hidden");
     $("#up-install").onclick = async () => {
       $("#up-install").disabled = true;
       await call("apply_update", info.asset);
     };
     $("#up-later").onclick = () => $("#update-modal").classList.add("hidden");
+    $("#up-close").onclick = () => $("#update-modal").classList.add("hidden");
   }
 
   const PRIV_LABELS = { system: "SYSTEM ✓", admin: "管理员 ✓", user: "未提权 ✗" };
