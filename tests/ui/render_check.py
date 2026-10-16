@@ -33,7 +33,7 @@ VIEWPORTS = [(1280, 800, "default", "light"), (1024, 640, "min", "light"),
              (760, 520, "tiny", "light"), (1280, 800, "dark", "dark")]
 PANELS = ["panel-procs", "panel-inject", "panel-control",
           "panel-res", "panel-mem", "panel-snap", "panel-bp",
-          "panel-mcp", "panel-log"]
+          "panel-handles", "panel-mcp", "panel-log"]
 
 FAILURES: list[str] = []
 

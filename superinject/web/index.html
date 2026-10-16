@@ -41,6 +41,7 @@
     <button class="nav-seg" data-target="panel-mem">内存</button>
     <button class="nav-seg" data-target="panel-snap">快照</button>
     <button class="nav-seg" data-target="panel-bp">断点</button>
+    <button class="nav-seg" data-target="panel-handles">设备</button>
     <button class="nav-seg" data-target="panel-mcp">MCP</button>
     <button class="nav-seg" data-target="panel-log">日志</button>
   </nav>
@@ -253,6 +254,21 @@
       </div>
       <div id="bp-events" class="log bp-events-list"></div>
     </details>
+  </section>
+
+  <!-- v1.3.3 P0：lsof 类设备/句柄检查 -->
+  <section class="panel" id="panel-handles">
+    <div class="panel-head">
+      <h2>设备访问</h2>
+      <span class="hint">枚举目标进程打开的句柄，按类型分组（文件 / 管道 / 设备 / 网络 / 注册表 / 同步 / 进程 / 内存 / GUI）</span>
+      <span class="grow"></span>
+      <span class="muted" id="hd-pid-label">PID -</span>
+      <button id="btn-hd-refresh" class="primary" disabled>刷新</button>
+    </div>
+    <div class="hd-body">
+      <div class="hd-summary" id="hd-summary">先在进程表里选中一个进程，再点刷新</div>
+      <div class="hd-cats" id="hd-cats"></div>
+    </div>
   </section>
 
   <!-- v1.3.0 P5/P6：MCP 授权面板（授权 + 无 UAC 命名管道服务 + 复制 Agent 配置） -->

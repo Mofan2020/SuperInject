@@ -202,6 +202,11 @@ class Api:
     def delete_snapshot(self, pid: int, name: str) -> bool:
         return self.controller.delete_snapshot(int(pid), name)
 
+    # -------------------------------------------------- 设备/句柄（lsof 类，v1.3.3）
+
+    def list_handles(self, pid: int) -> dict:
+        return self.controller.list_handles(int(pid))
+
     # -------------------------------------------------- 硬件断点（v1.3.0 P2）
 
     def bp_set(self, pid: int, target: str, tid: int = 0,

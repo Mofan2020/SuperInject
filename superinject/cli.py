@@ -267,6 +267,11 @@ def _build_subparser() -> argparse.ArgumentParser:
     sp.add_argument("--pid", type=int, required=True)
     sp = sub.add_parser("ping", help="连通性自检")
     add_pid_positional(sp)
+    sp = sub.add_parser("handles", help="枚举目标进程打开的句柄（lsof 视角）")
+    add_pid_positional(sp)
+    sp.add_argument("--category", help="只显示该分类（文件/管道/设备/网络/注册表/同步/进程/内存/GUI/Other）")
+    sp.add_argument("--name-contains", help="按对象名子串过滤（大小写不敏感）")
+    sp.add_argument("--limit", type=int, default=0, help="最多输出条数；0=不限")
     sp = sub.add_parser("unload", help="卸载注入的 DLL")
     add_pid_positional(sp)
     sp = sub.add_parser("terminate", help="终止进程（让 DLL 内 ExitProcess）")
@@ -949,6 +954,26 @@ def _dispatch(sub: str, args: argparse.Namespace, pre) -> Any:
     if sub == "ping":
         return {"ok": True, "kind": "ping",
                 "results": _ensure_controller().ping(_normalize_pids(args))}
+    if sub == "handles":
+        pids = _normalize_pids(args)
+        if not pids:
+            return {"ok": False, "kind": "handles",
+                    "error": "handles 命令需要 1 个 pid"}
+        r = _ensure_controller().list_handles(pids[0])
+        if r.get("ok"):
+            items = r["items"]
+            cat = getattr(args, "category", None)
+            name_sub = getattr(args, "name_contains", None)
+            if cat:
+                items = [i for i in items if i["category"] == cat]
+            if name_sub:
+                ns = name_sub.lower()
+                items = [i for i in items if ns in (i["name"] or "").lower()]
+            lim = int(getattr(args, "limit", 0) or 0)
+            if lim and len(items) > lim:
+                items = items[:lim]
+            r = {**r, "items": items, "count": len(items)}
+        return {"ok": r.get("ok", False), "kind": "handles", "result": r}
     if sub == "info":
         pids = _normalize_pids(args)
         return {"ok": True, "kind": "info",
