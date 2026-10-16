@@ -29,6 +29,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <winternl.h>
 #include <wchar.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1196,6 +1197,132 @@ static int scan_mapped_media(si_json *arr, int *scanned, int *truncated)
         base += region;
     }
     return count;
+}
+
+/*
+ * list_handles —— 枚举本进程打开的句柄（lsof 视角）。
+ *
+ * 协议：输入 {}；输出 {"items": [...], "count": N}。
+ *
+ * 实现：NtQuerySystemInformation(SystemHandleInformation=16) 拿到系统全局
+ * 句柄表，按 UniqueProcessId == GetCurrentProcessId() 过滤，逐个用
+ * NtQueryObject(ObjectNameInformation) 拿名字 + ObjectTypeInformation
+ * 拿类型字符串。
+ *
+ * 边界：系统句柄表可能 50k+ 条；本函数硬限 65536 条防止单次响应失控。
+ * SeDebugPrivilege 通常由 SuperInject 提权时开好，DuplicateHandle 不会失败
+ * （这里直接用目标句柄 HANDLE 调 NtQueryObject，不需要 Duplicate）。
+ */
+static int handle_is_special(HANDLE h)
+{
+    ULONG_PTR v = (ULONG_PTR)h;
+    if (v <= 2) return 1;  /* 0/1/2 伪句柄 */
+    if (v == (ULONG_PTR)(LONG_PTR)-1) return 1;
+    if ((v & 0xFFFF8000) == 0xFFFF8000) return 1;  /* 内核句柄 */
+    return 0;
+}
+
+static void wide_to_utf8_buf(const UNICODE_STRING *u, char *out, size_t out_size)
+{
+    if (!u || !u->Buffer || u->Length == 0 || out_size == 0) {
+        if (out_size) out[0] = 0;
+        return;
+    }
+    int wlen = (int)(u->Length / sizeof(WCHAR));
+    int maxw = (int)out_size - 1;
+    if (wlen > maxw) wlen = maxw;
+    int n = WideCharToMultiByte(CP_UTF8, 0, u->Buffer, wlen,
+                                out, (int)out_size - 1, NULL, NULL);
+    if (n < 0) n = 0;
+    out[n] = 0;
+}
+
+static void list_handles(si_json *out)
+{
+    NTSTATUS (NTAPI *pNtQuerySystemInformation)(
+        ULONG, PVOID, ULONG, PULONG) = (NTSTATUS (NTAPI *)(ULONG, PVOID, ULONG, PULONG))
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+    NTSTATUS (NTAPI *pNtQueryObject)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG) = (NTSTATUS (NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG))
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryObject");
+    if (!pNtQuerySystemInformation || !pNtQueryObject) {
+        si_json_set_int(out, "count", 0);
+        return;
+    }
+
+    ULONG self_pid = (ULONG)(ULONG_PTR)GetCurrentProcessId();
+
+    /* 第一段：拿 size */
+    ULONG needed = 0;
+    (void)pNtQuerySystemInformation(16, NULL, 0, &needed);
+    if (needed == 0) needed = 0x10000;
+    ULONG buf_size = needed + 0x1000;
+    unsigned char *buf = (unsigned char *)malloc(buf_size);
+    if (!buf) { si_json_set_int(out, "count", 0); return; }
+    NTSTATUS st = pNtQuerySystemInformation(16, buf, buf_size, &needed);
+    if (!NT_SUCCESS(st)) { free(buf); si_json_set_int(out, "count", 0); return; }
+
+    /* SYSTEM_HANDLE_INFORMATION: ULONG HandleCount + SYSTEM_HANDLE_TABLE_ENTRY_INFO[] */
+    typedef struct _SYSHANDLE {
+        USHORT UniqueProcessId;
+        USHORT CreatorBackTraceIndex;
+        USHORT ObjectTypeIndex;
+        USHORT HandleAttributes;
+        USHORT HandleValue;
+        ULONG  Object;
+        ULONG  GrantedAccess;
+    } SYSHANDLE;
+    ULONG count = *(ULONG *)buf;
+    if (count > 65536) count = 65536;
+    SYSHANDLE *entries = (SYSHANDLE *)(buf + sizeof(ULONG));
+
+    si_json *items = si_json_new_array();
+    char  name_buf[512], type_buf[64];
+    int   out_count = 0;
+
+    for (ULONG i = 0; i < count; i++) {
+        if (entries[i].UniqueProcessId != self_pid) continue;
+        HANDLE h = (HANDLE)(ULONG_PTR)entries[i].HandleValue;
+        if (handle_is_special(h)) continue;
+
+        /* 类型名 */
+        const char *type_name = "";
+        ULONG tneed = 0;
+        (void)pNtQueryObject(h, 2, NULL, 0, &tneed);
+        PVOID tbuf = tneed ? malloc(tneed + 16) : NULL;
+        if (tbuf) {
+            if (NT_SUCCESS(pNtQueryObject(h, 2, tbuf, tneed + 16, &tneed))) {
+                wide_to_utf8_buf((UNICODE_STRING *)tbuf, type_buf, sizeof(type_buf));
+                type_name = type_buf;
+            }
+            free(tbuf);
+        }
+
+        /* 对象名 */
+        const char *obj_name = "";
+        ULONG nneed = 0;
+        (void)pNtQueryObject(h, 1, NULL, 0, &nneed);
+        PVOID nbuf = nneed ? malloc(nneed + 16) : NULL;
+        if (nbuf) {
+            if (NT_SUCCESS(pNtQueryObject(h, 1, nbuf, nneed + 16, &nneed))) {
+                wide_to_utf8_buf((UNICODE_STRING *)nbuf, name_buf, sizeof(name_buf));
+                obj_name = name_buf;
+            }
+            free(nbuf);
+        }
+
+        si_json *o = si_json_new();
+        si_json_set_int(o, "handle", (long long)(ULONG_PTR)h);
+        si_json_set_str(o, "type",   type_name);
+        si_json_set_str(o, "name",   obj_name);
+        si_json_set_int(o, "access", (long long)entries[i].GrantedAccess);
+        si_json_set_arr(items, NULL, o);
+        out_count++;
+    }
+
+    si_json_set_arr(out, "items", items);
+    si_json_set_int(out, "count", (long long)out_count);
+    free(buf);
 }
 
 static int dump_resources(si_json *out)
@@ -3540,6 +3667,10 @@ static void agent_handle(const char *text)
 
     } else if (strcmp(type, "resources") == 0) {
         dump_resources(out);
+        si_json_set_bool(out, "ok", 1);
+
+    } else if (strcmp(type, "handles") == 0) {
+        list_handles(out);
         si_json_set_bool(out, "ok", 1);
 
     } else if (strcmp(type, "bp_set") == 0) {

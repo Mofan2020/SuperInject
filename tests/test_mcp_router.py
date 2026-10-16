@@ -45,13 +45,17 @@ def ctrl():
 
 
 def test_tool_count_and_tier_split_matches_plan():
-    """分档数量与 v1.3.0 计划一致 —— 改动工具清单时这条会提醒同步文档。"""
+    """分档数量与 v1.3.3 计划一致 —— 改动工具清单时这条会提醒同步文档。
+
+    v1.3.0 → 31 工具（16 read / 14 write / 1 dangerous）
+    v1.3.3 加 list_handles → 32 工具（17 read / 14 write / 1 dangerous）
+    """
     from collections import Counter
     tiers = Counter(s.capability for s in mcp_router._TOOLS)
-    assert tiers["read"] == 16
+    assert tiers["read"] == 17
     assert tiers["write"] == 14
     assert tiers["dangerous"] == 1
-    assert sum(tiers.values()) == 31
+    assert sum(tiers.values()) == 32
 
 
 def test_list_tools_read_only_session_hides_write_and_dangerous():
@@ -69,7 +73,8 @@ def test_list_tools_full_session_exposes_everything():
     names = {t["name"] for t in mcp_router.list_tools(session)}
     assert "terminate" in names
     assert "mem_write" in names
-    assert len(names) == 31
+    assert "list_handles" in names
+    assert len(names) == 32
 
 
 def test_list_tools_none_session_is_empty():

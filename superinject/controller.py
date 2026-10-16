@@ -807,6 +807,121 @@ class Controller:
             "unchanged_count": int(resp.get("unchanged_count", 0)),
         }
 
+    # -------------------------------------------------- 设备/句柄（lsof 类）
+
+    # Win32 对象类型名 → 大类（界面上的「分组」标签）。覆盖 90% 常见对象；
+    # 私有类型 / 不在表里的 → "Other"。基于 Process Hacker / Sysinternals
+    # 多年沿用的对象类型枚举。
+    _HANDLE_TYPE_CATEGORY = {
+        "File":         "文件",
+        "Pipe":         "管道",
+        "NamedPipe":    "管道",
+        "FilePort":     "管道",
+        "Device":       "设备",
+        "Key":          "注册表",
+        "Mutant":       "同步",
+        "Mutex":        "同步",
+        "Semaphore":    "同步",
+        "Event":        "同步",
+        "Timer":        "同步",
+        "IoCompletion": "同步",
+        "WaitablePort": "同步",
+        "Thread":       "进程/线程",
+        "Process":      "进程/线程",
+        "Token":        "进程/线程",
+        "Job":          "进程/线程",
+        "Section":      "内存",
+        "MemoryMappedFile": "内存",
+        "WindowStation": "GUI",
+        "Desktop":      "GUI",
+        "Window":       "GUI",
+        "Menu":         "GUI",
+        "Cursor":       "GUI",
+        "Brush":        "GUI",
+        "Icon":         "GUI",
+        "Palette":      "GUI",
+        "Font":         "GUI",
+        "Bitmap":       "GUI",
+        "Region":       "GUI",
+    }
+    _HANDLE_CATEGORY_ORDER = (
+        "文件", "管道", "设备", "网络", "注册表", "同步", "进程/线程", "内存", "GUI", "Other",
+    )
+
+    @staticmethod
+    def _categorize_handle(type_name: str, name: str) -> str:
+        r"""把 Win32 句柄类型归到大类。\Device\* 类的名字归「设备」；
+        \\.\pipe\* / *NamedPipe* 归「管道」；AFD / Tcp / Udp 归「网络」；
+        \REGISTRY\* 归「注册表」。"""
+        if not type_name and not name:
+            return "Other"
+        cat = Controller._HANDLE_TYPE_CATEGORY.get(type_name)
+        if cat:
+            return cat
+        # 仅剥 \?\?\ 这种 Windows 设备路径前缀，单个 \ 不能剥 —— 不然
+        # \Device\NamedPipe\foo 会被剥成 Device\NamedPipe\foo，丢失分类锚点。
+        nm = name or ""
+        if nm.startswith("\\\\?\\"):
+            nm = nm[4:]
+        up = nm.upper()
+        if up.startswith("\\DEVICE\\NAMEDPIPE\\") or up.startswith("DEVICE\\NAMEDPIPE\\"):
+            return "管道"
+        if up.startswith("\\DEVICE\\") or up.startswith("DEVICE\\"):
+            return "设备"
+        if up.startswith("\\PIPE\\") or up.startswith("\\\\.\\PIPE\\"):
+            return "管道"
+        if up.startswith("\\REGISTRY\\") or up.startswith("REGISTRY\\"):
+            return "注册表"
+        if up.startswith("AFD"):
+            return "网络"
+        if up.startswith("\\"):
+            return "文件"  # 兜底：所有以 \ 开头的未知名字路径都先归到文件
+        return "Other"
+
+    def list_handles(self, pid: int) -> dict:
+        """枚举目标进程打开的句柄（lsof 视角）。
+
+        返回::
+
+            {
+                "ok": True,
+                "pid": <int>,
+                "count": <int>,
+                "by_category": {"文件": [...], "管道": [...], ...},
+                "items":     [...]   # 原始列表（含 handle/type/name/access）
+            }
+
+        ``items`` 里每条形如 ``{"handle": 0x1234, "type": "File",
+        "name": "C:\\\\Windows\\\\…", "access": 0x12019F}``。
+        """
+        resp = self.server.request(pid, {"type": "handles"}, timeout=15)
+        if not resp.get("ok"):
+            return {"ok": False, "error": resp.get("error", "handles 失败"),
+                    "pid": int(pid), "count": 0, "items": [],
+                    "by_category": {}}
+        items = resp.get("items") or []
+        out_items: List[dict] = []
+        by_cat: Dict[str, list] = {c: [] for c in self._HANDLE_CATEGORY_ORDER}
+        for it in items:
+            try:
+                handle = int(it.get("handle", 0))
+                tname  = str(it.get("type", "") or "")
+                name   = str(it.get("name", "") or "")
+                access = int(it.get("access", 0))
+            except (TypeError, ValueError):
+                continue
+            cat = self._categorize_handle(tname, name)
+            entry = {"handle": handle, "type": tname, "name": name,
+                     "access": access, "category": cat}
+            out_items.append(entry)
+            by_cat[cat].append(entry)
+        # 清掉空分类，保持 by_category 简洁
+        by_cat = {k: v for k, v in by_cat.items() if v}
+        return {
+            "ok": True, "pid": int(pid), "count": len(out_items),
+            "by_category": by_cat, "items": out_items,
+        }
+
     def _snapshot_store(self):  # noqa: F821 — SnapshotStore 由懒加载导入
         """懒加载 SnapshotStore（避免 controller import 时强依赖新模块）。
 

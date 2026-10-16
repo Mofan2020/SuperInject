@@ -205,6 +205,18 @@ def _h_ping(ctrl: "Controller", args: Dict[str, Any]) -> Any:
     return ctrl.ping(_arg_pids(args))
 
 
+def _h_list_handles(ctrl: "Controller", args: Dict[str, Any]) -> Any:
+    """枚举目标进程打开的句柄（lsof 视角）。
+
+    返回结构见 ``Controller.list_handles``：``items``（扁平列表）+ ``by_category``
+    （按 Win32 对象类型分到中文大类：文件/管道/设备/网络/注册表/同步/进程/内存/GUI）。
+    """
+    pids = _arg_pids(args)
+    if not pids:
+        return {"ok": False, "error": "list_handles 需要 pid"}
+    return ctrl.list_handles(pids[0])
+
+
 def _h_snapshot(ctrl: "Controller", args: Dict[str, Any]) -> Any:
     regions = []
     for region in args.get("regions") or []:
@@ -454,6 +466,17 @@ _TOOLS: Tuple[ToolSpec, ...] = (
         "round-trip success per pid. Read-only. REQUIRES the injector online.",
         _schema({"pid": _PID, "pids": _PIDS}, ("pids",)),
         "read", _h_ping, ("pid", "pids"),
+    ),
+    ToolSpec(
+        "list_handles",
+        "Enumerate the open handles of a target process (lsof-style view: "
+        "files, pipes, devices, network sockets, registry keys, sync objects, "
+        "process/thread handles, memory sections, GUI objects). Each entry "
+        "carries the handle value, Win32 object type, full name (when the "
+        "object has one), and access mask. Returns {items, by_category, count}. "
+        "Read-only. REQUIRES the injector online.",
+        _schema({"pid": _PID}, ("pid",)),
+        "read", _h_list_handles, ("pid",),
     ),
     ToolSpec(
         "snapshot",

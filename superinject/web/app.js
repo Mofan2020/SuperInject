@@ -34,6 +34,15 @@
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   }
 
+  // 长路径在表格里截中间留省略号，比简单末尾截断更能保留两侧的可识别信息
+  function truncMid(s, max) {
+    s = String(s);
+    if (s.length <= max) return s;
+    const head = Math.ceil((max - 1) / 2);
+    const tail = Math.floor((max - 1) / 2);
+    return s.slice(0, head) + "…" + s.slice(s.length - tail);
+  }
+
   function humanSize(n) {
     n = Number(n) || 0;
     if (n < 1024) return n + " B";
@@ -581,7 +590,78 @@
   updateCounts = function () {
     origUpdateCounts();
     state.snapPid = selected()[0] || null;
+    state.handlePid = selected()[0] || null;
+    const hdBtn = $("#btn-hd-refresh");
+    if (hdBtn) hdBtn.disabled = !state.handlePid;
+    const hdLabel = $("#hd-pid-label");
+    if (hdLabel) hdLabel.textContent = "PID " + (state.handlePid || "-");
   };
+
+  // ---------------------------------------------------------- 设备/句柄（lsof 类，v1.3.3）
+  state.handlePid = null;
+  state.handleData = null;  // {items, by_category, count}
+
+  function renderHandles() {
+    const cats = $("#hd-cats");
+    if (!cats) return;
+    cats.innerHTML = "";
+    if (!state.handleData) {
+      $("#hd-summary").textContent = "先在进程表里选中一个进程，再点刷新";
+      return;
+    }
+    const { items, by_category, count } = state.handleData;
+    if (!count) {
+      $("#hd-summary").textContent = `pid=${state.handlePid}：没有枚举到句柄（可能未注入或 SeDebugPrivilege 受限）`;
+      return;
+    }
+    $("#hd-summary").textContent = `pid=${state.handlePid}：共 ${count} 个句柄，按类型分组如下`;
+    const order = ["文件", "管道", "设备", "网络", "注册表", "同步",
+                   "进程/线程", "内存", "GUI", "Other"];
+    for (const cat of order) {
+      const list = by_category[cat];
+      if (!list || !list.length) continue;
+      const det = document.createElement("details");
+      det.open = cat === "文件" || cat === "管道" || cat === "网络";
+      const sum = document.createElement("summary");
+      sum.textContent = `${cat} (${list.length})`;
+      det.appendChild(sum);
+      const tbl = document.createElement("table");
+      tbl.className = "hd-tbl";
+      tbl.innerHTML = "<thead><tr><th>句柄</th><th>类型</th><th>对象</th><th>访问</th></tr></thead>";
+      const tb = document.createElement("tbody");
+      for (const it of list) {
+        const tr = document.createElement("tr");
+        const h = "0x" + Number(it.handle).toString(16).toUpperCase();
+        tr.innerHTML = `<td class="mono">${h}</td>` +
+                       `<td class="mono">${escapeHtml(it.type || "-")}</td>` +
+                       `<td class="mono" title="${escapeHtml(it.name || "")}">${escapeHtml(truncMid(it.name || "(无名字)", 120))}</td>` +
+                       `<td class="mono">0x${Number(it.access || 0).toString(16).toUpperCase()}</td>`;
+        tb.appendChild(tr);
+      }
+      tbl.appendChild(tb);
+      det.appendChild(tbl);
+      cats.appendChild(det);
+    }
+  }
+
+  $("#btn-hd-refresh").addEventListener("click", async () => {
+    if (!state.handlePid) return log("先在进程表里选一个进程", "warn");
+    const btn = $("#btn-hd-refresh");
+    btn.disabled = true;
+    log(`枚举 pid=${state.handlePid} 的句柄…`);
+    const r = await call("list_handles", state.handlePid);
+    btn.disabled = false;
+    if (!r || !r.ok) {
+      log("句柄枚举失败: " + (r && r.error || "未知"), "err");
+      return;
+    }
+    state.handleData = { items: r.items, by_category: r.by_category, count: r.count };
+    log(`句柄枚举完成: ${r.count} 个`, "ok");
+    renderHandles();
+  });
+
+  // 句柄面板的 CSS 跟其他面板共用 .panel-head / .muted 之类，
+  // 这里只补两个 .hd-body / .hd-tbl 用的样式。
 
   // ---------------------------------------------------------- 硬件断点（v1.3.0 P2）
   //

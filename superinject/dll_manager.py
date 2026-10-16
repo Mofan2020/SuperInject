@@ -92,6 +92,11 @@ def dll_for_arch(arch: str) -> Optional[Path]:
     """返回对应 arch 的 DLL 路径（含环境变量/开发构建回退）。
 
     None 表示该位数 DLL 不可用（既未内嵌，也没有本地构建产物）。
+
+    关键行为：内嵌 x86 DLL 已在 exe 字节里，但 ``verify_and_sync`` 默认只释放
+    x64（启动期只调一次）。这里在「内嵌可用 + 磁盘缺文件」时**自动释放**到
+    磁盘，确保跨位数注入 / 资源提取 / 内存快照等所有走 LoadLibraryW 的功能
+    在第一次用到 x86 时就能直接命中。
     """
     arch = arch.lower()
     if arch not in DLL_FILENAMES:
@@ -99,6 +104,13 @@ def dll_for_arch(arch: str) -> Optional[Path]:
     target = target_dll_path(arch)
     if target.exists():
         return target
+    # 磁盘缺：内嵌可用 → 写盘；没有内嵌 → 看 dev 构建
+    emb = embedded_bytes(arch)
+    if emb:
+        # 落盘（保留 verify_and_sync 的 sha 校验 / 备份 / 错误处理逻辑）
+        report = verify_and_sync(arch=arch)
+        if report.ok:
+            return target
     if arch == "x86":
         dev = _dev_build_dll_x86()
         if dev and dev.exists():

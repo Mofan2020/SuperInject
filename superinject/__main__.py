@@ -154,8 +154,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         safe_print(f"[自检1] 权限自检通过（{elev.identity}）")
 
-    # ---- 自检2：DLL 校验（SHA256 全部运行时自动计算）
-    report = dll_manager.verify_and_sync()
+    # ---- 自检2：DLL 校验（SHA256 全部运行时自动计算）。
+    # 同时把 x64 + x86 释放到磁盘，避免首次跨位数注入时再触发写盘。
+    report = None
+    for arch in ("x64", "x86"):
+        r = dll_manager.verify_and_sync(arch=arch)
+        if arch == "x86":
+            report = r  # 后面 api.dll_report / 日志用 x86 的状态
+        if not r.ok:
+            safe_print(f"[自检2] {arch} DLL 校验失败: {r.message}")
+    if report is None:
+        report = dll_manager.verify_and_sync(arch="x64")  # 兜底
 
     from .gui import Api, create_window, run_gui, update_checker
 
