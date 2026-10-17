@@ -1,162 +1,141 @@
 # SuperInject
 
-> **⚠️ 仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负！**
+> **⚠️ For developer debugging only. Do not misuse. You are solely liable for any consequences.**
 
-**SuperInject** 是一个**仅运行在 Windows 上**的、基于 DLL 注入的**快捷调试工具**。
-它把「找进程 → 注入 → 读内存 → 改内存 → 冻结 → 卸载 / 结束」这条调试链路压缩进一个
-PyWebView 图形界面里，帮助开发者在几分钟内定位问题，而不是在各种命令行脚本之间来回切换。
+**SuperInject** is a **Windows-only**, DLL-injection-based fast debugger. It collapses the chain "find process → inject → read memory → write memory → freeze → unload / terminate" into a single PyWebView GUI, so you can locate a bug in minutes instead of bouncing between command-line scripts.
 
-> **使用边界（请务必阅读）**
-> 本工具**只能**用于你自己拥有、或已获得**明确授权**的目标进程。
-> 严禁用于任何未授权的第三方程序、用于绕过软件保护机制，或用于侵犯他人权益的行为。
-> 在多数司法辖区，未经授权对第三方进程注入代码可能违反法律与软件许可协议；
-> 由此产生的一切后果由使用者自行承担。本项目作者与贡献者不承担任何责任。
+![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.9%2B-yellow.svg)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
----
+[中文文档](./README.zh-CN.md) · [Releases](https://github.com/Mofan2020/SuperInject/releases)
 
-## 功能一览
+> **Use boundaries (please read)**
+> Use this tool **only** on processes you own or have **explicit written authorization** to debug.
+> Do not use it on unauthorized third-party software, to bypass software protection mechanisms, or to infringe on others' rights.
+> In most jurisdictions, injecting code into a third-party process without authorization may violate law and software license agreements; any consequences are the user's responsibility. The author and contributors disclaim all liability.
 
-| 能力 | 说明 |
+## Capabilities
+
+| Capability | Description |
 | --- | --- |
-| 启动自检 1 | 识别当前权限（SYSTEM / 管理员 / 普通用户）：普通用户先走 UAC 提到管理员，管理员再**自我提权到 SYSTEM**（复制 SYSTEM 进程令牌 + `CreateProcessAsUserW`），以便调试高权限进程；失败会明确降级为管理员并说明原因 |
-| 启动自检 2 | DLL 完整性校验：运行时计算 SHA256 与内嵌副本比对，不一致（或缺失）**自动替换** |
-| 进程选择 | 全量进程列表，支持按名称 / PID / **进程路径** 搜索，支持多选批量，也支持手工粘贴 PID |
-| CLI 模式 | `-c -y <command>`：进程列表 / 注入 / 冻结 / 内存读写 / 卸载 / 终止 / DLL 自校验；默认 plain text，加 `--json` 切 JSON |
-| x86 应用注入 | 同时内嵌 x64 + x86 两份 DLL；按目标进程位数自动选择，无需手动指定 |
-| 注入检查 | 注入前逐个 PID 预检：进程是否还在、位数是否匹配（含「x86 DLL 可用时自动放行跨位数」）、能否打开、是否系统关键进程、是否已注入 |
-| 注入 | `CreateRemoteThread + LoadLibraryW`，批量注入，**并确认控制通道真的建立**才算成功 |
-| 热更新重注入 | 对已注入的进程再次注入时，自动「先卸载旧 DLL → 等通道断开 → 注入新 DLL」 |
-| 批量控制 | 注入端 DLL 通过**回环 TCP 反向连接**控制器（带一次性令牌），控制器可同时控制任意多个已注入进程 |
-| 卸载注入 | 让目标进程内的 DLL 自己 `FreeLibraryAndExitThread`，干净卸载并断开通道 |
-| 终止进程 | 由注入的 DLL 在目标进程内调用 `ExitProcess`——即"进程自己终结自己" |
-| 冻结进程 | `NtSuspendProcess` 挂起全部线程，目标进程**完全无响应**；可随时解除，并核实线程真实挂起状态 |
-| 内存搜索 | 支持 `4D 5A ?? ??` 通配的十六进制模式扫描，可批量在多进程内搜索 |
-| 内存查看 / 修改 | 十六进制读写任意地址；遇到代码段/只读页会自动临时改页属性再写回（可改代码） |
-| 内存快照 / diff | 4KB 分页 SHA-256 + 前 64 字节快照，落盘到 `%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json`；二次操作可对比任意两份快照的差异页（先看全局 SHA 找变化页，再展示 `head64` 两栏 hex），既找得到 1 字节改动也不会随进程跑出 MB 级 false positive |
-| 硬件断点（P2/P3 v1.3.0） | DR0-DR3 装线程级硬件断点（4 槽），DR7 控制位含 R/W / LEN / L 启用；槽位耗尽自动降到 VEH 模拟（`INT3 0xCC` patch + 单步重写）—— 命中推 `event:breakpoint` 给控制器，事件 payload 含 `addr / pid / tid / slot / kind / fault_addr / hit_count / regs / stack`。**命中事件含完整寄存器**（x64: RIP/RSP/RBP/RFLAGS/RAX-RDI/R8-R15/CS/SS；x86: EIP/ESP/EBP/EFLAGS/EAX-EDI/CS/SS）**和栈快照前 16 项**（每项 `{i, addr, value}`；RSP/ESP 页不可读时栈为空数组，事件照推） |
-| MCP server（P4/P5/P6/P7 v1.3.0） | `SuperInject.exe mcp` 起 stdio JSON-RPC server，把 31 个调试能力（`read` 16 / `write` 14 / `dangerous` 1）按**会话授权**开关暴露给 AI Agent：启动时弹窗（或 `--consent-stdin` 一次性读配置）确认 PID 白名单 / 进程名通配符 / 能力分档，未授权的工具在 `tools/list` 里就不出现、硬调也只回 `consent_denied` 且**不会落到控制器**；默认走零依赖的裸 stdio 实现，装了官方 `mcp` SDK 则自动优先走 SDK、失败自动降级；`--print-config` 直接打印 Claude Desktop / Cursor 的 `mcpServers` 配置片段（默认无 UAC 的 launcher 版，加 `--direct` 出直连版）。**GUI 内置授权面板**（P5）：顶部 MCP 状态徽标（未授权 / 已授权 / 已过期）+「授权…」模态框（PID 白名单 / 进程名通配 / 三档能力 / 有效期）+「撤销授权」+「复制 Agent 配置」，授权直接落盘供外部 Agent 复用。**无 UAC launcher**（P6）：GUI 里点「启用 MCP 服务」后，主进程（已提权）监听命名管道 `\\.\pipe\SuperInjectMCP`；Agent 端配置用 `SuperInject.exe mcp-launcher`（**不要求管理员/SYSTEM**）把 stdio JSON-RPC 经管道转交主进程执行，**全程无 UAC 弹窗**。**一键写入 Agent 配置**（P7）：MCP 面板列出 Claude Desktop / Cursor 两个目标（名字 + 配置路径 + 是否已存在），点「写入」先弹确认框，确认后**合并**写入（只改 `mcpServers.superinject` 一个键，其他键与别人的 MCP 条目原样保留）、写前 `copy2` 备份成 `<名字>.bak-<时间戳>`、原子写（临时文件 + `os.replace`）；文件不存在则创建、内容一致则 `unchanged`（不写不备份）、坏 JSON 报错且**不动原文件**；**只在用户点确认后发生，不静默改机器** |
-| 进程资源查看 | 提取并**直接在界面里预览**目标进程内存中的图片 / 音频 / 视频：<br>① PE 资源（RT_BITMAP / RT_ICON / RT_CURSOR 会补文件头转成 BMP / ICO / CUR）<br>② 内存映射文件（自己进程里被 map 进来的图片音视频，按内存内容原样导出） |
-| 崩溃转储 | DLL 在 `DllMain` 里装 `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler`，目标进程 ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE 时自动写 `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` 与同名 `.json` 元数据 sidecar；控制器在 `on_detach` 时按"水位线"扫目录，把新文件合成 `event:crash` 推到事件队列，CLI/前端都能消费 |
-| 事件流 | DLL / 控制器都能主动推 `type=event:*` 帧（包括崩溃转储、patch 落地等）—— 不参与 id 匹配，专为「通知但不期望响应」设计；CLI `events` 子命令支持 `--follow` 持续轮询 |
-| 模块导出表 + 符号解析 | `info` 命令附每模块的前 N 条导出，自写 PE 解析不依赖 dbghelp；`exports` 命令按 base / name 查单个模块；`superinject.symbols` 在控制器侧做 `module+0x123` / `module!symbol+0x42` 反查 |
-| 线程级冻结 | `threads` 列目标进程所有线程（含 tid / 状态 / WaitReason / 当前 SuspendCount / 线程名 GetThreadDescription），`thread_suspend` / `thread_resume` 单条挂起 / 恢复；`NtSuspendThread` + `NtQueryInformationThread(ThreadBasicInformation)` 取 SuspendCount |
-| 代码 patch (trampoline) | `patch_inject` 在目标地址写 5 字节 `E9 rel32` 跳到新申请的一段 RWX 跳板，shellcode 末尾再 `E9 rel32` 跳回原地址+5；`patch_list` 列出当前进程里所有 patch（含原字节 hex / trampoline 基址 / version），`patch_revert` 还原单个、`patch_clear` 一次性还原全部；上限 32 条 / 进程 |
-| 自动更新 | 后台检查 GitHub Release（含预发布版本），有新版时询问是否下载安装 |
-| 界面 | 单页应用、**整页可滚动**、六个功能区按视口高度分配空间；外观跟随系统（浅色 / 深色）的 macOS 风格 |
-| 单文件交付 | 打包产物**只有 `SuperInject.exe` 一个文件**（无 `_internal` 目录），内置 DLL 与前端资源都在 exe 内 |
+| Startup self-check 1: Privileges | Identifies the current privilege (SYSTEM / Admin / User); User → UAC to Admin → Admin self-elevates to **SYSTEM** (clone SYSTEM token + `CreateProcessAsUserW`); on failure, falls back to Admin and logs the reason. |
+| Startup self-check 2: DLL integrity | Computes the runtime SHA-256 of `SuperInjectAgent.dll` and compares it to the in-binary copy; mismatch (or missing) → **auto-replace**. |
+| Process picker | Full process list, searchable by name / PID / **process path**, multi-select, paste PIDs manually. |
+| CLI mode | `-c -y <command>`: process list / inject / freeze / memory R-W / unload / terminate / DLL self-check; plain text by default, add `--json` for JSON. |
+| x86 process injection | Both x64 + x86 DLLs are embedded; auto-picks by target architecture. |
+| Pre-injection check | For each PID: still alive? architecture match? (with cross-arch auto-fallback when x86 DLL is available) not a protected system process? not already injected? |
+| Injection | `CreateRemoteThread + LoadLibraryW`, batch injection, **confirmed by an actually-established control channel**, not just a non-zero return. |
+| Hot reload | Re-injecting an already-injected process: automatically "unload old DLL → wait for channel teardown → inject new DLL". |
+| Batch control | The injected DLL opens a **loopback TCP reverse connection** to the controller (with a one-shot token); the controller can talk to any number of injected processes in parallel. |
+| Unload | The injected DLL calls `FreeLibraryAndExitThread` on itself; clean unload with channel teardown. |
+| Terminate | The injected DLL calls `ExitProcess` inside the target — "process terminates itself". |
+| Freeze | `NtSuspendProcess` suspends every thread; the target becomes **completely unresponsive**; resume verifies real thread state. |
+| Memory search | Hex pattern scan with `4D 5A ?? ??` wildcards; cross-process batch search supported. |
+| Memory view / write | Hex R/W at any address; code/read-only pages are temporarily flipped writable and restored (code patching supported). |
+| Memory snapshot / diff | 4 KB page SHA-256 + first 64-byte snapshot, written to `%LOCALAPPDATA%/SuperInject/snapshots/<pid>/<name>.json`. Diff any two snapshots: page-level SHA locates changed pages, then `head64` shows a two-column hex diff — finds a 1-byte change without flooding you with MB of false positives. |
+| Hardware breakpoints (P2/P3 v1.3.0) | Per-thread hardware breakpoints on DR0-DR3 (4 slots), DR7 controls R/W / LEN / L enable; when slots run out, falls back to VEH emulation (`INT3 0xCC` patch + single-step rewrite). Hit pushes `event:breakpoint` with `addr / pid / tid / slot / kind / fault_addr / hit_count / regs / stack`. **Full register state on hit** (x64: RIP/RSP/RBP/RFLAGS/RAX-RDI/R8-R15/CS/SS; x86: EIP/ESP/EBP/EFLAGS/EAX-EDI/CS/SS) **+ first 16 stack entries** (each `{i, addr, value}`; when RSP/ESP pages are unreadable the stack is empty, the event still fires). |
+| MCP server (P4/P5/P6/P7 v1.3.0) | `SuperInject.exe mcp` starts a stdio JSON-RPC server exposing 31 debug capabilities (`read` 16 / `write` 14 / `dangerous` 1) under session-based consent: at startup a dialog (or `--consent-stdin` for one-shot config) confirms PID whitelist / process-name wildcards / capability tiers; unauthorized tools are absent from `tools/list`, and a hard call only returns `consent_denied` without ever reaching the controller. Default zero-dep raw stdio; if the official `mcp` SDK is installed, the SDK is preferred and falls back gracefully on failure. `--print-config` emits the Claude Desktop / Cursor `mcpServers` snippet (UAC-free launcher; `--direct` for the non-launcher version). **Built-in GUI consent panel** (P5): MCP status badge in the top bar (Unauthorized / Authorized / Expired) + "Authorize…" modal (PID whitelist / name wildcards / 3 capability tiers / validity) + "Revoke" + "Copy Agent config"; consent is persisted on disk for external agents to reuse. **UAC-free launcher** (P6): clicking "Enable MCP server" in the GUI causes the (already-elevated) main process to listen on named pipe `\\.\pipe\SuperInjectMCP`; the agent side uses `SuperInject.exe mcp-launcher` (which does **not require admin/SYSTEM**) to forward stdio JSON-RPC through the pipe to the main process — **no UAC prompt at all**. **One-click Agent config write** (P7): the MCP panel lists Claude Desktop and Cursor targets (name + config path + whether it already exists); clicking "Write" first shows a confirmation dialog, then performs a **merge** write (only the `mcpServers.superinject` key, all other top-level keys and other agents' `mcpServers` entries preserved verbatim), backs up via `copy2` to `<name>.bak-<timestamp>` first, writes atomically (temp file + `os.replace`); missing file is created, identical content returns `unchanged` (no write, no backup), malformed JSON is rejected **without touching the original**; **only happens after the user explicitly confirms**. |
+| Process resource viewer | Extracts and **in-line previews** images / audio / video in target-process memory: ① PE resources (RT_BITMAP / RT_ICON / RT_CURSOR have file headers reconstructed into BMP / ICO / CUR) ② memory-mapped files (anything the process has mmap'd — images, audio, video — exported as-is). |
+| Crash dump | DLL installs `SetUnhandledExceptionFilter` + `AddVectoredExceptionHandler` in `DllMain`; on ACCESS_VIOLATION / STACK_OVERFLOW / ILLEGAL_INSTRUCTION / DIVIDE_BY_ZERO / PRIV_INSTRUCTION / GUARD_PAGE / INVALID_HANDLE in the target, writes `%TEMP%\SuperInject\<pid>\dump-<tick>.dmp` and a same-name `.json` metadata sidecar; controller scans the directory at `on_detach` and pushes `event:crash` for new files into the event queue, consumable by both CLI and frontend. |
+| Event stream | DLL / controller both push `type=event:*` frames (crash dumps, patch landed, etc.) — these don't participate in id matching and are designed for "notify but don't expect a reply". CLI `events` subcommand supports `--follow` for continuous polling. |
+| Module exports + symbol resolution | `info` shows the first N exports per module; self-written PE parser, no dbghelp dependency; `exports` queries one module by base / name; `superinject.symbols` does `module+0x123` / `module!symbol+0x42` reverse lookups on the controller side. |
+| Thread-level freeze | `threads` lists all threads of the target (tid / state / WaitReason / current SuspendCount / thread name via GetThreadDescription); `thread_suspend` / `thread_resume` per thread; `NtSuspendThread` + `NtQueryInformationThread(ThreadBasicInformation)` reads SuspendCount. |
+| Code patch (trampoline) | `patch_inject` writes a 5-byte `E9 rel32` at the target address to jump to a freshly-allocated RWX trampoline; the shellcode ends with `E9 rel32` back to original+5; `patch_list` enumerates every patch (original bytes hex / trampoline base / version); `patch_revert` restores one, `patch_clear` restores all; cap 32 per process. |
+| Auto-update | Background check of GitHub Releases (pre-releases included); prompts to download and install on a new version. |
+| UI | Single-page, **fully scrollable**, six functional zones sized to the viewport; follows system appearance (light / dark) with a macOS-style aesthetic. |
+| Single-file distribution | The packaged output is **one file — `SuperInject.exe`** (no `_internal` folder); the DLL and frontend assets are embedded. |
 
 ---
 
-## 工作原理
+## How It Works
 
 ```
-┌──────────────── SuperInject.exe（Python / PyWebView）────────────────┐
-│                                                                        │
-│  自检1 权限（UAC → SYSTEM 提权重启）→ 自检2 DLL SHA 校验替换 → GUI 启动     │
-│                                                                        │
-│  Controller ──► 注入检查 → CreateRemoteThread + LoadLibraryW 注入       │
-│      │                                                                 │
-│      │  为每个目标写会合文件 %TEMP%\SuperInject\port-<目标PID>.txt       │
-│      ▼                                                                 │
-│ AgentServer  ◄════ 回环 TCP 127.0.0.1（4 字节长度 + JSON）════  Agent   │
-│      │                                                                 │
-│      │  导出目录 %TEMP%\SuperInject\<pid>\ → 127.0.0.1 只读预览服务      │
-│      ▼                                                                 │
-│  <img>/<video>/<audio> 直接播放（支持 Range，能拖进度）                  │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   │ 注入点
+┌──────────────── SuperInject.exe (Python / PyWebView) ────────────────┐
+│                                                                      │
+│  Self-check 1 (priv → UAC → SYSTEM elevate) → Self-check 2 (DLL SHA,  │
+│  auto-replace) → GUI launches                                        │
+│                                                                      │
+│  Controller ──► pre-check → CreateRemoteThread + LoadLibraryW         │
+│      │                                                               │
+│      │  Writes rendezvous file %TEMP%\SuperInject\port-<PID>.txt     │
+│      ▼                                                               │
+│ AgentServer  ◄════ loopback TCP 127.0.0.1 (4-byte length + JSON)     │
+│      │                                       ══════  Agent          │
+│      │  Export dir %TEMP%\SuperInject\<pid>\ → 127.0.0.1 read-only   │
+│      ▼                                                               │
+│  <img>/<video>/<audio> preview (supports Range, scrubbable)          │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │ inject point
                  ┌─────────────────▼──────────────────┐
-                 │ SuperInjectAgent.dll（目标进程内）    │
+                 │ SuperInjectAgent.dll (in target)    │
                  │  · ping / info / mem_regions         │
                  │  · mem_search / mem_read / mem_write  │
-                 │  · resources（PE 资源 + 内存映射）     │
+                 │  · resources (PE + memory-mapped)     │
                  │  · terminate / unload                 │
-                 └────────────────────────────────────┘
+                 └─────────────────────────────────────┘
 ```
 
-关键设计：
+Key design decisions:
 
-* **控制通道是反向的**。被注入的 DLL 读会合文件后主动连接控制器的回环端口，
-  因此一次注入即可支持**批量、随时、反复**地控制目标进程，不需要每次操作都重新注入。
-* **冻结在控制器侧完成**（`NtSuspendProcess`）。从进程内部挂起自己是没意义的 —— 只会让
-  DLL 唯一的工作线程睡死，既冻结不了目标也永远回不来。冻结期间目标进程完全不响应，
-  DLL 自然也不响应，这是预期行为。
-* **注入成功 = 通道建立**。`LoadLibraryW` 返回非 0 只说明模块进了目标进程；
-  本工具会继续等待注入端连上控制通道，连不上就如实报失败（并区分「模块残留」这类情况）。
-* **通道用回环 TCP 而不是命名管道**。控制器只监听 `127.0.0.1`（不对外），并把
-  「端口 + 一次性随机令牌」写进 `%TEMP%\SuperInject\port-<目标PID>.txt`，注入端连上后
-  首帧必须回传该令牌，否则连接被丢弃。早期版本用命名管道，实测在「控制器写命令、
-  注入端阻塞读」并存时会出现方向性死等（写端与读端一起卡死数分钟），故换成 socket。
-* DLL 字节在打包时以 base64 **内嵌进 exe**，运行时的 SHA256 **全部实时计算**，
-  源码与配置中不存在任何手写哈希常量（有单元测试守护这条规则）。
-* **SYSTEM 提权不改会话**。做法是：打开 `SeDebugPrivilege` → 在**当前会话**里找一个
-  以 SYSTEM 运行的进程（首选 `winlogon.exe`，它未被 PPL 保护）→ 复制其令牌为**主令牌**
-  → 用该令牌把自己重新拉起。新进程是 SYSTEM，但仍在你当前的桌面/会话里，
-  所以 GUI 照常显示（用计划任务以 SYSTEM 启动会掉进 session 0，界面根本看不见）。
-  候选限定在同会话，因此完全不需要 `SeTcbPrivilege`。
-* **会合文件跨 TEMP 也能找到**。注入端除了读自己的 `%TEMP%\SuperInject\`，
-  在找不到时会再只读扫描各用户的 `%TEMP%\SuperInject\` —— 因为 SYSTEM 服务这类
-  目标进程的 `GetTempPathW()` 往往是 `C:\Windows\Temp`，而控制器写在启动它的
-  那个用户的 TEMP 里。只读扫描，不往公共目录写令牌。
+- **Reverse control channel.** The injected DLL reads the rendezvous file and *initiates* the loopback connection, so a single injection supports **batch, ad-hoc, repeated** control of the target without re-injecting every time.
+- **Freeze is on the controller side** (`NtSuspendProcess`). Self-suspending from inside the process is pointless — it would just sleep the DLL's only worker thread, freezing neither the target nor ever waking back up. While frozen, the target is fully unresponsive and so is its DLL; that is expected.
+- **Injection success = channel established.** A non-zero return from `LoadLibraryW` only proves the module landed in the target. SuperInject keeps waiting for the injected DLL to connect to the control channel; if it doesn't, the tool reports failure (and distinguishes "module residue" cases).
+- **Loopback TCP, not named pipe.** The controller listens on `127.0.0.1` only (not exposed), and writes "port + one-shot random token" to `%TEMP%\SuperInject\port-<target-PID>.txt`; the injected DLL must echo the token in its first frame, or the connection is dropped. An earlier named-pipe version deadlock-tested at "controller writes + DLL blocks reading" and wedged both ends for minutes — the switch to sockets eliminated it.
+- **DLL bytes are base64-embedded in the exe; SHA-256 is computed at runtime.** There are no hand-written hash constants anywhere in the source or config (a unit test guards this rule).
+- **SYSTEM elevation stays in the current session.** Open `SeDebugPrivilege` → find a SYSTEM process in the **current session** (preferring `winlogon.exe`, which is not PPL-protected) → duplicate its token as a **primary token** → relaunch self with that token. The new process is SYSTEM but stays in your current desktop/session, so the GUI shows normally (scheduled-task-as-SYSTEM would land in session 0 with no visible UI). Candidates are limited to the same session, so `SeTcbPrivilege` is never needed.
+- **Rendezvous file works across TEMP directories.** The injected DLL tries its own `%TEMP%\SuperInject\` first, and if that fails, scans every user's `%TEMP%\SuperInject\` read-only — because `GetTempPathW()` for SYSTEM services is typically `C:\Windows\Temp`, while the controller wrote to the launching user's TEMP. Read-only scan, no token writes to public paths.
 
 ---
 
-## 安装与使用
+## Install & Use
 
-### 方式一：下载 Release
+### Option 1: Download a Release
 
-从 [Releases](https://github.com/Mofan2020/SuperInject/releases) 下载 `SuperInject-win-x64.zip`，
-解压得到**单个 `SuperInject.exe`**（没有 `_internal` 目录，也不需要安装），双击运行，
-按提示同意 UAC。
+Download `SuperInject-win-x64.zip` from [Releases](https://github.com/Mofan2020/SuperInject/releases). Unzip to get a **single `SuperInject.exe`** (no `_internal` folder, no installer), double-click, accept the UAC prompt.
 
-> 依赖：Windows 10/11 x64 + [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Win11 自带）。
+> Requirements: Windows 10/11 x64 + [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on Win11).
 >
-> 发布包（`SuperInject-win-x64.zip`）里**只有 `SuperInject.exe` 一个文件**，
-> 解压出来就是单文件，没有 `_internal` 目录、也不需要安装。
+> The release zip contains **only `SuperInject.exe`**.
 >
-> 首次运行会在 exe 同目录释放内置的 `SuperInjectAgent.dll`（自检2 会实时校验它的
-> SHA256）；若 exe 放在不可写的位置（如 `Program Files`），DLL 会自动改释放到
-> `%LOCALAPPDATA%\SuperInject\`。
+> On first run, `SuperInjectAgent.dll` is extracted next to the exe (Self-check 2 verifies its SHA-256 in real time); if the exe sits in a non-writable location (e.g. `Program Files`), the DLL falls back to `%LOCALAPPDATA%\SuperInject\`.
 
-### 方式二：从源码运行
+### Option 2: Run from Source
 
 ```bash
 git clone https://github.com/Mofan2020/SuperInject.git
 cd SuperInject
 python -m pip install -r requirements.txt
 
-# 1) 编译注入端 DLL（macOS/Linux 用 MinGW-w64 交叉编译，Windows 上优先用 MSVC）
+# 1) Compile the DLL (MinGW-w64 cross-compile on macOS/Linux; MSVC preferred on Windows)
 python build/build_native.py
-# 2) 把 DLL 内嵌进程序
+# 2) Embed the DLL into the program
 python build/make_payload.py
-# 3) 运行（会自动触发 UAC 提权）
+# 3) Run (auto-triggers UAC)
 python run_superinject.py
 ```
 
-### 使用步骤
+### Usage
 
-1. **选择进程** —— 在列表里搜索名称或 PID，勾选（可多选），或直接粘贴 PID。
-2. **注入** —— 点击「注入选中」，会先做注入检查（系统关键进程、位数不匹配等会被拦下），
-   再执行注入并确认控制通道已建立。
-3. **控制** —— 在「控制（批量）」区执行冻结 / 解除冻结 / 查看资源 / 卸载 / 终止。
-4. **看资源** —— 「查看进程资源」会把目标进程内存里的图片/音频/视频导出到临时目录，
-   并在下方**直接以缩略图 / 播放器呈现**（音频视频可播放拖动）。
-5. **内存调试** —— 输入十六进制模式（如 `4D 5A ?? ??`）搜索，选中结果后即可查看与修改；
-   写入只读页（例如 PE 头、代码段）时会自动临时改页属性并还原。
+1. **Pick processes** — search by name or PID in the list, tick (multi-select supported), or paste PIDs.
+2. **Inject** — click "Inject selected". Pre-checks run first (protected system processes, architecture mismatch, etc. are blocked), then inject and confirm the control channel is up.
+3. **Control** — in the "Control (batch)" zone: freeze / unfreeze / view resources / unload / terminate.
+4. **View resources** — "View process resources" exports images/audio/video from target memory to a temp directory and renders them inline (thumbnails / player; audio & video support scrubbing).
+5. **Memory debugging** — search with a hex pattern like `4D 5A ?? ??`; select a result to view / write. Writing into a read-only page (PE header, code section) auto-flips page protection and restores it.
 
-### 命令行参数
+### CLI Arguments
 
 ```
-SuperInject.exe                  启动自检 → 提权到 SYSTEM → 图形界面
-SuperInject.exe --as-admin       只提到管理员（不提 SYSTEM），调试普通进程时用
-SuperInject.exe --self-test      无界面全链路自检
-SuperInject.exe --help           帮助
+SuperInject.exe                  Self-check → elevate to SYSTEM → GUI
+SuperInject.exe --as-admin       Only elevate to Admin (not SYSTEM), for ordinary targets
+SuperInject.exe --self-test      Headless end-to-end self-check
+SuperInject.exe --help           Help
 
-# CLI 模式（v1.1.0 新增）：不带 GUI，方便脚本与 Agent 调用
-SuperInject.exe -c -y list                 # 列进程
-SuperInject.exe -c -y list --path "C:\Program Files\..."   # 按路径过滤
-SuperInject.exe -c -y list --name chrome   # 按名过滤
-SuperInject.exe -c -y inject 1234          # 注入（自动按目标位数选 DLL）
+# CLI mode (added in v1.1.0): no window, scriptable
+SuperInject.exe -c -y list                 # list processes
+SuperInject.exe -c -y list --path "C:\Program Files\..."   # filter by path
+SuperInject.exe -c -y list --name chrome   # filter by name
+SuperInject.exe -c -y inject 1234          # inject (auto-pick DLL by target arch)
 SuperInject.exe -c -y inject --pid 100 --pid 200 --arch x86
 SuperInject.exe -c -y freeze 1234
 SuperInject.exe -c -y mem-read 1234 0x401000 64
@@ -164,28 +143,26 @@ SuperInject.exe -c -y mem-search 1234 '4D 5A ?? ??'
 SuperInject.exe -c -y snapshot 1234 --name before --region 0x401000 0x1000
 SuperInject.exe -c -y diff 1234 --a before --b after --limit 32
 SuperInject.exe -c -y bp-set 1234 iphlpapi!IcmpSendEcho2+0x10        # module!symbol+offset
-SuperInject.exe -c -y bp-set 1234 0x401000 --tid 12345 --type exec    # 线程级硬件 DR 槽
+SuperInject.exe -c -y bp-set 1234 0x401000 --tid 12345 --type exec    # per-thread HW DR slot
 SuperInject.exe -c -y bp-list 1234
 SuperInject.exe -c -y bp-remove 1234 0x401000
 SuperInject.exe -c -y bp-clear 1234
 SuperInject.exe -c -y unload 1234
 SuperInject.exe -c -y terminate 1234
 SuperInject.exe -c -y status
-SuperInject.exe -c -y dll                  # DLL 自校验
+SuperInject.exe -c -y dll                  # DLL self-check
 ```
 
-MCP server（给 AI Agent 用，stdio JSON-RPC）：
+MCP server (for AI agents, stdio JSON-RPC):
 
-```
-SuperInject.exe mcp                               # 起 server（复用有效授权，没有则要求授权）
-SuperInject.exe mcp --print-config                # 只打印 Agent 端配置片段后退出
+```powershell
+SuperInject.exe mcp                               # start server (reuses valid consent; otherwise requires consent)
+SuperInject.exe mcp --print-config                # print the agent-side config snippet and exit
 SuperInject.exe mcp --consent-stdin --no-gui-consent < consent.txt
 ```
 
-- 不带参数时：若本地已有**未过期**的授权会话就直接复用；否则拒绝启动并提示——
-  要么在 GUI 里授权，要么用 `--consent-stdin` 现场提供（授权只能由人给出，不能由 Agent 自签）。
-
-`consent.txt` 格式（首行必须是大写 `YES`，这一行就是授权同意）：
+- With no flag: if a **non-expired** consent session exists locally, reuse it; otherwise refuse to start and prompt — either authorize in the GUI, or supply one-shot consent via `--consent-stdin`. Consent can only be granted by a human, never by an agent.
+- `consent.txt` format (first line must be uppercase `YES` — that line *is* the consent):
 
 ```
 YES
@@ -194,185 +171,176 @@ names=notepad*,mytool.exe
 capabilities=read,write
 ```
 
-- `capabilities` 三档：`read`（列举 / 读内存 / 断点查询等）、`write`（写内存 / patch / 冻结 / 装断点等）、`dangerous`（终止进程）。
-- 未列出的目标进程一律拒绝；`pids` 与 `names` 都空 = 拒绝一切。
-- 授权默认 30 分钟过期，之后要重新授权。
-- `--print-config` 输出的片段贴进 Claude Desktop 的 `claude_desktop_config.json`（或 Cursor 的 `mcp.json`）即可让 Agent 发现本 server。
+- Three capability tiers: `read` (list / read memory / query breakpoints, etc.), `write` (write memory / patch / freeze / install breakpoints, etc.), `dangerous` (terminate process).
+- Unlisted target processes are always rejected; both `pids` and `names` empty = reject everything.
+- Default 30-minute expiry; re-authorize afterwards.
+- `--print-config` outputs the snippet to paste into Claude Desktop's `claude_desktop_config.json` (or Cursor's `mcp.json`) so the agent can discover the server.
 
-**GUI 授权流程**（v1.3.0 P5/P6，推荐）：
+**GUI consent flow** (v1.3.0 P5/P6, recommended):
 
-1. 打开 GUI，顶部状态栏的 `MCP` 徽标显示当前授权状态（未授权 / 已授权 / 已过期）；`MCP` 分区里点「授权…」打开授权模态框。
-2. 在模态框里勾选能力分档（`read` 自动勾选；`write` 改变目标状态；`dangerous` = 终止进程）、填 PID 白名单 / 进程名通配符、选有效期，点「授权」—— 会话**落盘**到 consent 文件（未授权成功不会落盘）。
-3. 点「启用 MCP 服务」：主进程（已提权）开始监听命名管道 `\\.\pipe\SuperInjectMCP`，面板与顶部徽标会显示「运行中」。
-4. 点「复制 Agent 配置」把 `mcpServers` 片段复制到剪贴板，贴进 Agent 端配置（默认就是无 UAC 的 `mcp-launcher` 版）。
-5. 或者点「一键写入 Agent 配置」里对应目标的「写入」按钮直接写进配置文件（Claude Desktop 的 `claude_desktop_config.json` / Cursor 的 `~/.cursor/mcp.json`）：**会先弹确认框**说明「将备份原文件、只改 `mcpServers.superinject` 一个键」，确认后**合并**写入并回显备份路径。写入是**用户点确认才发生**的，不存在启动时静默改配置的路径。
-6. Agent 自行以 `SuperInject.exe mcp-launcher` 拉起 launcher：它**不要求管理员/SYSTEM**，把 Agent 的 stdio JSON-RPC 经命名管道转交给第 3 步启用的主进程执行，**全程无 UAC 弹窗**。
+1. Open the GUI; the MCP badge in the top bar shows current consent state. Click "Authorize…" in the MCP section.
+2. In the modal: tick capability tiers (`read` auto-ticked; `write` changes target state; `dangerous` = terminate), fill PID whitelist / process-name wildcards, choose validity, click "Authorize". The session is **persisted to disk** (only on success).
+3. Click "Enable MCP server": the main process (already elevated) begins listening on named pipe `\\.\pipe\SuperInjectMCP`; the panel and badge show "Running".
+4. Click "Copy Agent config" to copy the `mcpServers` snippet; paste it into the agent's config (default is the UAC-free `mcp-launcher` variant).
+5. Or click "Write" next to a target under "One-click Agent config" to write the config file directly (Claude Desktop's `claude_desktop_config.json` / Cursor's `~/.cursor/mcp.json`): **a confirmation dialog appears first** stating "will back up the original file and only modify the `mcpServers.superinject` key"; after confirmation, a **merge** write happens and the backup path is echoed. **The write only happens after the user explicitly confirms** — there is no silent-on-startup write path.
+6. The agent launches `SuperInject.exe mcp-launcher` itself: it does **not require admin/SYSTEM**, forwards stdio JSON-RPC through the named pipe to the elevated main process, **no UAC prompt at all**.
 
-**一键写入（P7）的安全边界**：只改 `mcpServers` 下 `superinject` 这一个键 —— 其他顶层键、别人的 `mcpServers` 条目都原样保留；写前把原文件 `copy2` 备份成 `<文件名>.bak-<时间戳>`（路径在日志里回显），再用临时文件 + `os.replace` 原子落盘；配置文件不存在就创建（只在用户点了该目标的「写入」时，不会凭空给未安装的 Agent 建目录）；内容已经一致就返回 `unchanged`（不写、不备份）；现有文件是坏 JSON / 顶层不是对象 / `mcpServers` 不是对象时**直接报错且不动原文件**。
+**P7 write safety boundaries**: only `mcpServers.superinject` is touched — other top-level keys and other agents' `mcpServers` entries are preserved; the original file is backed up via `copy2` to `<name>.bak-<timestamp>` (path echoed in log) before atomic write via temp file + `os.replace`; missing file is created (only when the user clicks that target's "Write" — never auto-creating dirs for uninstalled agents); identical content returns `unchanged` (no write, no backup); existing file with malformed JSON / non-object top level / non-object `mcpServers` is **rejected without touching the original**.
 
-**为什么用 mcp-launcher 而不是直接 `SuperInject.exe mcp`？** 直接跑 `mcp` 要能注入目标进程，因此需要管理员/SYSTEM，每次都会弹 UAC。`mcp-launcher` 只做「转发」——它把请求交给**已经提权**的 GUI 主进程执行，自己不需要任何权限，所以不弹 UAC。代价是必须先打开 GUI 并启用 MCP 服务；主进程没运行时 launcher 会在 stderr 报「SuperInject 主进程未运行（请先打开 GUI 并启用 MCP 服务）」并返回非 0。
+**Why `mcp-launcher` instead of `SuperInject.exe mcp` directly?** Running `mcp` directly needs to inject into target processes, which requires admin/SYSTEM and triggers UAC every time. `mcp-launcher` only forwards requests to the **already-elevated** GUI main process — it needs no privileges itself, so no UAC. The trade-off: you must first open the GUI and enable the MCP server; if the main process isn't running, the launcher prints "SuperInject main process is not running (please open the GUI and enable the MCP server first)" to stderr and exits non-zero.
 
-> **launcher 与主进程必须是同一个 Windows 用户。** 命名管道的默认 ACL 只允许创建者所在用户访问，跨用户（例如主进程以管理员身份、launcher 以普通用户）连不上；此时改回直连版 `SuperInject.exe mcp`（会走 UAC）。
+> **The launcher and the main process must be the same Windows user.** Named pipes default to an ACL that allows only the creating user; cross-user access (e.g. main as admin, launcher as standard user) won't connect — fall back to direct `SuperInject.exe mcp` (which goes through UAC).
+>
+> The GUI's MCP section handles **consent** + **starting/stopping the named pipe service** + **copying config**. The service itself is a **named pipe** (not inline stdio — the GUI process has no stdin/stdout for stdio transport). Click "Stop" to stop, "Revoke" to delete the consent file.
 
-> GUI 的 `MCP` 分区负责**授权** + **启用/停止命名管道服务** + **复制配置**；服务本身是**命名管道**（不是内嵌 stdio —— GUI 进程没有可用的 stdin/stdout 给 stdio 传输）。任何时刻点「停止」停服务、点「撤销授权」删除授权文件清空授权。
+To skip the launcher and let the agent elevate itself via `SuperInject.exe mcp`, generate the direct config snippet with `--print-config --direct`.
 
-不想要 launcher、让 Agent 自己提权走 `SuperInject.exe mcp` 时，用 `--print-config --direct` 生成直连版配置片段。
+CLI mode:
 
-CLI 模式：
+- Plain text by default (agent-friendly); add `--json` for JSON.
+- `-c` enters CLI (required); `-y` means "I accept the disclaimer" (required, otherwise it refuses to run).
+- Both x64 + x86 DLLs are built. Injecting x86 targets auto-picks the x86 DLL — no manual `--arch` needed.
+- Full subcommands and help: `-h` / `--help`.
 
-* 默认输出 plain text（Agent 友好）；加 `--json` 切 JSON。
-* `-c` 启动 CLI（必需）；`-y` 一律同意免责（必需，否则拒绝执行）。
-* 同时编两份 DLL：x64 + x86。注入 x86 进程时会自动选 x86 DLL，无需手动指定 `--arch`。
-* 完整子命令与帮助：`-h` / `--help`。
+### About SYSTEM Privilege
 
-### 关于 SYSTEM 权限
+- **Defaults to SYSTEM.** Inject checks, memory R/W, and freeze all work on high-privilege processes (SYSTEM services, other users' processes); the UI top-right shows the real privilege (`Privilege SYSTEM ✓` / `Privilege Admin ✓` / `Privilege Not elevated ✗`).
+- **Still works without SYSTEM.** If policy disallows it (no available SYSTEM token source, security software blocks token duplication), the program **falls back to Admin** and logs the reason — it does not hard-exit. Admin is enough for ordinary processes.
+- **Don't want SYSTEM** — pass `--as-admin`.
+- **Which high-privilege processes are injectable**: in SYSTEM mode, anything not kernel / not PPL can be attempted; `lsass.exe`, `csrss.exe`, `services.exe`, and other critical processes are **actively blocked** (injecting them crashes the system — not a capability gap, an intentional guardrail).
 
-- **默认就会提权到 SYSTEM**：注入检查、内存读写、冻结这些能力对高权限进程
-  （SYSTEM 服务、其他用户的进程）同样有效；界面右上角会显示当前真实权限
-  （`权限 SYSTEM ✓` / `权限 管理员 ✓` / `权限 未提权 ✗`）。
-- **拿不到 SYSTEM 也能用**：若系统策略不允许（例如没有可用的 SYSTEM 令牌来源、
-  安全软件拦截令牌复制），程序会**降级为管理员继续运行**，并在日志里写明原因，
-  不会硬性退出 —— 调试普通进程用管理员权限足够。
-- **不想提 SYSTEM** 时加 `--as-admin`。
-- **可以调试哪些高权限进程**：在 SYSTEM 模式下，目标进程只要不是内核/受保护进程
-  （PPL）都可以尝试注入；`lsass.exe`、`csrss.exe`、`services.exe` 等系统关键进程
-  被本工具主动拦下（注入它们会导致系统崩溃，这不是能力不足而是必须的护栏）。
-
-### 无界面自检（CI 与自测用）
+### Headless Self-Test (CI & Manual)
 
 ```powershell
-SuperInject.exe --self-test            # 全链路自检，报告写入程序目录
+SuperInject.exe --self-test            # full end-to-end self-check, report written next to exe
 SuperInject.exe --self-test --report D:\report.json
 SuperInject.exe --self-test --keep-target
 ```
 
-它从**打包产物**本身出发，用内嵌的 DLL 去注入一个真实进程，逐项验证：
-权限自检 → DLL 校验与 SHA 一致 → SYSTEM 令牌复制 → **真实创建一个 SYSTEM 进程并核对身份** → 拉起目标进程 → 注入检查 → 注入并建连 →
-ping / info / mem_regions / 内存搜索 / 内存读写还原 → 资源提取 →
-冻结与解除（核实线程挂起状态）→ 卸载 → 重新注入 → 热更新重注入 → 自我终止。
-退出码 0 表示全部通过，报告为 JSON（`self-test-report.json`）。
+Starts from the **packaged artifact itself**, uses the embedded DLL to inject into a real process, and verifies each step:
+privilege self-check → DLL verify and SHA match → SYSTEM token duplication → **actually create a SYSTEM process and verify identity** → launch target → pre-check → inject and establish channel →
+ping / info / mem_regions / memory search / memory R-W and restore → resource extraction → freeze and resume (with thread-state verification) → unload → re-inject → hot reload → self-terminate.
+
+Exit 0 means all passed; the report is JSON (`self-test-report.json`).
 
 ---
 
-## 项目结构
+## Project Layout
 
 ```
 SuperInject/
 ├─ superinject/
-│  ├─ __main__.py        启动流程（权限自检 → DLL 自检 → GUI → 更新检查）/ CLI 入口
-│  ├─ gui.py             PyWebView 桥接层（暴露给前端 JS 的 API）
-│  ├─ controller.py      注入检查 / 注入 / 批量控制 / 内存 / 资源编排
-│  ├─ winapi.py          Win32/NT API 的 ctypes 封装（权限、注入、挂起检测等）
-│  ├─ ipc.py             回环 TCP 控制通道 + 帧协议编解码
-│  ├─ fileserver.py      127.0.0.1 只读预览服务（支持 Range，供音视频播放）
-│  ├─ media.py           媒体类型判定与预览条目组装
-│  ├─ resconv.py         裸 DIB → BMP / ICO / CUR（PE 资源补文件头）
-│  ├─ dll_manager.py     DLL 内嵌副本与 SHA256 自校验替换（自检2）
-│  ├─ elevate.py         权限自检、UAC 提权与 SYSTEM 提权策略（自检1）
-│  ├─ system_token.py    SYSTEM 令牌复制与 CreateProcessAsUserW 重启（Windows 专用）
-│  ├─ updater.py         GitHub Release 更新检查与安装
-│  ├─ selftest.py        无界面全链路自检（--self-test）
-│  ├─ web/               前端界面（index.html / app.js / style.css）
-│  └─ embedded/          打包时生成的 DLL 字节（base64）
+│  ├─ __main__.py        Startup (privilege check → DLL check → GUI → update check) / CLI entry
+│  ├─ gui.py             PyWebView bridge layer (APIs exposed to frontend JS)
+│  ├─ controller.py      Injection check / inject / batch control / memory / resource orchestration
+│  ├─ winapi.py          Win32/NT API ctypes wrappers (privileges, injection, suspend state, etc.)
+│  ├─ ipc.py             Loopback TCP control channel + frame codec
+│  ├─ fileserver.py      127.0.0.1 read-only preview server (Range support, for A/V playback)
+│  ├─ media.py           Media type detection and preview entry assembly
+│  ├─ resconv.py         Raw DIB → BMP / ICO / CUR (reconstruct file headers for PE resources)
+│  ├─ dll_manager.py     Embedded DLL copy and SHA-256 self-check (Self-check 2)
+│  ├─ elevate.py         Privilege self-check, UAC elevation and SYSTEM elevation strategy (Self-check 1)
+│  ├─ system_token.py    SYSTEM token duplication and CreateProcessAsUserW relaunch (Windows only)
+│  ├─ updater.py         GitHub Release update check and install
+│  ├─ selftest.py        Headless end-to-end self-check (--self-test)
+│  ├─ web/               Frontend (index.html / app.js / style.css)
+│  └─ embedded/          DLL bytes generated at packaging time (base64)
 ├─ native/
-│  ├─ agent.c            被注入的 DLL：管道客户端 + 各项能力
-│  └─ superinject_json.c/.h  DLL 侧零依赖 JSON 实现
-├─ build/                编译 / 内嵌 / 打包脚本
-├─ tests/                单元测试（跨平台） + Windows 真实注入集成测试
-│  └─ ui/render_check.py 前端布局的无头渲染检查（Playwright + 假后端）
-└─ .github/workflows/ci.yml  CI：编译 DLL + 测试 + 打包 + 产物自检 + 自动发布
+│  ├─ agent.c            Injected DLL: pipe client + every capability
+│  └─ superinject_json.c/.h  Zero-dep JSON implementation on the DLL side
+├─ build/                Compile / embed / package scripts
+├─ tests/                Unit tests (cross-platform) + Windows real-injection integration tests
+│  └─ ui/render_check.py Headless render check for the frontend (Playwright + fake backend)
+└─ .github/workflows/ci.yml  CI: compile DLL + test + package + artifact self-check + auto-release
 ```
 
 ---
 
-## 开发与测试
+## Development & Testing
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest tests -q --ignore=tests/test_integration_windows.py   # 跨平台单元测试
+python -m pytest tests -q --ignore=tests/test_integration_windows.py   # cross-platform unit tests
 python -m ruff check superinject build tests run_superinject.py
-python build/build_native.py       # 本机编译 DLL 自测（macOS/Linux 走 MinGW-w64 交叉编译；
-                                   # 发布件由 CI 用 MSVC 构建，见 ci.yml 的 native-msvc）
+python build/build_native.py       # local DLL build self-test (MinGW-w64 cross-compile on macOS/Linux;
+                                   # releases are built by CI with MSVC, see ci.yml's native-msvc job)
 
-# 前端布局检查（无头 Chromium，装一次浏览器即可）
+# Frontend layout check (headless Chromium; install the browser once)
 python -m pip install playwright && python -m playwright install chromium
 python tests/ui/render_check.py --shots-dir /tmp/si-ui
 ```
 
-Windows 上（管理员终端）跑真实注入集成测试：
+Real-injection integration test on Windows (admin terminal):
 
 ```powershell
 $env:SUPERINJECT_DLL_PATH = "native/build/SuperInjectAgent.dll"
 python -m pytest tests/test_integration_windows.py -v
 ```
 
-CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在每次 push / PR 上：
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push / PR:
 
-1. 在 windows runner 上用 **MSVC**（`/W4 /WX`）编译 `SuperInjectAgent.dll` —— 这是**唯一的构建产线**，
-   校验产物是 64 位 PE DLL，并守卫**导入表只允许系统 DLL**（不许依赖 VCRUNTIME140/msvcp 这类
-   用户得额外安装的运行库，否则注入会失败）；
-2. 在 **Ubuntu + Windows** 上跑单元测试、`compileall` 与 `ruff`
-   （Windows 上还会跑 `tests/test_system_token_windows.py`：真复制 SYSTEM 令牌、
-   以 SYSTEM 创建进程并核对子进程身份）；
-3b. 用 **Playwright + Chromium** 把前端渲染三档窗口尺寸 + 深浅两套外观，
-   断言「整页可滚动 / 无横向溢出 / 各功能区都能完整看到」，并真点一遍交互路径；
-4. 在 **windows-latest** 上跑**真实注入集成测试**（注入 `ping.exe`，
-   覆盖内存读写含只读页、冻结与解除、资源提取、卸载、重新注入、自我终止）；
-5. 用 PyInstaller **单文件**打包（`--onefile`），断言产物只有 `SuperInject.exe`、
-   zip 里也只有这一个文件，再压成 `SuperInject-win-x64.zip`；
-6. 对**打包产物**再跑一次 `SuperInject.exe --self-test`，把整条链路在发布件上重验一遍；
-7. 打 `v*` tag 时自动发布正式版 Release（附加 zip 资产，自动更新只认它）。
+1. On windows runner, compile `SuperInjectAgent.dll` with **MSVC** (`/W4 /WX`) — this is the **only build line**, with a check that the product is a 64-bit PE DLL and that the **import table only references system DLLs** (no VCRUNTIME140/msvcp-style runtimes that users would need to install separately; otherwise injection fails).
+2. Run unit tests + `compileall` + `ruff` on **Ubuntu + Windows** (Windows also runs `tests/test_system_token_windows.py`: actually duplicates a SYSTEM token, creates a SYSTEM process, and verifies the child identity).
+3. Use **Playwright + Chromium** to render the frontend at three window sizes × light/dark themes, asserting "fully scrollable / no horizontal overflow / every functional zone fully visible", and click through the interactive paths.
+4. On **windows-latest**, run **real-injection integration tests** (inject `ping.exe`, covering memory R/W including read-only pages, freeze and resume, resource extraction, unload, re-inject, self-terminate).
+5. PyInstaller **single-file** packaging (`--onefile`), assert the product is only `SuperInject.exe`, the zip contains only that file, then compress to `SuperInject-win-x64.zip`.
+6. Run `SuperInject.exe --self-test` **on the packaged artifact** to re-verify the whole chain against the release build.
+7. Pushing a `v*` tag triggers an auto-release (attaches the zip asset; auto-update keys off it).
 
-> 改动前先读 [`docs/notes.md`](docs/notes.md)：那里记录了本版修掉的遗留缺陷及根因
-> （控制通道方向性死锁、数组序列化无限互递归、重新注入竞态、`pid_alive` 假存活等）、
-> 架构约定、已知边界，以及「哪些没做、为什么没做」。
+> Before making changes, read [`docs/notes.md`](docs/notes.md): it records the defects fixed in this version with root cause (control-channel directional deadlock, array-serialization infinite mutual recursion, re-injection race, `pid_alive` false-positive), architectural conventions, known boundaries, and "what was deliberately not done and why".
 
 ---
 
-## 常见问题
+## FAQ
 
-**Q：注入失败怎么办？**
-- 先看「注入检查」的结论，它会明确告诉你是哪种情况：
-  进程不存在 / 位数不匹配（x64 工具不能注入 x86 进程，反之亦然）/ 无法打开进程（未提权）/
-  系统关键进程被拦（`lsass.exe`、`csrss.exe` 之类注入会直接蓝屏）。
-- 部分安全软件 / 反作弊会拦截 `CreateRemoteThread`，本工具不提供任何绕过能力。
+**Q: Injection failed. What now?**
 
-**Q：提示「已存在 SuperInjectAgent.dll 但控制通道未建立」？**
-说明目标进程里残留了上一次的注入模块（例如控制器被强杀）。这种情况无法从外部安全卸载，
-请重启目标进程后再注入。
+- Read what "Pre-injection check" actually said. It tells you which case this is:
+  process gone / architecture mismatch (x64 tool can't inject x86, and vice versa) / cannot open process (not elevated) / protected system process blocked (`lsass.exe`, `csrss.exe` — injecting them bluescreens).
+- Some security software / anti-cheat hooks `CreateRemoteThread`; this tool provides no bypass for that.
 
-**Q：想更新 DLL 后重新注入？**
-直接对已注入的进程再点「注入选中」即可，会自动先卸载旧 DLL 再注入新的。
+**Q: "SuperInjectAgent.dll already exists but control channel not established"?**
 
-**Q：搜索内存很慢？**
-全进程空间扫描确实耗时；对已知地址建议直接用「查看/修改」读该地址区域。
+Means the previous injection left a residual module in the target (e.g. controller was force-killed). External safe-unload is impossible here — restart the target and inject again.
 
-**Q：冻结后怎么恢复？**
-「解除冻结」按钮，或直接结束进程。冻结期间目标进程完全不响应，包括它的注入端 DLL。
+**Q: Want to update the DLL and re-inject?**
 
-**Q：界面显示「权限 管理员 ✓」而不是 SYSTEM？**
-说明 SYSTEM 提权没成功，日志里会写明原因（常见：安全软件拦截令牌复制、
-没有可用的 SYSTEM 进程令牌）。功能仍然可用，只是调试不了 SYSTEM 级别的目标。
+Click "Inject selected" again on an already-injected process — it automatically unloads the old DLL and injects the new one.
 
-**Q：能不能只以管理员运行、不要 SYSTEM？**
-可以，加 `--as-admin` 参数启动（例如做快捷方式时带上它）。
+**Q: Memory search is slow?
+**
 
-**Q：为什么任务管理器里看到 SuperInject 的进程名/用户变了？**
-提权到 SYSTEM 时程序会「用 SYSTEM 令牌重新启动自己」再退出原进程，属于预期行为。
+Full process-space scan is indeed slow; for known addresses, use "View / Edit" on that address range directly.
 
-**Q：资源提取为什么有些图片打不开？**
-内存映射文件是按「当时被映射进内存的那段内容」导出的，如果程序只映射了文件的一部分，
-导出的就是这一部分（界面上会标注「已截断」）。
+**Q: How do I resume a frozen process?**
+
+The "Unfreeze" button, or just terminate it. While frozen, the target is completely unresponsive, including its injected DLL.
+
+**Q: The UI says "Privilege Admin ✓" instead of SYSTEM?**
+
+SYSTEM elevation failed; check the log for the reason (common: security software blocks token duplication, no usable SYSTEM process token). Functionality is still available, just can't debug SYSTEM-level targets.
+
+**Q: Can I run as Admin only, not SYSTEM?**
+
+Yes — pass `--as-admin` (e.g. add it to your shortcut).
+
+**Q: Why does Task Manager show SuperInject's process name / user changed?**
+
+Elevation to SYSTEM relaunches itself with the SYSTEM token and exits the original process; this is expected.
+
+**Q: Why can't some extracted resource images be opened?**
+
+Memory-mapped files are exported as the contents mapped into memory at that moment — if the program only mapped part of the file, that's what you get (the UI marks it as "truncated").
 
 ---
 
-## 安全声明（再次强调）
+## Safety Notice (Restated)
 
-- SuperInject **仅供开发人员调试程序使用，严禁滥用，违规使用者后果自负**；
-- 请仅在你自己开发的、或已获得书面授权的软件/进程上使用；
-- 请遵守所在地区的法律法规与相关软件的许可协议；
-- 作者与贡献者对任何滥用行为造成的损失不承担责任。
+- SuperInject is **for developer debugging only. Do not misuse. You are solely liable for any consequences**.
+- Use it only on software/processes you developed or have written authorization to debug.
+- Comply with local laws and the relevant software's license agreements.
+- The author and contributors disclaim all liability for any misuse.
 
-## 许可证
+## License
 
 [MIT](LICENSE) © 2026 Skyc8266
